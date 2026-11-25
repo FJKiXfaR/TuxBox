@@ -67,6 +67,32 @@ unsafe fn create_pipeline_inner(
     let mut native_desc = unsafe { core::ptr::read(desc) };
     native_desc.pRootSignature = ManuallyDrop::new(root.cloned());
     super::format::host_targets(&mut native_desc.RTVFormats, &mut native_desc.DSVFormat);
+    // Never hand console-native bitcode to the host compiler: it faults instead
+    // of returning an error (see shader_cache::host_compatible). The rectangle
+    // path supplies its own desktop shaders and is exempt.
+    if native_desc.PrimitiveTopologyType.0 != rectangle::PIPELINE_TYPE {
+        for (stage, code) in [
+            ("VS", native_desc.VS),
+            ("PS", native_desc.PS),
+            ("DS", native_desc.DS),
+            ("HS", native_desc.HS),
+            ("GS", native_desc.GS),
+        ] {
+            if code.BytecodeLength == 0 || code.pShaderBytecode.is_null() {
+                continue;
+            }
+            // SAFETY: the guest keeps each shader blob alive for this call.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+            };
+            if !super::shader_cache::host_compatible(bytes) {
+                crate::diagnostics::log_once(&std::sync::Once::new(), || {
+                    format!("refusing console-native {stage} graphics stage; not submitted to the host compiler")
+                });
+                return E_NOTIMPL;
+            }
+        }
+    }
     let label = graphics_label(desc);
     let native = if native_desc.PrimitiveTopologyType.0 == rectangle::PIPELINE_TYPE {
         crate::big_stack::run_logged(&label, || unsafe { rectangle::create_pipeline(&this.native, &mut native_desc) })

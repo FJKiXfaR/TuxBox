@@ -1513,12 +1513,18 @@ unsafe extern "system" fn present(
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || format!("PresentX failed planes={count} HRESULT={:#010x}", result.0));
         if result == windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST {
-            // The desktop window was closed. A console title has no such event
-            // and would otherwise wait for this frame's flip until its own
-            // watchdog fires. Treat the close as a request to quit.
-            crate::diagnostics::log_once(&std::sync::Once::new(), || "presentation window closed; exiting title".into());
-            use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-            let _ = unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+            // The host window association was lost (the title recreated or hid
+            // its window, the display mode changed, or a desktop switch). A
+            // console title never closes a desktop window: drop the host window
+            // and swap chain so the next present builds a fresh one, and keep
+            // the title running; it may still be in its loading phase.
+            static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let lost = LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::diagnostics::log(&format!(
+                "presentation access lost; recreating host window/swap chain (#{})",
+                lost + 1
+            ));
+            queue.state.presentation.reset();
         }
         // A rejected present still ends this frame for the title's pacing.
         if count >= 1 && let Some(plane) = unsafe { planes.as_ref() } {
@@ -1597,7 +1603,20 @@ unsafe fn present_planes(
             return E_NOTIMPL;
         }
     }
-    let result = queue.state.presentation.present(&queue.native, source);
+    // The finished frame usually lands in a placed render target while the
+    // present names the committed display surface. Show the render target the
+    // title actually drew into when its shape matches (see present::redirect).
+    let redirected = crate::present::redirect::source(&source);
+    if redirected.is_some() {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST, || {
+            "presenting the title's full-size render target in place of the display surface".into()
+        });
+    }
+    let result = queue
+        .state
+        .presentation
+        .present(&queue.native, redirected.as_ref().unwrap_or(&source));
     if result == S_OK {
         frame_heartbeat(plane.token);
     }

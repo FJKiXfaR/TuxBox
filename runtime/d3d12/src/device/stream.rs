@@ -377,6 +377,21 @@ unsafe fn create(
     let compute_code = original[5]
         .and_then(|(_, translated)| translated.map(|index| &stages[index]))
         .filter(|code| crate::compile_gate::is_large(code.len()));
+    // A console-native stage that the translator could not turn into portable
+    // DXIL is rejected (and can fault) inside the host compiler, so fall back
+    // before handing it over.
+    if unsafe { console_native_stage(&fields) }.is_some() {
+        let hashes = original.map(|stage| {
+            stage.and_then(|(code, prepared)| {
+                shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some()))
+            })
+        });
+        // SAFETY: the stream storage and its field pointers are still live.
+        return unsafe {
+            null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
+        }
+        .unwrap_or_else(|| Err(E_NOTIMPL.into()));
+    }
     let initial = if let Some(code) = compute_code {
         let signature = match (&pipeline.scene_root, root_record) {
             (Some(root), _) => Some(root.native.clone()),
@@ -410,9 +425,35 @@ unsafe fn create(
             }
         }
     } else {
-        // SAFETY: the stream storage, translated shaders, and guest-owned inputs
-        // all stay alive throughout this synchronous call on the desktop Device2.
-        crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState(&native_desc) })
+        // SAFETY: capture copies the stream and every guest pointer it embeds.
+        let owned = unsafe { OwnedStream::capture(&native_desc, &fields, root_record) };
+        match owned {
+            Some(owned) => {
+                let device = host.clone();
+                match crate::big_stack::run_deadline(&label, move || unsafe { owned.create(&device) }) {
+                    crate::big_stack::PipelineWait::Ready(result) => result,
+                    crate::big_stack::PipelineWait::Deferred => {
+                        // The driver compile continues on the detached helper and
+                        // still records its binary in the GPU cache; this call gets
+                        // the stand-in so the title keeps presenting frames.
+                        let hashes = original.map(|stage| {
+                            stage.and_then(|(code, prepared)| {
+                                shader_cache::source_digest(code).map(|hash| (hash, prepared.is_some()))
+                            })
+                        });
+                        // SAFETY: the stream storage and its field pointers are still live.
+                        return unsafe {
+                            null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
+                        }
+                        .unwrap_or_else(|| Err(E_NOTIMPL.into()));
+                    }
+                }
+            }
+            // A stream this code cannot copy keeps the synchronous path.
+            None => crate::big_stack::run_logged(&label, || unsafe {
+                host.CreatePipelineState(&native_desc)
+            }),
+        }
     };
     let Err(error) = &initial else {
         if rectangles {
@@ -523,6 +564,113 @@ unsafe fn create(
     }
     crate::diagnostics::pipeline_stages(&hashes, status.0, false);
     unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes) }.unwrap_or(initial)
+}
+
+/// Index of the first stream stage whose bytecode the host compiler cannot parse.
+///
+/// Stages that were translated point at portable DXIL containers; an untranslated
+/// console stage still points into the guest's Xbox container, which the host
+/// driver rejects and can fault on.
+unsafe fn console_native_stage(fields: &[Option<*mut D3D12_SHADER_BYTECODE>; 8]) -> Option<usize> {
+    for (index, field) in fields.iter().enumerate().take(6) {
+        let Some(field) = field else { continue };
+        let code = unsafe { &**field };
+        if code.BytecodeLength == 0 || code.pShaderBytecode.is_null() {
+            continue;
+        }
+        let bytes = unsafe {
+            slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+        };
+        if !shader_cache::host_compatible(bytes) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+
+/// A pipeline stream descriptor copied out of guest memory so a driver compile
+/// can continue after the title's call returns.
+///
+/// The stream embeds pointers to shader bytecode and the root signature that
+/// belong to the guest; those are replaced with owned copies (the shader vectors
+/// live on the heap, so their buffers stay valid when this value is moved).
+struct OwnedStream {
+    blob: Vec<u8>,
+    shaders: Vec<Vec<u8>>,
+    root: Option<ID3D12RootSignature>,
+    size: usize,
+}
+
+impl OwnedStream {
+    unsafe fn capture(
+        desc: &D3D12_PIPELINE_STATE_STREAM_DESC,
+        fields: &[Option<*mut D3D12_SHADER_BYTECODE>; 8],
+        root: Option<*mut *mut core::ffi::c_void>,
+    ) -> Option<Self> {
+        if desc.pPipelineStateSubobjectStream.is_null() || desc.SizeInBytes == 0 {
+            return None;
+        }
+        let base = desc.pPipelineStateSubobjectStream as *const u8;
+        let size = desc.SizeInBytes as usize;
+        let mut owned = Self {
+            // SAFETY: the guest keeps the stream readable for this call.
+            blob: unsafe { slice::from_raw_parts(base, size) }.to_vec(),
+            shaders: Vec::new(),
+            root: None,
+            size: desc.SizeInBytes,
+        };
+        for field in fields.iter().flatten() {
+            // SAFETY: the stream's shader subobjects point at readable bytecode.
+            let code = unsafe { &**field };
+            if code.pShaderBytecode.is_null() || code.BytecodeLength == 0 {
+                continue;
+            }
+            let offset = (*field as usize).checked_sub(base as usize)?;
+            if offset + 16 > size {
+                return None;
+            }
+            // SAFETY: the bytecode stays readable for the duration of this call.
+            let bytes = unsafe {
+                slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+            };
+            owned.shaders.push(bytes.to_vec());
+            let buffer = owned.shaders.last()?;
+            let pointer = buffer.as_ptr() as usize;
+            let length = buffer.len();
+            // SAFETY: both writes stay inside the owned blob (bounds checked above)
+            // and the shader payload is a pointer followed by a length.
+            unsafe {
+                core::ptr::write_unaligned(owned.blob.as_mut_ptr().add(offset).cast::<usize>(), pointer);
+                core::ptr::write_unaligned(owned.blob.as_mut_ptr().add(offset + 8).cast::<usize>(), length);
+            }
+        }
+        if let Some(field) = root {
+            let offset = (field as usize).checked_sub(base as usize)?;
+            if offset + 8 > size {
+                return None;
+            }
+            // SAFETY: the payload holds the root signature pointer the guest passed.
+            let raw = unsafe { *field };
+            let borrowed = unsafe { ID3D12RootSignature::from_raw_borrowed(&raw) }?;
+            owned.root = Some(borrowed.clone());
+            let pointer = owned.root.as_ref().map_or(0, |root| unsafe { root.as_raw() } as usize);
+            // SAFETY: the pointer stays inside the owned blob (bounds checked above).
+            unsafe {
+                core::ptr::write_unaligned(owned.blob.as_mut_ptr().add(offset).cast::<usize>(), pointer);
+            }
+        }
+        Some(owned)
+    }
+
+    unsafe fn create(&self, device: &ID3D12Device2) -> windows::core::Result<ID3D12PipelineState> {
+        let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: self.size,
+            pPipelineStateSubobjectStream: self.blob.as_ptr().cast_mut().cast(),
+        };
+        // SAFETY: the owned blob and everything it points at stay alive for the call.
+        unsafe { device.CreatePipelineState(&desc) }
+    }
 }
 
 /// Retry a rejected stream with resource-free shaders (see `fallback`). Mesh

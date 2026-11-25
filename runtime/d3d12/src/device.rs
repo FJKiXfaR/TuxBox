@@ -449,6 +449,9 @@ unsafe extern "system" fn create_heap(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    // The console's type 4 heap is a CBV/SRV/UAV heap on the host.
+    let mapped = D3D12_DESCRIPTOR_HEAP_DESC { Type: host_heap_type(desc.Type), ..*desc };
+    let desc = &mapped;
     if desc.NumDescriptors == 0 {
         return E_INVALIDARG;
     }
@@ -520,8 +523,15 @@ unsafe extern "system" fn create_heap(
     unsafe { wrap_pageable(Ok(native), &HEAP, this, state, out) }
 }
 
+/// Xbox GDK descriptor heap type 4 is the additional CBV/SRV/UAV heap; the host
+/// only knows the four D3D12 types, and forwarding 4 made vkd3d return an
+/// increment size of 0 (every descriptor offset the title computed was wrong).
+pub(crate) fn host_heap_type(kind: D3D12_DESCRIPTOR_HEAP_TYPE) -> D3D12_DESCRIPTOR_HEAP_TYPE {
+    if kind.0 == 4 { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV } else { kind }
+}
+
 unsafe extern "system" fn increment_size(this: &Device, kind: D3D12_DESCRIPTOR_HEAP_TYPE) -> u32 {
-    unsafe { this.native.GetDescriptorHandleIncrementSize(kind) }
+    unsafe { this.native.GetDescriptorHandleIncrementSize(host_heap_type(kind)) }
 }
 
 pub(crate) const BUFFER_READ_BITS: i32 =

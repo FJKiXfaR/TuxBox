@@ -1,8 +1,11 @@
 //! Guest device-factory ABI for d3d12_xs.dll.
 
+#[macro_export]
+macro_rules! invalid_site { () => { $crate::diagnostics::invalid_site(file!(), line!()) } }
 mod big_stack;
 mod clwb;
 mod clzero;
+mod sse4a;
 mod mwaitx;
 mod commands;
 mod compile_gate;

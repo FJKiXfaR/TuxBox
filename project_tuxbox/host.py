@@ -13,6 +13,7 @@ from .backend_log import game_diagnostics
 from .console_cbv import configure_console_cbv
 from .mangohud import performance_capture
 from .pipeline_profile import pipeline_capture
+from .prefix_paths import runtime_prefix
 from .runtime_shaders import runtime_shader_compiler
 
 
@@ -231,6 +232,7 @@ def configure_nvidia_shader_cache(env, report=None):
     env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(8 << 30))
     if report:
         report(f"NVIDIA shader cache: {cache}")
+
 
 
 class Host:

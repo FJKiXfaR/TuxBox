@@ -112,7 +112,37 @@ impl MouseMotion {
     }
 }
 
+/// `TUXBOX_SYNTH_PAD_A_MS=<ms>`: present a virtual pad and press A for 800 ms at
+/// that point, so the title can be driven without a physical controller or host
+/// focus (used to step through the account prompt during bring-up).
+fn synthetic_pad(port: usize) -> Option<Pad> {
+    // One press: "<ms>". Repeating presses: "<start_ms>,<period_ms>".
+    let spec = std::env::var("TUXBOX_SYNTH_PAD_A_MS").ok()?;
+    if port != 0 {
+        return None;
+    }
+    let mut parts = spec.split(',');
+    let start = parts.next()?.trim().parse::<u64>().ok()?;
+    let period = parts.next().and_then(|value| value.trim().parse::<u64>().ok());
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    let elapsed = START.elapsed().as_millis() as u64;
+    let mut pad = Pad::default();
+    let since = elapsed.saturating_sub(start);
+    let pressed = match period {
+        Some(period) if period != 0 && elapsed >= start => since % period < 800,
+        _ => elapsed >= start && elapsed < start + 800,
+    };
+    if pressed {
+        pad.buttons = 1 << 2; // A
+    }
+    Some(pad)
+}
+
 pub fn gamepad(port: usize) -> Option<Pad> {
+    if let Some(pad) = synthetic_pad(port) {
+        return Some(pad);
+    }
     let mut state = XINPUT_STATE::default();
     // SAFETY: The scanner passes a port from 0 through 3 and writable state.
     if unsafe { XInputGetState(port as u32, &mut state) } != 0 {

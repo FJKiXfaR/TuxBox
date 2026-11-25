@@ -1,4 +1,5 @@
 """Prepare profiled retail shaders in the cache read by the staged graphics provider."""
+from .prefix_paths import runtime_prefix
 import ctypes
 import hashlib
 import json
@@ -313,7 +314,7 @@ def prepare_for_launch(executable, host):
     print(f"{plan['title']} shader preparation profile: {name}", file=sys.stderr, flush=True)
     plan, source_profile = tuxbox_plan(profile, plan, mode in ("menu", "chase"))
     pak = executable.parent / plan["shader_package"]
-    prefix = Path(host.env["WINEPREFIX"])
+    prefix = runtime_prefix(host.env)
     cache = prefix / SOURCE_CACHE
     started = monotonic()
     with desktop_progress(plan["title"], host.env) as progress:

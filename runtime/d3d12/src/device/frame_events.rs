@@ -13,6 +13,21 @@ use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::Win32::System::Threading::{GetCurrentProcess, SetEvent};
 use windows::core::{HRESULT, Interface};
 
+/// `TUXBOX_TRACE_FRAME_EVENTS=1`: log the title's frame pacing handshakes.
+pub(super) fn trace_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("TUXBOX_TRACE_FRAME_EVENTS").is_some());
+    *ON
+}
+
+macro_rules! frame_trace {
+    ($($arg:tt)*) => {
+        if trace_enabled() {
+            crate::diagnostics::log(&format!($($arg)*));
+        }
+    };
+}
+
 #[derive(Default)]
 pub(super) struct FrameEvents {
     state: Mutex<State>,
@@ -77,6 +92,7 @@ pub(super) unsafe extern "system" fn interval(
         state.flip.clear();
         state.flip_scheduled = false;
     }
+    frame_trace!("frame interval {length_us}us period {period}");
     state.interval = interval;
     state.period = period as usize;
     frames.changed.notify_all();
@@ -181,6 +197,7 @@ pub(super) unsafe extern "system" fn wait(
         return E_NOTIMPL;
     }
     let mut input = unsafe { token.read_unaligned() };
+    frame_trace!("frame wait kind={kind} flags={flags} input={input} timeout_ms={timeout_ms}");
     let frames = &device.state.frames;
     let mut state = frames.state.lock().unwrap_or_else(|e| e.into_inner());
     // ProjectScarlett clears its token before every timeout poll (RVA 0x248241e)
@@ -236,6 +253,7 @@ pub(super) unsafe extern "system" fn wait(
                 } else {
                     state.pending = Some(id);
                 }
+                frame_trace!("frame wait kind={kind} -> token={id} ready={ready}");
                 unsafe { token.write_unaligned(id) };
             }
             return if ready { S_OK } else { S_FALSE };
@@ -278,6 +296,7 @@ fn next_tick(origin: Instant, interval: Duration, now: Instant) -> Instant {
 // The queue holds a strong reference to its controlling guest device. Called
 // only after a successful host presentation, with the token in the guest plane.
 pub(crate) unsafe fn display_flip(identity: *mut c_void, token: u64) {
+    frame_trace!("display flip token={token}");
     let device = unsafe { &*identity.cast::<Device>() };
     let frames = &device.state.frames;
     let mut state = frames.state.lock().unwrap_or_else(|e| e.into_inner());

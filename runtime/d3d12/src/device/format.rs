@@ -6,6 +6,9 @@ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 // Desktop D3D12 has no 16-bit depth with stencil. D24S8 also stores unsigned
 // normalized depth, and its extra precision does not change test results.
 pub(crate) const D16_UNORM_S8_UINT: DXGI_FORMAT = DXGI_FORMAT(118);
+/// Scarlett-only packed 10-bit float channel formats (7e3 and 6e4).
+const R10G10B10_7E3: DXGI_FORMAT = DXGI_FORMAT(116);
+const R10G10B10_6E4: DXGI_FORMAT = DXGI_FORMAT(117);
 const R16_UNORM_X8_TYPELESS: DXGI_FORMAT = DXGI_FORMAT(119);
 const X16_TYPELESS_G8_UINT: DXGI_FORMAT = DXGI_FORMAT(120);
 
@@ -17,6 +20,11 @@ pub(crate) fn host_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
         D16_UNORM_S8_UINT => DXGI_FORMAT_D24_UNORM_S8_UINT,
         R16_UNORM_X8_TYPELESS => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
         X16_TYPELESS_G8_UINT => DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+        // The desktop adapter has no 1_5_5_5 target and a UAV on one removes the
+        // device; RGBA8 renders and samples the same normalized channels.
+        DXGI_FORMAT_B5G5R5A1_UNORM => DXGI_FORMAT_R8G8B8A8_UNORM,
+        // Scarlett packs R10G10B10 floats; half floats carry the same range.
+        R10G10B10_7E3 | R10G10B10_6E4 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         other => other,
     }
 }
@@ -26,6 +34,7 @@ pub(crate) fn host_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
 pub(super) fn view_format(translated: bool, format: DXGI_FORMAT) -> DXGI_FORMAT {
     match format {
         DXGI_FORMAT_B4G4R4A4_UNORM if translated => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B5G5R5A1_UNORM => DXGI_FORMAT_R8G8B8A8_UNORM,
         other => host_format(other),
     }
 }
@@ -69,6 +78,8 @@ pub(super) fn substitute(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DE
         DXGI_FORMAT_B4G4R4A4_UNORM if flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0 => {
             (DXGI_FORMAT_R8G8B8A8_UNORM, flags)
         }
+        DXGI_FORMAT_B5G5R5A1_UNORM => (DXGI_FORMAT_R8G8B8A8_UNORM, flags),
+        R10G10B10_7E3 | R10G10B10_6E4 => (DXGI_FORMAT_R16G16B16A16_FLOAT, flags),
         // Scarlett depth can also allow unordered access; the desktop image
         // keeps its format and depth usage. A UAV on it is reported at view creation.
         format if flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0

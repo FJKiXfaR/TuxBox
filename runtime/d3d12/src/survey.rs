@@ -51,7 +51,13 @@ const RECOVERABLE: [(usize, [u8; 9]); 2] = [
 ];
 
 fn is_recoverable(rva: usize, bytes: &[u8]) -> bool {
-    RECOVERABLE.iter().any(|&(site, expected)| rva == site && bytes == expected)
+    if RECOVERABLE.iter().any(|&(site, expected)| rva == site && bytes == expected) {
+        return true;
+    }
+    // A debug assert whose own continuation is a direct jump: resuming at the
+    // instruction after the `int3` lets the title take the path it encoded
+    // next. This covers build-specific asserts without hardcoding their RVAs.
+    bytes.first() == Some(&0xcc) && matches!(bytes.get(1), Some(0xeb) | Some(0xe9))
 }
 
 /// Asserts in a leaf function that has no stack frame, where stepping over the
@@ -100,7 +106,29 @@ pub(crate) fn uninstall_handler() {
 /// Outside survey mode the handler only steps over `RECOVERABLE`, rewrites
 /// unsupported `clwb` instructions, emulates unsupported `clzero` and rewrites
 /// unsupported `monitorx`/`mwaitx` to NOPs.
+/// `TUXBOX_SELF_EXIT_AT_MS=<ms>`: end the process with `ExitProcess` at that
+/// point. A normal exit runs the DLL detach handlers that merge vkd3d-proton's
+/// pipeline cache; a killed process never does, so every run would recompile.
+fn install_self_exit() {
+    use windows::Win32::System::Threading::ExitProcess;
+    let Some(millis) = std::env::var("TUXBOX_SELF_EXIT_AT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = std::thread::Builder::new().name("tuxbox-self-exit".into()).spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+            log(format!("self exit after {millis} ms (pipeline cache merge)"));
+            unsafe { ExitProcess(0) };
+        });
+    });
+}
+
 pub(crate) fn install() {
+    install_self_exit();
     let installed = install_handler();
     static LOGGED: Once = Once::new();
     LOGGED.call_once(|| {
@@ -153,6 +181,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             if crate::clwb::handle_illegal_instruction(context, start, end)
                 || crate::clzero::handle_illegal_instruction(context, start, end)
                 || crate::mwaitx::handle_illegal_instruction(context, start, end)
+                || crate::sse4a::handle_illegal_instruction(context, start, end)
             {
                 return CONTINUE_EXECUTION;
             }

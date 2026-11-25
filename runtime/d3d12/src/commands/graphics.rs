@@ -116,6 +116,11 @@ pub(super) unsafe extern "system" fn targets(
         state.trace_target = if count == 1 {
             crate::diagnostics::display::draw_target(unsafe { (*rtvs).ptr })
         } else { None };
+        // The finished frame lands in a placed render target; remember the latest
+        // full-size one so PresentX can show it (see present::redirect).
+        if let Some(target) = &state.trace_target {
+            crate::present::redirect::bound(target);
+        }
     }
     if crate::diagnostics::display::enabled() {
         // Contiguous ranges: the display target is bound alone in practice.

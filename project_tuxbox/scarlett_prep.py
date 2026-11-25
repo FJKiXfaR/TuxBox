@@ -1,6 +1,7 @@
 """Compile ProjectScarlett's recorded shader requests before launching the title."""
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from .prefix_paths import runtime_prefix
 import os
 from itertools import islice
 import json
@@ -92,7 +93,7 @@ def prepare_scarlett(executable, host):
     if (host.env.get("TUXBOX_RUNTIME_SHADERS") == "0"
             or not executable.with_name("d3d12_xs.dll").is_file()):
         return False
-    cache_root = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE.parent
+    cache_root = runtime_prefix(host.env) / SOURCE_CACHE.parent
     archive = scarlett_requests(executable, cache_root)
     if archive is None:
         return False

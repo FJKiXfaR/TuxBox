@@ -22,6 +22,14 @@ pub(crate) struct Presentation {
 }
 
 impl Presentation {
+    /// Drop the host window and swap chain after DXGI_ERROR_ACCESS_LOST. The next
+    /// present acquires a fresh window (the title may have recreated or hidden
+    /// its own during loading) and builds a new swap chain.
+    pub(crate) fn reset(&self) {
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = session.take();
+    }
+
     pub(crate) fn present(&self, queue: &ID3D12CommandQueue, source: &ID3D12Resource) -> HRESULT {
         self.present_texture(queue, source)
             .unwrap_or_else(|error| error.code())
@@ -419,6 +427,21 @@ pub(crate) mod sampler {
                     grid[y * 4 / h][x * 4 / w] += luma;
                 }
             }
+            // `TUXBOX_DUMP_PRESENT_FRAMES=<dir>`: write the sampled resource raw
+            // so a black presented image can be attributed to a specific target.
+            if let Ok(directory) = std::env::var("TUXBOX_DUMP_PRESENT_FRAMES")
+                && self.index < 6
+            {
+                use std::io::Write as _;
+                let _ = std::fs::create_dir_all(&directory);
+                let stem = format!("{directory}\\{name}-{:04}", self.index);
+                if let Ok(mut raw) = std::fs::File::create(format!("{stem}.raw")) {
+                    let _ = raw.write_all(&data[..pitch * h]);
+                }
+                if let Ok(mut meta) = std::fs::File::create(format!("{stem}.txt")) {
+                    let _ = writeln!(meta, "{w}x{h} pitch={pitch} format={} source={:#x}", f.Format.0, self.source);
+                }
+            }
             let n = ((w / 4) * (h / 4)).max(1) as u64;
             let cells: Vec<String> = grid.iter().map(|row| row.iter()
                 .map(|&v| format!("{:3}", v / (n / 16).max(1) / 3)).collect::<Vec<_>>().join(" ")).collect();
@@ -432,5 +455,48 @@ pub(crate) mod sampler {
                 crate::diagnostics::display::report_null_usage();
             }
         }
+    }
+}
+
+/// `TUXBOX_PRESENT_REDIRECT` (default on): the title draws its finished frame
+/// into a placed render target while PresentX names the committed display
+/// surface, which TuxBox backs with a separate host texture. Present the most
+/// recently bound full-size render target with the same shape instead.
+pub(crate) mod redirect {
+    use std::sync::{LazyLock, Mutex};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
+    pub(crate) fn enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("TUXBOX_PRESENT_REDIRECT").is_none_or(|value| value != "0")
+        });
+        *ON
+    }
+    static LAST: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+
+    pub(crate) fn bound(target: &ID3D12Resource) {
+        if !enabled()
+            || crate::diagnostics::display::is_display_any(windows::core::Interface::as_raw(target))
+        {
+            return;
+        }
+        let desc = unsafe { target.GetDesc() };
+        if desc.Width >= 1280
+            && desc.Height >= 720
+            && desc.SampleDesc.Count == 1
+            && desc.MipLevels == 1
+            && desc.DepthOrArraySize == 1
+        {
+            *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.clone());
+        }
+    }
+
+    pub(crate) fn source(display: &ID3D12Resource) -> Option<ID3D12Resource> {
+        if !enabled() {
+            return None;
+        }
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let (a, b) = unsafe { (display.GetDesc(), last.GetDesc()) };
+        (a.Width == b.Width && a.Height == b.Height && a.Format == b.Format).then_some(last)
     }
 }

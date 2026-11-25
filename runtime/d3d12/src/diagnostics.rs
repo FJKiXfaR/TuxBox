@@ -344,7 +344,13 @@ pub(crate) mod display {
     }
 
     pub(crate) fn capture_draws() -> bool {
-        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_CAPTURE_DRAW_READBACK").as_deref() == Some(std::ffi::OsStr::new("1")));
+        // Redirecting PresentX to the render target the title actually drew into
+        // needs the bound full-size target, so turning that on also captures it.
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            crate::present::redirect::enabled()
+                || std::env::var_os("TUXBOX_CAPTURE_DRAW_READBACK").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+        });
         *ON
     }
     use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -380,6 +386,11 @@ pub(crate) mod display {
     }
     pub(crate) fn is_display(native: *mut core::ffi::c_void) -> bool {
         enabled() && RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
+    }
+    /// Whether a resource was recorded as a display surface, regardless of the
+    /// display tracing switch: presentation redirection relies on this.
+    pub(crate) fn is_display_any(native: *mut core::ffi::c_void) -> bool {
+        RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
     }
     pub(crate) fn rtv(handle: usize, native: Option<*mut core::ffi::c_void>) {
         if !enabled() { return; }

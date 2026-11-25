@@ -1581,6 +1581,13 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
             || matches!(i.mnemonic.as_str(), "v_and_b32" | "v_or_b32" | "v_min_u32" | "v_max_u32" | "v_min_f32" | "v_max_f32" | "v_add_nc_u32" | "v_add_f32"));
     let required_wave_size = if em.pixel_wave { None } else { required_wave_size };
     let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1)) || uses_bpermute || group_extrema).then_some(32));
+    // Experimental: a wave32-only GPU cannot create a wave64 pipeline. With
+    // `XSHADER_FORCE_WAVE32` the requirement is coerced so the program runs with
+    // 32-lane waves; operations that depend on the 64th lane become approximate.
+    let required_wave_size = match required_wave_size {
+        Some(64) if ex.stage == Stage::Compute && std::env::var_os("XSHADER_FORCE_WAVE32").is_some() => Some(32),
+        other => other,
+    };
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.

@@ -1,6 +1,7 @@
 """Compile Xbox shaders and link raster stages requested by a running Proton game."""
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
+from .prefix_paths import runtime_prefix
 import errno
 import hashlib
 import os
@@ -580,7 +581,7 @@ def runtime_shader_compiler(backend, env, executable, report):
     if backend != "proton" or env.get("TUXBOX_RUNTIME_SHADERS") == "0" or not executable.with_name("d3d12_xs.dll").is_file():
         yield
         return
-    cache = Path(env["WINEPREFIX"]) / SOURCE_CACHE.parent
+    cache = runtime_prefix(env) / SOURCE_CACHE.parent
     from .scarlett_prep import scarlett_requests
 
     archive = None
