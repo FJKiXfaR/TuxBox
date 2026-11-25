@@ -43,6 +43,13 @@ pub(super) fn possible_bits(ops: &[Insn], targets: &std::collections::BTreeSet<i
         ("s_and_b32", [a,b]) => Some(bits(a)? & bits(b)?),
         // A bit that may be set in both inputs can still survive XOR.
         ("s_or_b32" | "s_xor_b32", [a,b]) => Some(bits(a)? | bits(b)?),
+        ("s_bfe_u32", [data, control]) => {
+            let Some(field) = literal(control) else { return Some(u32::MAX); };
+            let offset = field & 31;
+            let width = (field >> 16) & 127;
+            let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+            Some((bits(data).unwrap_or(u32::MAX) >> offset) & mask)
+        }
         ("s_lshl_b32", [a,b]) => Some(bits(a)? << (literal(b)? & 31)),
         ("s_lshr_b32", [a,b]) => Some(bits(a)? >> (literal(b)? & 31)),
         _ => Some(u32::MAX),

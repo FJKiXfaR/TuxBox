@@ -292,6 +292,25 @@ fn bounded_bitwise_offsets_index_only_complete_aligned_tables() {
     }
 }
 
+#[test]
+fn extracted_bit_fields_bound_the_entire_scalar_table_load() {
+    // getpc s[8:9]; bfe_u32 s10,s12,field; lshl s10,s10,2;
+    // load s16 from PC + 24 + s10. The first table word follows endpgm.
+    let translate = |field: u32, table_words: u32| {
+        let words = [0xbe881f00, 0x938aff0c, field, 0x8f0a820a, 0xf4000404, 0x14000018, 0xbf810000];
+        let mut ex = compute_extract(&words);
+        ex.isa_data.extend((0..table_words).flat_map(u32::to_le_bytes));
+        super::translate(&ex)
+    };
+    // Two middle bits, or the two bits remaining after a right shift by 30.
+    for field in [0x0002_000b, 0x0020_001e, 0x007f_001e] {
+        assert!(translate(field, 4).is_ok(), "field {field:#x}");
+        assert!(translate(field, 3).is_err(), "field {field:#x}");
+    }
+    assert!(translate(0x0000_000b, 1).is_ok()); // Zero width always selects word zero.
+    assert!(translate(0x0020_0000, 4).is_err()); // All 32 input bits remain available.
+}
+
 fn bounded_cbv_fixture() -> ShaderExtract {
     // gfx1030: and s10,s8,1; lshl s10,s10,5; load descriptor s[16:19]
     // from s[4:5]+s10; buffer_load s20; endpgm.
@@ -338,6 +357,18 @@ fn bounded_dynamic_cbv_descriptors_select_only_reflected_slots() {
     let mut bad = bounded_cbv_fixture();
     bad.isa[4..8].copy_from_slice(&0x8f0a840au32.to_le_bytes());
     assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+}
+
+#[test]
+fn extracted_descriptor_index_requires_every_selected_cbv() {
+    let mut ex = bounded_cbv_fixture();
+    // Extract bit 11 of s8 instead of masking bit zero, then scale the slot by 32.
+    ex.isa.splice(0..4, [0x938aff08u32, 0x0001000b].into_iter().flat_map(u32::to_le_bytes));
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.resolve_resources().unwrap();
+    assert_eq!(em.bsel.get(&3).unwrap().1.len(), 2);
+    ex.resources[0].upper = 0;
+    assert!(Emitter::new(&ex, disassemble(&ex.isa)).resolve_resources().is_err());
 }
 
 #[test]
