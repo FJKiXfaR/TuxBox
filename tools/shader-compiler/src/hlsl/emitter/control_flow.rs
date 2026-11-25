@@ -1,4 +1,5 @@
 //! Structured branches and loops, and the block dispatcher.
+use std::collections::HashMap;
 use super::*;
 
 impl<'a> Emitter<'a> {
@@ -92,6 +93,14 @@ impl<'a> Emitter<'a> {
             // skipped, and in-body flags are cleared at the bottom of each iteration.
         }
         let labels: BTreeSet<usize> = target.values().copied().collect();
+        // Lowest branch that reaches each label. The per-instruction guard check
+        // only asks whether any branch before it targets the label, so this turns
+        // an O(labels x branches) scan per instruction into one lookup.
+        let mut first_branch: HashMap<usize, usize> = HashMap::new();
+        for (&b, &t) in &target {
+            let e = first_branch.entry(t).or_insert(b);
+            *e = (*e).min(b);
+        }
         for l in &labels {
             self.line(&format!("bool j{l} = false;"));
         }
@@ -155,7 +164,7 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("tb_c{b} = false;"));
             }
             let mut active: Vec<usize> =
-                labels.iter().copied().filter(|&t| t > i && target.iter().any(|(&b, &bt)| bt == t && b < i)).collect();
+                labels.iter().copied().filter(|&t| t > i && first_branch.get(&t).is_some_and(|&b| b < i)).collect();
             if self.page_waves || self.hoist_wave_exchanges {
                 let exchange = if self.page_waves {
                     page_waves::rendezvous(i, ins)?
