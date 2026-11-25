@@ -357,6 +357,10 @@ unsafe fn create(
             }
         }
     }
+    if let Some((code, compiled_idx)) = original[5] {
+        pipeline.compute_threads = tuxbox_dxbc::shader_compute_threads(code)
+            .or_else(|| compiled_idx.and_then(|index| tuxbox_dxbc::shader_compute_threads(&stages[index])));
+    }
     if let Some((code, Some(index))) = original[5]
         && let Some(root) =
             super::compute_scene::private_root(&device.native, code, &stages[index], guest_root, node_mask)?

@@ -5,8 +5,54 @@ use core::ffi::c_void;
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION, D3D12_RESOURCE_DIMENSION_BUFFER,
-
 };
+use windows::core::HRESULT;
+
+/// `COMPUTE_DISPATCH_INITIATOR__USE_THREAD_DIMENSIONS__SHIFT` (bit 5) in AMD
+/// RDNA2 (`drivers/gpu/drm/amd/include/asic_reg/gc/gc_10_3_0_sh_mask.h`).
+const DISPATCH_USE_THREAD_DIMENSIONS: u32 = 0x20;
+/// `COMPUTE_DISPATCH_INITIATOR__CS_W32_EN__SHIFT` (bit 15). Wave width is static
+/// in desktop DXIL; no dynamic wave-mode switch is needed at dispatch.
+const DISPATCH_CS_W32_EN: u32 = 0x8000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlaggedGroups {
+    groups: [u32; 3],
+    used_threads: bool,
+    partial: bool,
+}
+
+fn resolve_flagged_groups(
+    dims: [u32; 3],
+    flags: u32,
+    compute_threads: Option<[u32; 3]>,
+    has_regular_pipeline: bool,
+) -> Result<FlaggedGroups, HRESULT> {
+    if flags & DISPATCH_USE_THREAD_DIMENSIONS == 0 {
+        return Ok(FlaggedGroups {
+            groups: dims,
+            used_threads: false,
+            partial: false,
+        });
+    }
+    let Some(group_size) = compute_threads else {
+        return Err(if has_regular_pipeline { E_NOTIMPL } else { E_INVALIDARG });
+    };
+    if group_size.contains(&0) {
+        return Err(E_NOTIMPL);
+    }
+    let groups = [
+        dims[0].div_ceil(group_size[0]),
+        dims[1].div_ceil(group_size[1]),
+        dims[2].div_ceil(group_size[2]),
+    ];
+    let partial = !dims.contains(&0) && (0..3).any(|i| !dims[i].is_multiple_of(group_size[i]));
+    Ok(FlaggedGroups {
+        groups,
+        used_threads: true,
+        partial,
+    })
+}
 
 pub(super) unsafe extern "system" fn bind_root(list: &List, signature: *mut c_void) {
     let mut state = recording(list);
@@ -136,6 +182,52 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u3
     if !state.can_record(&list.native) {
         return;
     }
+    record_dispatch(list, &mut state, x, y, z);
+}
+
+pub(super) unsafe extern "system" fn dispatch_flagged(list: &List, x: u32, y: u32, z: u32, flags: u32) {
+    let mut state = recording(list);
+    if !state.can_record(&list.native) {
+        return;
+    }
+    if flags & !(DISPATCH_USE_THREAD_DIMENSIONS | DISPATCH_CS_W32_EN) != 0 {
+        static UNKNOWN_FLAGS: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&UNKNOWN_FLAGS, || format!(
+            "slot 80 dispatch observed unexpected COMPUTE_DISPATCH_INITIATOR flags {flags:#x}"
+        ));
+    }
+    let compute_threads = state.bindings.compute_threads();
+    let has_regular_pipeline = matches!(
+        state.bindings.pipeline,
+        Some(super::compute_bindings::Pipeline::Regular(..))
+    );
+    let resolved = match resolve_flagged_groups([x, y, z], flags, compute_threads, has_regular_pipeline) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            crate::diagnostics::recording_error(format_args!(
+                "slot 80 thread-dimension dispatch ({x},{y},{z}) flags={flags:#x} without known compute [numthreads]"
+            ));
+            state.error = error;
+            return;
+        }
+    };
+    let [gx, gy, gz] = resolved.groups;
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || if let Some([nx, ny, nz]) = compute_threads.filter(|_| resolved.used_threads) {
+        format!("slot 80 dispatch threads=({x},{y},{z}) numthreads=({nx},{ny},{nz}) -> groups=({gx},{gy},{gz}) flags={flags:#x}")
+    } else {
+        format!("slot 80 dispatch groups=({gx},{gy},{gz}) flags={flags:#x}")
+    });
+    if resolved.partial && let Some([nx, ny, nz]) = compute_threads {
+        static PARTIAL: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&PARTIAL, || format!(
+            "slot 80 thread-dimension dispatch ({x},{y},{z}) rounded up for [numthreads({nx},{ny},{nz})] to ({gx},{gy},{gz}); desktop Dispatch does not mask surplus threads in the boundary group"
+        ));
+    }
+    record_dispatch(list, &mut state, gx, gy, gz);
+}
+
+fn record_dispatch(list: &List, state: &mut super::Recording, x: u32, y: u32, z: u32) {
     if x.max(y).max(z) > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION {
         state.error = E_INVALIDARG;
         return;
@@ -200,4 +292,65 @@ pub(super) unsafe extern "system" fn copy_buffer(
         list.native
             .CopyBufferRegion(&dst.native, dst_offset, &src.native, src_offset, bytes)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot80_thread_dimensions_convert_to_rounded_groups_and_fail_closed() {
+        // Without USE_THREAD_DIMENSIONS (0x20), dimensions are already group counts,
+        // even when CS_W32_EN (0x8000) or no compute group size is present.
+        assert_eq!(
+            resolve_flagged_groups([45, 1, 1], 0, None, false).unwrap(),
+            FlaggedGroups { groups: [45, 1, 1], used_threads: false, partial: false }
+        );
+        assert_eq!(
+            resolve_flagged_groups([3, 2, 1], DISPATCH_CS_W32_EN, None, false).unwrap(),
+            FlaggedGroups { groups: [3, 2, 1], used_threads: false, partial: false }
+        );
+
+        // With USE_THREAD_DIMENSIONS (0x20 or 0x8020), thread counts divide by [gx, gy, gz] rounded up.
+        assert_eq!(
+            resolve_flagged_groups([45, 1, 1], DISPATCH_USE_THREAD_DIMENSIONS, Some([64, 1, 1]), true).unwrap(),
+            FlaggedGroups { groups: [1, 1, 1], used_threads: true, partial: true }
+        );
+        assert_eq!(
+            resolve_flagged_groups([1, 1, 1], DISPATCH_USE_THREAD_DIMENSIONS | DISPATCH_CS_W32_EN, Some([8, 4, 2]), true).unwrap(),
+            FlaggedGroups { groups: [1, 1, 1], used_threads: true, partial: true }
+        );
+        assert_eq!(
+            resolve_flagged_groups([128, 16, 4], DISPATCH_USE_THREAD_DIMENSIONS, Some([64, 8, 2]), true).unwrap(),
+            FlaggedGroups { groups: [2, 2, 2], used_threads: true, partial: false }
+        );
+        // Zero on any thread axis yields zero groups on that axis and no partial boundary.
+        assert_eq!(
+            resolve_flagged_groups([0, 5, 1], DISPATCH_USE_THREAD_DIMENSIONS, Some([64, 4, 1]), true).unwrap(),
+            FlaggedGroups { groups: [0, 2, 1], used_threads: true, partial: false }
+        );
+        // Large thread counts stay overflow-safe and scale down to valid desktop group counts.
+        assert_eq!(
+            resolve_flagged_groups([70_000, 1, 1], DISPATCH_USE_THREAD_DIMENSIONS, Some([8, 1, 1]), true).unwrap(),
+            FlaggedGroups { groups: [8750, 1, 1], used_threads: true, partial: false }
+        );
+        assert_eq!(
+            resolve_flagged_groups([u32::MAX, u32::MAX, 1], DISPATCH_USE_THREAD_DIMENSIONS, Some([2, 1, 1]), true).unwrap(),
+            FlaggedGroups { groups: [1u32 << 31, u32::MAX, 1], used_threads: true, partial: true }
+        );
+
+        // Unknown or zero [numthreads] fails closed when 0x20 is set.
+        assert_eq!(
+            resolve_flagged_groups([45, 1, 1], DISPATCH_USE_THREAD_DIMENSIONS, None, false),
+            Err(E_INVALIDARG)
+        );
+        assert_eq!(
+            resolve_flagged_groups([45, 1, 1], DISPATCH_USE_THREAD_DIMENSIONS | DISPATCH_CS_W32_EN, None, true),
+            Err(E_NOTIMPL)
+        );
+        assert_eq!(
+            resolve_flagged_groups([45, 1, 1], DISPATCH_USE_THREAD_DIMENSIONS, Some([0, 1, 1]), true),
+            Err(E_NOTIMPL)
+        );
+    }
 }

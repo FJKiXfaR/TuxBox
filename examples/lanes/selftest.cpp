@@ -9,9 +9,9 @@
 #include <fstream>
 #include <iterator>
 #include <vector>
-#include "xbox_shader.h"
 #include "course_shader.h"
 #include "reclaim_shader.h"
+#include "xbox_shader.h"
 #include <algorithm>
 #include <memory>
 
@@ -32,8 +32,9 @@ constexpr DWORD deadline_ms = 2000;
 
 // Xbox command-list and queue slots (GDK gen9/d3d12_xs.h).
 constexpr size_t slot_copy_memory = 62, slot_write32 = 71, slot_write64 = 72, slot_wait64 = 74,
-                 slot_copy_texture = 83, slot_build = 119, slot_emit_sizes = 120, slot_sync_top = 131, slot_sync_bottom = 132;
-constexpr size_t slot_compute_root = 33, device_create_compute = 62;
+                 slot_dispatch_flagged = 80, slot_copy_texture = 83, slot_build = 119,
+                 slot_emit_sizes = 120, slot_sync_top = 131, slot_sync_bottom = 132;
+constexpr size_t slot_compute_root = 33, device_create_compute = 62, device_create_stream = 86;
 constexpr size_t slot_bind_heaps = 32, slot_compute_table = 35, queue_wait = 17;
 constexpr size_t slot_execute_indirect = 61, slot_root_constants = 39, slot_root_uav = 45;
 constexpr size_t queue_signal = 16, queue_execute_frame = 35, device_place = 44, device_create_list = 73;
@@ -42,12 +43,15 @@ using CopyMemory_ = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT64, U
 using Write32 = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT, UINT, UINT);
 using Write64 = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT64, UINT, UINT);
 using Wait64 = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, D3D12_COMPARISON_FUNC, UINT64, UINT);
+using DispatchFlagged = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 using Build = void (WINAPI*)(ID3D12GraphicsCommandList*, const void*, UINT, const void*);
 using Sync = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT64, UINT64);
 using SignalQueue = HRESULT (WINAPI*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 using ExecuteFrame = void (WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*, UINT64, UINT);
 using CreateComputePipeline = HRESULT (WINAPI*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
                                                 UINT, const void*, REFIID, void**);
+using CreateStreamPipeline = HRESULT (WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*,
+                                               REFIID, void**);
 using SetRoot = void (WINAPI*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
 using ExecuteIndirect_ = void (WINAPI*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT,
                                          ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
@@ -997,6 +1001,138 @@ void descriptor_reclaim(ID3D12Device* device) {
     compute.signal();
     compute.finish("pinned control and post-OOM recovery");
     verify_outputs(next_idx, "fail-closed OOM control");
+// Slot 80 (dispatch_flagged) with USE_THREAD_DIMENSIONS (0x20) counts threads
+// rather than groups, converting via the bound PSO's [numthreads(8, 1, 1)].
+void thread_dimensions(ID3D12Device* device) {
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {1, 2, 2};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[1].Descriptor = {2, 1};
+    D3D12_ROOT_SIGNATURE_DESC sig{};
+    sig.NumParameters = 2;
+    sig.pParameters = params;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&sig, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize thread-dimensions root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create thread-dimensions root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {course_dxil, sizeof(course_dxil)};
+    ComPtr<ID3D12PipelineState> pipeline, stream_pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create thread-dimensions compute pipeline");
+    struct alignas(void*) ComputeStream {
+        int root_tag = 0;
+        UINT pad0 = 0;
+        ID3D12RootSignature* root = nullptr;
+        int cs_tag = 6;
+        UINT pad1 = 0;
+        D3D12_SHADER_BYTECODE cs{};
+    } stream{};
+    static_assert(sizeof(ComputeStream) == 40);
+    stream.root = root.Get();
+    stream.cs = shader.CS;
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+    check(method<CreateStreamPipeline>(device, device_create_stream)(device, &stream_desc,
+                                                                     IID_PPV_ARGS(&stream_pipeline)),
+          "create thread-dimensions stream pipeline");
+
+    Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    auto dispatch_flagged = method<DispatchFlagged>(compute.list.Get(), slot_dispatch_flagged);
+
+    // Fail closed when flags & 0x20 is set without a bound compute pipeline.
+    dispatch_flagged(compute.list.Get(), 8, 1, 1, 0x20);
+    if (SUCCEEDED(compute.list->Close()))
+        throw std::runtime_error("slot 80 thread-dimension dispatch accepted without a pipeline");
+    check(compute.list->Reset(compute.allocator.Get(), pipeline.Get()), "reset after missing pipeline");
+    compute.list->ClearState(nullptr);
+    dispatch_flagged(compute.list.Get(), 8, 1, 1, 0x8020);
+    if (SUCCEEDED(compute.list->Close()))
+        throw std::runtime_error("slot 80 thread-dimension dispatch accepted after ClearState(nullptr)");
+
+    constexpr UINT words = 64, guard = 0xdeadbeefu;
+    constexpr UINT64 bytes = words * sizeof(UINT);
+    std::array<UINT, words> seed_words;
+    seed_words.fill(guard);
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    compute_fixture::upload(seed.Get(), seed_words.data(), bytes);
+
+    struct Pass {
+        UINT x;
+        UINT flags;
+        UINT row_count;
+        UINT expected_written;
+        UINT mode; // 0 = Reset(pipeline), 1 = SetPipelineState(stream_pipeline), 2 = ClearState(pipeline)
+    };
+    constexpr Pass passes[] = {
+        {16, 0x20, words, 16, 0},
+        {8, 0x8020, words, 8, 1},
+        {70000, 0x20, 24, 24, 2},
+        {13, 0x20, 13, 13, 0},
+        {0, 0x20, words, 0, 0},
+        {2, 0x0, words, 16, 0},
+        {1, 0x8000, words, 8, 1},
+    };
+    const UINT seed_value = 7;
+    auto expected_word = [&](UINT row) {
+        const UINT beat = (row + seed_value) & 3u;
+        const UINT coin = beat == 3u ? 1u : beat;
+        UINT mixed = (row + seed_value) * 747796405u + 2891336453u;
+        mixed ^= mixed >> 16;
+        const UINT barrier = (coin + 1u + (mixed & 1u)) % 3u;
+        return coin | (barrier << 8);
+    };
+    for (size_t i = 0; i < std::size(passes); ++i) {
+        const auto& pass = passes[i];
+        check(compute.allocator->Reset(), "reset thread-dimensions allocator");
+        check(compute.list->Reset(compute.allocator.Get(), pass.mode == 0 ? pipeline.Get() : nullptr),
+              "reset thread-dimensions list");
+        if (i != 0)
+            compute_fixture::transition(compute.list.Get(), output.Get(),
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        compute.list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+        compute_fixture::transition(compute.list.Get(), output.Get(),
+                                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (pass.mode == 1)
+            compute.list->SetPipelineState(stream_pipeline.Get());
+        else if (pass.mode == 2)
+            compute.list->ClearState(pipeline.Get());
+        auto* raw = compute.list.Get();
+        const UINT constants[] = {seed_value, pass.row_count};
+        method<SetRoot>(raw, slot_compute_root)(raw, root.Get());
+        method<SetConstants>(raw, slot_root_constants)(raw, 0, 2, constants, 0);
+        method<SetUav>(raw, slot_root_uav)(raw, 1, output->GetGPUVirtualAddress());
+        dispatch_flagged(raw, pass.x, 1, 1, pass.flags);
+        compute_fixture::transition(compute.list.Get(), output.Get(),
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        compute.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+        compute.submit();
+        compute.finish("slot 80 dispatch");
+
+        std::array<UINT, words> actual{};
+        D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)}, empty{};
+        void* mapped{};
+        check(readback->Map(0, &range, &mapped), "map thread-dimensions readback");
+        std::memcpy(actual.data(), mapped, bytes);
+        readback->Unmap(0, &empty);
+        for (UINT row = 0; row < words; ++row) {
+            const UINT expected = row < pass.expected_written ? expected_word(row) : guard;
+            if (actual[row] != expected) {
+                char msg[160];
+                std::snprintf(msg, sizeof(msg),
+                              "pass %zu (x=%u flags=%#x) row %u: expected %#x, found %#x",
+                              i, pass.x, pass.flags, row, expected, actual[row]);
+                throw std::runtime_error(msg);
+            }
+        }
+    }
 }
 
 struct Scenario {
@@ -1014,6 +1150,7 @@ constexpr Scenario scenarios[] = {
     {L"texture-readback", texture_readback},
     {L"ray-tracing-builder", ray_tracing_builder},
     {L"descriptor-reclaim", descriptor_reclaim},
+    {L"thread-dimensions", thread_dimensions},
     {L"xbox-shader", xbox_shader_scenario},
 };
 
@@ -1065,6 +1202,10 @@ const wchar_t* const selftest_scenarios[] = {L"labels",          L"cross-queue",
                                              L"skipped-command", L"copy-memory", L"shared-texture",
                                              L"indirect-dispatch", L"texture-readback",
                                              L"ray-tracing-builder", L"descriptor-reclaim", L"xbox-shader"};
+const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
+                                             L"skipped-command",   L"copy-memory",      L"shared-texture",
+                                             L"indirect-dispatch", L"texture-readback", L"ray-tracing-builder",
+                                             L"thread-dimensions", L"xbox-shader"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

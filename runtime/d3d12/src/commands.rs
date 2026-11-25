@@ -1275,14 +1275,12 @@ fn write_dword(list: &List, state: &mut Recording, address: u64, value: u32) -> 
 }
 
 // XboxBvhBuilder emits this when its inline packet space is exhausted, with
-// the same words it otherwise writes as a 0x4003cc00 packet: group counts X,
-// Y, Z and a flags word (0x20 or 0x8020 in the rehydrate path). The flags have
-// no desktop equivalent, so the dispatch is recorded as an ordinary one.
+// the same words it otherwise writes as a 0x4003cc00 packet: counts X, Y, Z
+// and the hardware COMPUTE_DISPATCH_INITIATOR flags word. When bit 5
+// (USE_THREAD_DIMENSIONS, 0x20) is set, X/Y/Z count threads and are divided
+// by the bound compute PSO's [numthreads] (rounded up).
 unsafe extern "system" fn dispatch_flagged(list: &List, x: u32, y: u32, z: u32, flags: u32) {
-    static FIRST: std::sync::Once = std::sync::Once::new();
-    crate::diagnostics::log_once(&FIRST, || format!(
-        "slot 80 dispatch groups=({x},{y},{z}) flags={flags:#x}"));
-    unsafe { compute::dispatch(list, x, y, z) }
+    unsafe { compute::dispatch_flagged(list, x, y, z, flags) }
 }
 
 static LIST_SLOTS: Slots<149> = {

@@ -69,7 +69,7 @@ impl SceneCheck {
 }
 
 pub(super) enum Pipeline {
-    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>),
+    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>),
     Ray(ID3D12StateObject),
 }
 
@@ -109,7 +109,7 @@ pub(super) enum Argument {
 
 impl From<&GuestPipeline> for Pipeline {
     fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone())
+        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads)
     }
 }
 
@@ -245,9 +245,16 @@ impl Bindings {
         }
     }
 
+    pub(super) fn compute_threads(&self) -> Option<[u32; 3]> {
+        match self.pipeline.as_ref() {
+            Some(Pipeline::Regular(.., threads)) => *threads,
+            _ => None,
+        }
+    }
+
     pub(super) fn reflected_table<const COMPUTE: bool>(&self) -> Option<&ComputeTable> {
         match &self.pipeline {
-            Some(Pipeline::Regular(_, _, compute, raster)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
+            Some(Pipeline::Regular(_, _, compute, raster, _)) => if COMPUTE { compute.as_deref() } else { raster.as_deref() },
             _ => None,
         }
     }
@@ -335,7 +342,7 @@ impl Bindings {
 
     pub(super) fn scene_root(&self) -> Option<&SceneRoot> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(_, root, _, _)) => root.as_ref(),
+            Some(Pipeline::Regular(_, root, _, _, _)) => root.as_ref(),
             _ => None,
         }
     }
@@ -519,7 +526,7 @@ impl Bindings {
                 host.SetGraphicsRootDescriptorTable(slot, base.native);
             }
             match self.pipeline.as_ref() {
-                Some(Pipeline::Regular(pso, _, _, _)) => host.SetPipelineState(pso),
+                Some(Pipeline::Regular(pso, _, _, _, _)) => host.SetPipelineState(pso),
                 Some(Pipeline::Ray(pso)) => host.SetPipelineState1(pso),
                 None => {}
             }
