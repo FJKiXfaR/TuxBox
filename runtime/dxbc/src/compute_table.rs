@@ -6,6 +6,8 @@ use crate::{Dxbc, compute_threads, xdat};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Binding {
     pub table: u32,
+    /// The descriptor range type (0 SRV, 1 UAV, 2 CBV), or ROOT_SRV, for which
+    /// `table` is the root parameter and `slot` is 0.
     pub kind: u32,
     pub register: u32,
     pub space: u32,
@@ -141,17 +143,34 @@ fn read_bindings(
             && compute_threads(psv) == Some([32, 1, 1]))
         .and_then(|_| resolve_constants_register(program));
     let mut resolve_constants = None;
+    let multi_table = root.filter(|root| stage <= 1 && leading_tables(root) > 1);
     for [class, offset, register, shape, location] in records {
-        let table = if stage == 5 { location >> 16 } else { 0 };
+        let raster_table = match multi_table {
+            Some(root) if matches!(class, 0x300 | 0x302 | 0x303) => Some(multi_table_descriptor(location, root)?),
+            _ => None,
+        };
+        // Root constants name their parameter the same way; the user-data check
+        // below confirms that parameter's register and SGPR.
+        let raster_constants = multi_table.is_some() && class == 2;
+        // A root SRV: its 64-bit address arrives in two SGPRs, and the record
+        // names its root parameter the same way (as mesh_table reads it).
+        let raster_root_srv = multi_table.is_some() && class == 0x100;
+        let table = if stage == 5 || raster_constants || raster_root_srv { location >> 16 }
+            else { raster_table.map_or(0, |(table, _)| table) };
         // Root-less raster programs (RAGE) can receive their descriptor table in
         // s9 instead of s8. The descriptor encodings are otherwise identical.
-        let descriptor_location = if stage <= 1 && matches!(class, 0x300 | 0x302 | 0x303)
+        let descriptor_location = if let Some((_, normalized)) = raster_table {
+            normalized
+        } else if stage <= 1 && matches!(class, 0x300 | 0x302 | 0x303)
             && (location >> 8) & 0xff == 9 { 0x800 | (location & 0xff) } else { location };
         let (kind, psv_type) = match (class, descriptor_location) {
             (0x300, 0x408 | 0x10508) if stage == 5 => (0, 3), // typed SRV
             // A four-dword buffer descriptor represents typed, raw or structured
             // views. PSV distinguishes those encodings, and FSSM gives the stride.
-            (0x300 | 0x303, 0x404 | 0x10504) if stage == 5 => {
+            (0x300 | 0x303, 0x404 | 0x10504) | (0x303, 0x804)
+                if stage == 5 && descriptor_location != 0x804
+                    || stage <= 1 && descriptor_location == 0x804 && multi_table.is_some() =>
+            {
                 let uav = class == 0x303;
                 let typed = if uav { 6 } else { 3 };
                 let raw = typed + 1;
@@ -171,10 +190,18 @@ fn read_bindings(
             (0x300, 0x808) if stage <= 1 => (0, 3),
             (0x303, 0x808) if stage <= 1 => (1, 6),
             (0x300, 0x804) if stage <= 1 && shape == 1 => (0, 4), // raw SRV
-            (0x300, 0x804) if stage <= 1 && (4..=2048).contains(&shape) && shape % 4 == 0 => (0, 5), // structured SRV
+            // Structured SRV, or a typed buffer when PSV names no structured view here.
+            (0x300, 0x804) if stage <= 1 && (4..=2048).contains(&shape) && shape % 4 == 0 => {
+                let named = |ty| rows.chunks_exact(stride)
+                    .any(|r| word(r, 0) == Some(ty) && word(r, 8) == Some(register) && word(r, 12) == Some(register));
+                // Only under the newly reflected roots, so other paths keep their result.
+                (0, if named(5) || multi_table.is_none() { 5 } else { 3 })
+            }
             (0x302, 0x804) if stage <= 1 => (2, 2),
             (2, 0x10904) if stage == 0 => (4, 2), // root constants in s9
+            (2, _) if raster_constants && location & 0xff == 4 => (4, 2),
             (2, 0x10504 | 0x20604) if stage == 5 => (4, 2),
+            (0x100, _) if raster_root_srv && location & 0xff == 4 && shape == 1 => (ROOT_SRV, 4),
             (0x401, _) => (3, 1),                 // inlined static sampler
             _ => return None,
         };
@@ -202,11 +229,18 @@ fn read_bindings(
                 } else if (reg, sp) != (register, space) {
                     return None;
                 }
+            } else if kind == ROOT_SRV {
+                let param = root.params.get(table as usize)?;
+                if param.visibility != 0 || offset != 0
+                    || !matches!(param.kind, RootParamKind::Descriptor { kind: 3, .. })
+                    || !user_layout.contains(&[1, 0, 2, register, location >> 8]) {
+                    return None;
+                }
             } else if kind < 3 && !user_layout.contains(&[3, offset, 1, register, location >> 8]) {
                 return None;
             }
         }
-        if kind >= 3 {
+        if kind == 3 || kind == 4 {
             continue;
         }
         if offset % 8 != 0 || bindings.iter().any(|b: &Binding| (b.table, b.slot) == (table, offset / 8)) {
@@ -323,6 +357,43 @@ pub fn missing_root_descriptors(bytes: &[u8], root: &crate::rootsig::RootSig) ->
         found.push(binding);
     }
     found
+}
+
+/// Binding kind for a root SRV read through its GPU address in two SGPRs. The
+/// shader names it with its own register, which the host root must then carry.
+pub const ROOT_SRV: u32 = 5;
+
+/// A raster descriptor record under a root with several leading tables names its
+/// table in the high half of the location, as compute records do, and table N is
+/// read from s8 + N. Returns the table and the location in the single-table (s8)
+/// encoding, or None when the record names no such table.
+fn multi_table_descriptor(location: u32, root: &crate::rootsig::RootSig) -> Option<(u32, u32)> {
+    let table = location >> 16;
+    ((location >> 8) & 0xff == 8 + table && (table as usize) < leading_tables(root))
+        .then_some((table, 0x800 | (location & 0xff)))
+}
+
+/// Merge vertex and pixel table bindings under one root. Both stages must agree:
+/// a slot holding two registers, or a register at two slots, returns None.
+pub fn merge_raster_bindings(mut vertex: Vec<Binding>, pixel: Vec<Binding>) -> Option<Vec<Binding>> {
+    for b in pixel {
+        let same_slot = vertex.iter().find(|r| (r.table, r.slot) == (b.table, b.slot));
+        let same_register = vertex.iter().find(|r| (r.kind, r.register, r.space) == (b.kind, b.register, b.space));
+        match (same_slot, same_register) {
+            (Some(existing), _) if *existing == b => {}
+            (None, None) => vertex.push(b),
+            _ => return None,
+        }
+    }
+    vertex.sort_by_key(|r| (r.table, r.slot));
+    Some(vertex)
+}
+
+/// How many root parameters, from the first, are descriptor tables.
+pub fn leading_tables(root: &crate::rootsig::RootSig) -> usize {
+    root.params.iter()
+        .take_while(|param| matches!(param.kind, crate::rootsig::RootParamKind::Table(_)))
+        .count()
 }
 
 fn table_parameter(stage: u32, sgpr: u8) -> Option<u32> {
@@ -812,6 +883,125 @@ mod tests {
         assert_eq!((kind, psv), (0, 3));
         let (kind, psv) = descriptor_class(0x302, 0x904, 0, 1, 8, &[]).unwrap();
         assert_eq!((kind, psv), (2, 2));
+    }
+
+    fn tables_then(kinds: &[RootParamKind]) -> RootSig {
+        RootSig {
+            version: 2,
+            flags: 0,
+            params: kinds.iter().cloned().map(|kind| RootParam { visibility: 0, kind }).collect(),
+            num_static_samplers: 0,
+            static_samplers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn leading_tables_counts_only_the_first_run_of_tables() {
+        let table = RootParamKind::Table(Vec::new());
+        let constants = RootParamKind::Constants { register: 500, space: 0, num32: 1 };
+        let srv = RootParamKind::Descriptor { kind: 3, register: 0, space: 3 };
+        assert_eq!(leading_tables(&tables_then(&[table.clone(), table.clone(), table.clone(), srv, constants.clone()])), 3);
+        assert_eq!(leading_tables(&tables_then(&[table.clone(), constants.clone(), table.clone()])), 1);
+        assert_eq!(leading_tables(&tables_then(&[constants, table])), 0);
+    }
+
+    #[test]
+    fn multi_table_raster_records_name_their_table() {
+        let table = RootParamKind::Table(Vec::new());
+        let constants = RootParamKind::Constants { register: 500, space: 0, num32: 1 };
+        let two = tables_then(&[table.clone(), table.clone(), constants]);
+        // Table N is read from s8 + N; the location keeps the descriptor width.
+        assert_eq!(multi_table_descriptor(0x0808, &two), Some((0, 0x808)));
+        assert_eq!(multi_table_descriptor(0x1_0908, &two), Some((1, 0x808)));
+        assert_eq!(multi_table_descriptor(0x1_0904, &two), Some((1, 0x804)));
+        // A table index that disagrees with the SGPR, or names a parameter that is
+        // not a leading table, fails closed.
+        assert_eq!(multi_table_descriptor(0x1_0808, &two), None);
+        assert_eq!(multi_table_descriptor(0x0908, &two), None);
+        assert_eq!(multi_table_descriptor(0x2_0a08, &two), None);
+        let three = tables_then(&[table.clone(), table.clone(), table]);
+        assert_eq!(multi_table_descriptor(0x2_0a04, &three), Some((2, 0x804)));
+    }
+
+    #[test]
+    fn raster_stage_bindings_merge_only_when_they_agree() {
+        let b = |table, kind, register, space, slot| Binding { table, kind, register, space, slot };
+        let vs = vec![b(1, 0, 4, 1, 2), b(0, 2, 0, 1, 0)];
+        // Shared identical binding, plus a new one: merged and sorted by (table, slot).
+        assert_eq!(merge_raster_bindings(vs.clone(), vec![b(0, 2, 0, 1, 0), b(0, 0, 3, 0, 5)]),
+            Some(vec![b(0, 2, 0, 1, 0), b(0, 0, 3, 0, 5), b(1, 0, 4, 1, 2)]));
+        // One slot, two registers.
+        assert_eq!(merge_raster_bindings(vs.clone(), vec![b(1, 0, 9, 1, 2)]), None);
+        // One register, two slots.
+        assert_eq!(merge_raster_bindings(vs.clone(), vec![b(0, 0, 4, 1, 7)]), None);
+        // Same register number in another space or kind is a different binding.
+        assert_eq!(merge_raster_bindings(vs, vec![b(0, 0, 4, 2, 7), b(0, 1, 4, 1, 8)]).map(|v| v.len()), Some(4));
+    }
+
+    /// A one-program raster stage: FSSM user and used rows, and PSV resource rows
+    /// ([type, space, lower, upper]; one per used row).
+    fn raster_shader(stage: u32, user: &[[u32; 5]], used: &[[u32; 5]], psv_rows: &[[u32; 4]]) -> Vec<u8> {
+        let xdat = crate::xdat::tests::container(&[(13, crate::xdat::tests::xbch(&program(user, used)))]);
+        let mut dxil = vec![0u8; 24];
+        put_u32(&mut dxil, 0, stage << 16);
+        dxil[8..12].copy_from_slice(b"DXIL");
+        dxil.extend(xdat);
+        let mut psv = vec![0u8; 36];
+        put_u32(&mut psv, 0, 32);
+        psv[28] = stage as u8;
+        psv.extend((psv_rows.len() as u32).to_le_bytes());
+        psv.extend(16u32.to_le_bytes());
+        psv.extend(psv_rows.iter().flatten().flat_map(|w| w.to_le_bytes()));
+        crate::container::tests::container_with(&[(b"DXIL", &dxil), (b"PSV0", &psv)])
+    }
+
+    /// [table, table, table, root SRV t4 space3, constants b500].
+    fn three_tables_srv_constants() -> RootSig {
+        let table = RootParamKind::Table(Vec::new());
+        tables_then(&[table.clone(), table.clone(), table,
+            RootParamKind::Descriptor { kind: 3, register: 4, space: 3 },
+            RootParamKind::Constants { register: 500, space: 0, num32: 1 }])
+    }
+
+    #[test]
+    fn multi_table_root_srv_carries_the_shader_register() {
+        let root = three_tables_srv_constants();
+        // Parameter 3's address arrives in s11-s12; the shader names it t5 space7.
+        let used = [[0x100, 0, 5, 1, 0x3_0b04]];
+        let srv = raster_shader(1, &[[1, 0, 2, 5, 0x30b]], &used, &[[4, 7, 5, 5]]);
+        assert_eq!(root_bindings(&srv, 1, &root),
+            Some(vec![Binding { table: 3, kind: ROOT_SRV, register: 5, space: 7, slot: 0 }]));
+        // Without the user-data row, or when parameter 3 is not a root SRV, it fails closed.
+        assert_eq!(root_bindings(&raster_shader(1, &[], &used, &[[4, 7, 5, 5]]), 1, &root), None);
+        let mut constants = root.clone();
+        constants.params[3].kind = RootParamKind::Constants { register: 5, space: 7, num32: 2 };
+        assert_eq!(root_bindings(&srv, 1, &constants), None);
+        // Root-less callers never see a root SRV binding.
+        assert_eq!(bindings(&srv, 1), None);
+    }
+
+    #[test]
+    fn multi_table_raster_buffer_views_follow_psv() {
+        let root = three_tables_srv_constants();
+        // A raw UAV in table 0 (s8) and a typed SRV buffer in table 1 (s9).
+        let user = [[3, 8, 1, 2, 0x008], [3, 16, 1, 3, 0x109]];
+        let used = [[0x303, 8, 2, 1, 0x0804], [0x300, 16, 3, 4, 0x1_0904]];
+        let shader = raster_shader(0, &user, &used, &[[7, 1, 2, 2], [3, 2, 3, 3]]);
+        assert_eq!(root_bindings(&shader, 0, &root), Some(vec![
+            Binding { table: 0, kind: 1, register: 2, space: 1, slot: 1 },
+            Binding { table: 1, kind: 0, register: 3, space: 2, slot: 2 },
+        ]));
+        // PSV must confirm the view type: a raw UAV named typed is refused.
+        assert_eq!(root_bindings(&raster_shader(0, &user, &used, &[[6, 1, 2, 2], [3, 2, 3, 3]]), 0, &root), None);
+        // Under a single-table root the same typed SRV buffer keeps its old result.
+        let single = tables_then(&[RootParamKind::Table(Vec::new()),
+            RootParamKind::Constants { register: 500, space: 0, num32: 1 }]);
+        let typed = raster_shader(0, &[[3, 16, 1, 3, 0x008]], &[[0x300, 16, 3, 4, 0x0804]], &[[3, 2, 3, 3]]);
+        assert_eq!(root_bindings(&typed, 0, &single), None);
+        assert_eq!(bindings(&typed, 0), None);
+        let uav = raster_shader(0, &[[3, 8, 1, 2, 0x008]], &[[0x303, 8, 2, 1, 0x0804]], &[[7, 1, 2, 2]]);
+        assert_eq!(root_bindings(&uav, 0, &single), None);
+        assert_eq!(bindings(&uav, 0), None);
     }
 
     #[test]

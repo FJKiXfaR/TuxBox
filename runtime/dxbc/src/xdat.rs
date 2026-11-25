@@ -118,11 +118,11 @@ pub fn programs(xdat: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use miniz_oxide::deflate::compress_to_vec_zlib;
 
-    fn xbch(program: &[u8]) -> Vec<u8> {
+    pub(crate) fn xbch(program: &[u8]) -> Vec<u8> {
         let compressed = compress_to_vec_zlib(program, 6);
         let mut section = Vec::from(*b"XBCH");
         section.extend(3u32.to_le_bytes());
@@ -132,7 +132,7 @@ mod tests {
         section
     }
 
-    fn container(parts: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    pub(crate) fn container(parts: &[(u32, Vec<u8>)]) -> Vec<u8> {
         let mut data = Vec::from(*b"XDAT");
         data.extend((parts.len() as u32).to_le_bytes());
         data.extend(36u32.to_le_bytes());

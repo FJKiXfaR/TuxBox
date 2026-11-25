@@ -72,6 +72,26 @@ pub(super) fn reflected(
                 tuxbox_dxbc::compute_table::bindings(shader, 5)
             }
         }
+        // Several leading tables (each read from s8 + N), then any root descriptors and
+        // constants, which pass through unchanged. Every descriptor must be confirmed
+        // by the user-data layout of both stages.
+        (Program::Raster { vertex, pixel }, params)
+            if tuxbox_dxbc::compute_table::leading_tables(&signature) > 1
+                && params[tuxbox_dxbc::compute_table::leading_tables(&signature)..].iter().all(|p| {
+                    matches!(p.kind, RootParamKind::Constants { .. } | RootParamKind::Descriptor { .. })
+                }) =>
+        {
+            let get = |shader: &[u8], stage| tuxbox_dxbc::compute_table::root_bindings(shader, stage, &signature);
+            // These roots took the guest root before. Anything the stages disagree
+            // on keeps that.
+            let Some(bindings) = get(vertex, 1).zip(get(pixel, 0))
+                .and_then(|(v, p)| tuxbox_dxbc::compute_table::merge_raster_bindings(v, p))
+            else {
+                return Ok(TableLayout::Unsupported);
+            };
+            corroborated_raster = true;
+            Some(bindings)
+        }
         (Program::Raster { vertex, pixel }, [table, rest @ ..])
             if matches!(table.kind, RootParamKind::Table(_)) && (rest.is_empty()
                 || matches!(rest, [param] if signature.flags & 0xc00 != 0 &&
@@ -129,11 +149,28 @@ pub(super) fn reflected(
         }
         return Ok(TableLayout::Unsupported);
     };
+    // Root SRVs read through their address keep their parameter; only the
+    // register the shader names for them can change.
+    let (root_srvs, bindings): (Vec<_>, Vec<_>) =
+        bindings.into_iter().partition(|b| b.kind == tuxbox_dxbc::compute_table::ROOT_SRV);
+    let mut srv_registers = Vec::new();
+    for b in &root_srvs {
+        let Some(RootParamKind::Descriptor { kind: 3, register, space }) =
+            signature.params.get(b.table as usize).map(|p| &p.kind) else {
+            return Ok(TableLayout::Unsupported);
+        };
+        if (*register, *space) != (b.register, b.space) {
+            srv_registers.push((b.table as usize, b.register, b.space));
+        }
+    }
+    // A reflected table binds through the resource heap at draw time, so a root
+    // SRV rename alone (no table binding) keeps the guest root.
     if signature.version != 2 || (bindings.is_empty() && scalar_index.is_none()) {
         return Ok(TableLayout::Unsupported);
     }
-    let mut lengths = [0; 2];
-    let mut rewrite = [false; 2];
+    let tables = signature.params.len().max(2);
+    let mut lengths = vec![0; tables];
+    let mut rewrite = vec![false; tables];
     let mut accessed_views = Vec::new();
     for (index, param) in signature.params.iter().enumerate() {
         if let RootParamKind::Table(ranges) = &param.kind
@@ -165,7 +202,8 @@ pub(super) fn reflected(
         !matches!(signature.params[2].kind, RootParamKind::Constants { register, space, .. }
             if (register, space) == (c.register, c.space))
     });
-    if !rewrite.contains(&true) && scalar_index.is_none() && rewrite_constants.is_none() && recovered_samplers.is_empty() {
+    if !rewrite.contains(&true) && srv_registers.is_empty() && scalar_index.is_none()
+        && rewrite_constants.is_none() && recovered_samplers.is_empty() {
         return Ok(TableLayout::Original);
     }
 
@@ -188,7 +226,7 @@ pub(super) fn reflected(
         }
         let mut parameters =
             std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec();
-        let mut range_storage = [Vec::new(), Vec::new()];
+        let mut range_storage = vec![Vec::new(); tables];
         for (index, ranges) in range_storage.iter_mut().enumerate().filter(|(i, _)| rewrite[*i]) {
             let parameter = &mut parameters[index];
             let table = parameter.Anonymous.DescriptorTable;
@@ -215,6 +253,14 @@ pub(super) fn reflected(
             parameter.Anonymous.DescriptorTable = D3D12_ROOT_DESCRIPTOR_TABLE1 {
                 NumDescriptorRanges: ranges.len() as u32, pDescriptorRanges: ranges.as_ptr(),
             };
+        }
+        for &(index, register, space) in &srv_registers {
+            let parameter = &mut parameters[index];
+            if parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV {
+                return Ok(TableLayout::Unsupported);
+            }
+            parameter.Anonymous.Descriptor.ShaderRegister = register;
+            parameter.Anonymous.Descriptor.RegisterSpace = space;
         }
         if let Some(constants) = rewrite_constants {
             parameters[2].Anonymous.Constants = D3D12_ROOT_CONSTANTS {
@@ -268,7 +314,7 @@ pub(super) fn reflected(
             native,
             original: original.clone(),
             layout: RootSource::new(bytes),
-            lengths: lengths.into(),
+            lengths,
             accessed_views,
             index_map,
             mirrors: Vec::new(),

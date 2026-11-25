@@ -297,9 +297,56 @@ unsafe fn create(
         && original[2..].iter().all(Option::is_none)
     {
         use super::compute_table::{Program, TableLayout};
-        let layout = super::compute_table::reflected(
+        // Roots with several tables were left to the guest root and the root-less
+        // translations before their tables could be reflected. Keep that whenever
+        // the reflected root cannot be built, or either stage has no translation
+        // against it, so a pipeline that worked before is never refused now.
+        let multi_table = tuxbox_dxbc::rootsig::parse_rts0(root.payload())
+            .is_ok_and(|sig| tuxbox_dxbc::compute_table::leading_tables(&sig) > 1);
+        let mut not_built = false;
+        let layout = match super::compute_table::reflected(
             &device.native, root, Program::Raster { vertex, pixel }, node_mask,
-        )?;
+        ) {
+            Err(_) if multi_table => {
+                not_built = true;
+                TableLayout::Unsupported
+            }
+            layout => layout?,
+        };
+        let layout = match layout {
+            // Stencil export is redirected after this, and draws refuse it with a
+            // reflected table, so those pixel shaders keep the guest root.
+            TableLayout::Original | TableLayout::Reflected(_)
+                if multi_table && tuxbox_dxbc::exports_stencil_reference(pixel) =>
+            {
+                multi_table_trace("stencil export, kept guest root");
+                TableLayout::Unsupported
+            }
+            TableLayout::Original | TableLayout::Reflected(_) if multi_table => {
+                let payload = match &layout {
+                    TableLayout::Reflected(table) => table.layout.payload(),
+                    _ => root.payload(),
+                };
+                let untranslated = [vertex, pixel].into_iter().position(|source| {
+                    shader_cache::raster_with_root(source, payload)
+                        .is_none_or(|variant| shader_cache::prepared(&variant).is_none())
+                });
+                multi_table_trace(match (&layout, untranslated) {
+                    (_, Some(0)) => "vertex untranslated, kept guest root",
+                    (_, Some(_)) => "pixel untranslated, kept guest root",
+                    (TableLayout::Reflected(_), None) => "reflected",
+                    _ => "original",
+                });
+                if untranslated.is_none() { layout } else { TableLayout::Unsupported }
+            }
+            TableLayout::Unsupported if multi_table => {
+                multi_table_trace(if not_built { "root not built, kept guest root" } else {
+                    unresolved_reason(root.payload(), vertex, pixel)
+                });
+                TableLayout::Unsupported
+            }
+            layout => layout,
+        };
         let root = match layout {
             TableLayout::Original => Some(root),
             TableLayout::Reflected(table) => {
@@ -856,6 +903,44 @@ unsafe fn create_pipeline_inner(
         native.as_ref().err().map(|e| e.code().0),
     );
     unsafe { wrap_pageable(native, &compute::PIPELINE, device, state, out) }
+}
+
+/// With TUXBOX_TRACE_RASTER_ROOTS=1, tally how raster pipelines with several
+/// root tables were created, logging the running totals every 128 pipelines.
+fn multi_table_trace(outcome: &'static str) {
+    use std::collections::BTreeMap;
+    use std::sync::{LazyLock, Mutex};
+    static TOTALS: LazyLock<Mutex<BTreeMap<&'static str, u32>>> = LazyLock::new(Default::default);
+    if !trace_raster_roots() { return; }
+    let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+    *totals.entry(outcome).or_default() += 1;
+    let seen: u32 = totals.values().sum();
+    if seen == 1 || seen.is_multiple_of(128) {
+        crate::diagnostics::log(&format!("multi-table raster roots after {seen} pipelines: {totals:?}"));
+    }
+}
+
+/// Why a raster root with several tables was not reflected, for the trace.
+fn unresolved_reason(payload: &[u8], vertex: &[u8], pixel: &[u8]) -> &'static str {
+    use tuxbox_dxbc::compute_table::{merge_raster_bindings, root_bindings};
+    if !trace_raster_roots() { return ""; }
+    let Ok(sig) = tuxbox_dxbc::rootsig::parse_rts0(payload) else { return "root unparsed" };
+    match (root_bindings(vertex, 1, &sig), root_bindings(pixel, 0, &sig)) {
+        (None, None) => "both stages unresolved",
+        (None, Some(_)) => "vertex unresolved",
+        (Some(_), None) => "pixel unresolved",
+        (Some(v), Some(p)) => if merge_raster_bindings(v, p).is_none() {
+            "stages disagree"
+        } else {
+            "root shape not reflected"
+        },
+    }
+}
+
+fn trace_raster_roots() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("TUXBOX_TRACE_RASTER_ROOTS").is_some());
+    *ON
 }
 
 /// With TUXBOX_TRACE_RASTER_ROOTS=1, describe each distinct raster root
