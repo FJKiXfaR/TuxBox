@@ -198,6 +198,51 @@ fn run() -> Result<(), Error> {
         return Ok(());
     }
     let shader = extract(&source_bytes)?;
+    // Development aid: `TUXBOX_ISA_WINDOW=0x4b4c:24:6,...` prints a disassembly
+    // window around byte offsets. Inert when unset.
+    if let Ok(spec) = env::var("TUXBOX_ISA_WINDOW") {
+        let insns = tuxbox_xshader::rdna2::disassemble(&shader.isa);
+        eprintln!("launch stage={:?} psv_threads={:?} preamble={:?} isa_bytes={}",
+            shader.stage, shader.psv_threads, shader.isa_preamble, shader.isa.len());
+        for item in spec.split(',').filter(|s| s.trim_start().starts_with("0x") || s.trim_start().starts_with('r')) {
+            let item = item.trim();
+            if let Some(rest) = item.strip_prefix('r') {
+                // `r<start>:<end>`: control-flow-relevant instructions only.
+                let rest = rest.trim_start_matches(':');
+                let mut parts = rest.split(':');
+                let from = u32::from_str_radix(
+                    parts.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0) as usize;
+                let to = u32::from_str_radix(
+                    parts.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0) as usize;
+                let interesting = |x: &tuxbox_xshader::rdna2::Insn| {
+                    x.enc == tuxbox_xshader::rdna2::Enc::Sopp
+                        || matches!(x.mnemonic.as_str(),
+                            "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap")
+                        || x.mnemonic.contains("saveexec") || x.mnemonic.contains("wrexec")
+                        || x.dst.iter().any(|d| matches!(d, tuxbox_xshader::rdna2::Opnd::ExecLo
+                            | tuxbox_xshader::rdna2::Opnd::ExecHi))
+                        || x.mnemonic.starts_with("v_cmpx")
+                };
+                eprintln!("--- ISA flow scan {from:#x}..{to:#x} ---");
+                for x in insns.iter().filter(|x| x.offset >= from && x.offset < to && interesting(x)) {
+                    eprintln!("{:#06x} {:26} {:?} <- {:?} imm={} mask={} raw={:08x?}",
+                        x.offset, x.mnemonic, x.dst, x.src, x.aux.imm, x.aux.mask, x.raw);
+                }
+                continue;
+            }
+            let mut parts = item.split(':');
+            let at = u32::from_str_radix(
+                parts.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+            let before = parts.next().and_then(|v| v.parse().ok()).unwrap_or(24usize);
+            let after = parts.next().and_then(|v| v.parse().ok()).unwrap_or(6usize);
+            let Some(first) = insns.iter().position(|x| x.offset >= at as usize) else { continue };
+            eprintln!("--- ISA window {at:#x} ---");
+            for x in &insns[first.saturating_sub(before)..(first + after).min(insns.len())] {
+                eprintln!("{:#06x} {:26} {:?} <- {:?} imm={} mask={} raw={:08x?}",
+                    x.offset, x.mnemonic, x.dst, x.src, x.aux.imm, x.aux.mask, x.raw);
+            }
+        }
+    }
     let (hlsl, model) = translate(
         &shader,
         consumer.as_deref(),

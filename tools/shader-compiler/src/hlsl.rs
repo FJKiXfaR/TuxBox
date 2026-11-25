@@ -348,6 +348,8 @@ struct Emitter<'a> {
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,
     resolve_wave32: bool,
+    /// Guest wave width whose EXEC words are literal lane masks (0 = none).
+    exec_mask_width: u32,
     wave32_compare_masks: bool,
     light_grid: bool,
     page_waves: bool,

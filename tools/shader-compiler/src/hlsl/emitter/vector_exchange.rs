@@ -53,8 +53,17 @@ impl<'a> Emitter<'a> {
 
     /// Read a lane from the other half of the wave.
     pub(in crate::hlsl) fn emit_permlanex16(&mut self, s: &[Opnd], d: Opnd, ins: &Insn) -> Result<(), String> {
-        let flags = (ins.raw[0] >> 11) & 0xf;
-        if flags != 0 || ins.aux.mask != 0 || ins.aux.imm != 0 || ins.aux.imm2 != 0 {
+        // OP_SEL (bits 14:11) selects 16-bit halves, which cannot affect a 32-bit
+        // lane gather; for this instruction OP_SEL[0] is instead the DPP
+        // fetch-inactive bit and OP_SEL[1] the bound control. FI=1 reads the
+        // source VGPR even when its lane is inactive, which is how a masked
+        // region adds the other row's total. ABS and CLMP must be clear.
+        let fetch_inactive = (ins.raw[0] >> 11) & 1;
+        if (ins.raw[0] >> 8) & 7 != 0
+            || (ins.raw[0] >> 12) & 3 != 0
+            || (ins.raw[0] >> 15) & 1 != 0
+            || ins.aux.mask != 0 || ins.aux.imm != 0 || ins.aux.imm2 != 0
+        {
             return Err("permlanex16 modifiers unsupported".into());
         }
         let (value, lo, hi) = (r(&s[0])?, r(&s[1])?, r(&s[2])?);
@@ -78,6 +87,10 @@ impl<'a> Emitter<'a> {
         self.line(&format!("uint t{t}lane = WaveGetLaneIndex(); uint t{t}sel = (t{t}lane & 8u) ? {hi} : {lo};"));
         self.line(&format!("uint t{t}src = ((t{t}lane & ~15u) ^ 16u) | ((t{t}sel >> (4u * (t{t}lane & 7u))) & 15u);"));
         self.line(&format!("uint t{t}value = WaveReadLaneAt({value}, t{t}src);"));
+        if fetch_inactive != 0 {
+            // The guest asked for the source register of an inactive lane.
+            return self.wv(&d, &format!("t{t}value"));
+        }
         // FI=0, BOUND_CTRL=0: an inactive source preserves the destination.
         self.line(&format!("uint4 t{t}active = WaveActiveBallot((exec_lo & 1u) != 0u);"));
         self.line(&format!("if (t{t}active[t{t}src >> 5] & (1u << (t{t}src & 31u))) {{"));
@@ -179,6 +192,22 @@ impl<'a> Emitter<'a> {
         let (id, count, identity) = self.portable_exchange_args(Some(&m))?;
         let id = id.as_str();
         let control = ins.raw[1] >> 8; // The reduction matcher verified this word.
+        if let Some(step) = wave_sum::row_shift(control) {
+            // A row shift moves the partial sums of the lanes below this one up
+            // by `step` lanes inside its own 16-lane row. Lanes below the shift
+            // are out of range: BOUND_CTRL=0 keeps the destination, and with
+            // BOUND_CTRL=1 the out-of-range source reads zero (ISA DPP_CTRL,
+            // row shifts "use bound_cntl"), so both forms leave the partial sum
+            // unchanged there.
+            self.line(&format!("uint t{t}low = {id} & 15u;"));
+            self.line(&format!(
+                "uint t{t}p = WaveReadLaneAt({acc}, ({id} & ~15u) | ((t{t}low - {step}u) & 15u));"
+            ));
+            self.line(&format!(
+                "uint t{t} = (t{t}low >= {step}u) ? (t{t}p + {acc}) : {acc};"
+            ));
+            return self.wv(&d, &format!("t{t}"));
+        }
         let lane = match (ins.aux.imm, control) {
             (0, _) => format!("{id} ^ 1u"),
             (1, 0x936012) => format!("({id} & ~3u) | (({id} ^ 2u) & 2u)"),

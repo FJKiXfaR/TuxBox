@@ -162,6 +162,13 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         fspx_wave.filter(|&width| width == 32)
     } else if straight_exchange { None }
       else { lower_wave_reductions(&mut insns)? };
+    // A literal EXEC mask makes the masked per-lane reduction's lane activity
+    // depend on the guest lane, so the host wave must carry exactly one guest
+    // wave and the emitter needs the flattened guest lane index.
+    let exec_mask_width = match required_wave_size {
+        Some(width) if wave_sum::has_row_shift(&insns) => width,
+        _ => 0,
+    };
     let required_wave_size = if resolve_wave32 {
         if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
@@ -234,6 +241,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     em.indexed_lane = indexed_lane;
     em.single_wave32 = single_wave32;
     em.resolve_wave32 = resolve_wave32;
+    em.exec_mask_width = exec_mask_width;
     em.wave32_compare_masks |= reflection && matches!(ex.isa.len(), 1024 | 1028);
     if matches!(ex.stage, Stage::Vertex | Stage::Geometry) {
         em.out_interp = feeds_ps.cloned().unwrap_or_default();
@@ -403,7 +411,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         match wave_sum::check_control_flow(&em.insns, width) {
             Ok(guards) => em.reduction_execz_guards = guards,
             Err(reason) if em.resolve_wave32 && !requires_ballot && scan_width.is_none() => {
-                if !wave_loops::uniform_dispatch(&em) {
+                if !wave_loops::uniform_dispatch(&em) && !wave_loops::uniform_scalars(&em) {
                     em.wave_bounded_latches = wave_loops::bounded_latches(&em).ok_or(reason)?;
                 }
             }

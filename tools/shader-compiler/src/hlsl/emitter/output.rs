@@ -388,6 +388,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
             if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp
                 || self.portable_threads.is_some() || self.lane_area.is_some()
+                || self.exec_mask_width != 0
             {
                 writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }

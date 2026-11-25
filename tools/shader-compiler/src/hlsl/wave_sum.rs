@@ -109,7 +109,17 @@ fn next_real<'a>(insns: &'a [Insn], at: &mut usize) -> Option<&'a Insn> {
 }
 
 fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> Option<(usize, Opnd, Opnd)> {
-    let select = insns.get(first.checked_sub(1)?)?;
+    let mut at = first.checked_sub(1)?;
+    // The masked per-lane form copies the CNDMASK result into the accumulator
+    // before the DPP steps. The copy selects nothing; it only renames the value.
+    if insns[at].mnemonic == "v_mov_b32"
+        && insns[at].dst == insns.get(first)?.dst
+        && matches!(insns[at].dst[..], [Opnd::Vgpr(_)])
+        && matches!(insns[at].src[..], [Opnd::Vgpr(_)])
+    {
+        at = at.checked_sub(1)?;
+    }
+    let select = insns.get(at)?;
     let [ident, _, mask @ Opnd::Sgpr(_)] = select.src[..] else {
         return None;
     };
@@ -130,7 +140,7 @@ fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> O
     };
     let mut mask_sources = None;
     let mut ident_reg_found = want_reg.is_none();
-    for (index, op) in insns[..first - 1].iter().enumerate().rev() {
+    for (index, op) in insns[..at].iter().enumerate().rev() {
         match op.mnemonic.as_str() {
             "s_waitcnt" | "v_nop" => (),
             "v_mov_b32" if want_reg.is_some() => {
@@ -191,7 +201,201 @@ pub(super) fn masked_floating(insns: &[Insn], first: usize) -> bool {
     masked_prologue(insns, first, id).is_some()
 }
 
+/// Skip scheduling placeholders between two real instructions.
+fn skip_placeholders(insns: &[Insn], mut at: usize) -> usize {
+    while insns
+        .get(at)
+        .is_some_and(|i| matches!(i.mnemonic.as_str(), "s_nop" | "s_waitcnt" | "v_nop"))
+    {
+        at += 1;
+    }
+    at
+}
+
+/// A literal EXEC word: the guest writes a physical lane mask, not a flag.
+fn exec_literal(ins: &Insn) -> Option<u32> {
+    if ins.mnemonic != "s_mov_b32" || !matches!(ins.dst[..], [Opnd::ExecLo | Opnd::ExecHi]) {
+        return None;
+    }
+    match ins.src[..] {
+        [Opnd::Literal(v)] => Some(v),
+        [Opnd::ConstInt(v)] => Some(v as u32),
+        _ => None,
+    }
+}
+
+/// Four DPP16 row shifts move the within-row partial sums up one, two, four and
+/// eight lanes. `DPP_ROW_SR*` (0x111-0x11F) selects the shift amount in its low
+/// four bits; the rows and banks it writes are the full 0xf. Lanes below the
+/// shift are out of range: BOUND_CTRL (bit 19 of the control word) decides
+/// whether such a lane keeps its destination (0) or adds the out-of-range
+/// source, which reads zero (1).
+const ROW_SHIFTS: [u32; 4] = [1, 2, 4, 8];
+
+pub(super) fn row_shift(control: u32) -> Option<u32> {
+    // control = raw[1] >> 8: DPP_CTRL in bits 8:0, FI in bit 10, BOUND_CTRL in
+    // bit 11, source modifiers in bits 15:12, bank mask in 19:16 and row mask in
+    // 23:20. A reduction step writes every row and bank and negates nothing.
+    if control >> 20 != 0xf
+        || (control >> 16) & 0xf != 0xf
+        || (control >> 12) & 0xf != 0
+        || (control >> 10) & 1 != 0
+    {
+        return None;
+    }
+    let step = (control & 0x1ff).checked_sub(0x110)?;
+    ROW_SHIFTS.contains(&step).then_some(step)
+}
+
+/// Whether any verified step is a row shift of the masked per-lane sum.
+pub(super) fn has_row_shift(insns: &[Insn]) -> bool {
+    insns
+        .iter()
+        .any(|i| i.op == DPP_REDUCE && i.raw.get(1).is_some_and(|w| row_shift(w >> 8).is_some()))
+}
+
+/// The masked per-lane "sum of the other lanes": total minus own value. The
+/// guest enables every lane, selects the neutral zero into the inactive ones,
+/// builds a within-row window sum with four DPP16 row shifts, adds the lower
+/// row's total in the upper 16 lanes, optionally carries the other half of a
+/// wave64 across, and then subtracts the lane's own value. Only the four shifts
+/// are rewritten; every other instruction is emitted exactly as encoded.
+fn scan_shift_reduction(insns: &mut [Insn], first: usize) -> Option<(u32, usize)> {
+    if insns.get(first)?.mnemonic != "v_add_nc_u32" {
+        return None;
+    }
+    let [Opnd::Vgpr(acc)] = insns[first].dst[..] else { return None };
+    let vr = Opnd::Vgpr(acc);
+    // v_mov acc, <CNDMASK destination> names the value the DPP steps accumulate.
+    let mv = first.checked_sub(1)?;
+    if insns[mv].mnemonic != "v_mov_b32" || insns[mv].dst != [vr] {
+        return None;
+    }
+    let [own @ Opnd::Vgpr(_)] = insns[mv].src[..] else { return None };
+    let cd = mv.checked_sub(1)?;
+    if insns[cd].mnemonic != "v_cndmask_b32" || insns[cd].dst != [own] {
+        return None;
+    }
+    let (save_at, mask, neutral) = masked_prologue(insns, first, NeutralIdentity::Immediate(0))?;
+    if neutral != Opnd::ConstInt(0)
+        || insns[cd].src.first() != Some(&neutral)
+        || !matches!(insns[cd].src.get(1), Some(Opnd::Vgpr(_)))
+        || insns[cd].src.get(2) != Some(&mask)
+    {
+        return None;
+    }
+    let width = match insns[save_at].mnemonic.as_str() {
+        "s_or_saveexec_b32" => 32,
+        "s_or_saveexec_b64" => 64,
+        _ => return None,
+    };
+    for (step, shift) in ROW_SHIFTS.into_iter().enumerate() {
+        let ins = insns.get(first + step)?;
+        let word = *ins.raw.get(1)?;
+        let control = (word >> 8) & 0x1ff;
+        if ins.enc != Enc::Vop2
+            || ins.mnemonic != "v_add_nc_u32"
+            || ins.src != [Opnd::Raw(250), vr]
+            || ins.dst != [vr]
+            || word >> 28 != 0xf
+            || (word >> 24) & 0xf != 0xf
+            || (word >> 18) & 1 != 0
+            || (word >> 20) & 0xf != 0
+            || word as u8 != acc
+            || control != 0x110 + shift
+        {
+            return None;
+        }
+    }
+    // The upper 16 lanes are enabled for the cross-row add; the lower row keeps
+    // the total it already holds.
+    let mut at = skip_placeholders(insns, first + 4);
+    let mut upper = false;
+    while let Some(word) = exec_literal(insns.get(at)?) {
+        if word & 0xffff == 0 && word >> 16 != 0 {
+            upper = true;
+        }
+        at = skip_placeholders(insns, at + 1);
+    }
+    if !upper {
+        return None;
+    }
+    let perm = insns.get(at)?;
+    let [tmp @ Opnd::Vgpr(_)] = perm.dst[..] else { return None };
+    if perm.mnemonic != "v_permlanex16_b32"
+        || perm.src != [vr, Opnd::ConstInt(-1), Opnd::ConstInt(-1)]
+    {
+        return None;
+    }
+    at = skip_placeholders(insns, at + 1);
+    let combined = insns.get(at)?;
+    if combined.mnemonic != "v_add_nc_u32" || combined.dst != [vr] || combined.src != [tmp, vr] {
+        return None;
+    }
+    at = skip_placeholders(insns, at + 1);
+    // Optional broadcast of the other half's total into the upper 32 lanes.
+    let mut read = None;
+    if insns.get(at)?.mnemonic == "v_readlane_b32" {
+        let read_ins = &insns[at];
+        let [Opnd::Vgpr(d @ 0..=105)] = read_ins.dst[..] else { return None };
+        if read_ins.src
+            != [vr, Opnd::ConstInt(if width == 64 { 31 } else { 0 }), Opnd::Sgpr(0)]
+        {
+            return None;
+        }
+        read = Some((at, d));
+        at = skip_placeholders(insns, at + 1);
+        while exec_literal(insns.get(at)?).is_some() {
+            at = skip_placeholders(insns, at + 1);
+        }
+        let add = insns.get(at)?;
+        if add.mnemonic != "v_add_nc_u32" || add.dst != [vr] || add.src != [Opnd::Sgpr(d), vr] {
+            return None;
+        }
+        at = skip_placeholders(insns, at + 1);
+    }
+    if width == 64 && read.is_none() {
+        return None;
+    }
+    // Full EXEC again for the subtraction of the lane's own value.
+    let mut full = false;
+    while let Some(word) = exec_literal(insns.get(at)?) {
+        full |= word == u32::MAX;
+        at = skip_placeholders(insns, at + 1);
+    }
+    if !full {
+        return None;
+    }
+    let sub = insns.get(at)?;
+    if sub.mnemonic != "v_sub_nc_u32" || sub.dst != [vr] || sub.src != [vr, own] {
+        return None;
+    }
+    at = skip_placeholders(insns, at + 1);
+    let restore = insns.get(at)?;
+    if !matches!(restore.mnemonic.as_str(), "s_mov_b32" | "s_mov_b64")
+        || restore.dst != [Opnd::ExecLo]
+        || !matches!(restore.src[..], [Opnd::Sgpr(_)])
+    {
+        return None;
+    }
+    for (step, ins) in insns[first..first + 4].iter_mut().enumerate() {
+        ins.op = DPP_REDUCE;
+        ins.src = vec![vr];
+        ins.aux.imm = step as i64;
+    }
+    if let Some((index, d)) = read {
+        let ins = &mut insns[index];
+        ins.op = READ_LANE;
+        ins.dst[0] = Opnd::Sgpr(d);
+        ins.src.truncate(2);
+    }
+    Some((width, at + 1))
+}
+
 pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'static str> {
+    if let Some(found) = scan_shift_reduction(insns, first) {
+        return Ok(found);
+    }
     let start = first.checked_sub(2).ok_or("missing reduction prologue")?;
     let tail = &insns[start..];
     let operation = &insns[first].mnemonic;
@@ -604,10 +808,17 @@ pub(super) fn reduction_regions(insns: &[Insn], _width: u32)
         let start = masked_identity(&ins.mnemonic)
             .and_then(|neutral| masked_prologue(insns, first, neutral))
             .map_or_else(|| first - prologue_len, |(index, _, _)| index);
-        // The restore is the first EXEC write after the DPP steps; waits and
-        // nops may be scheduled between the broadcasts and it.
-        let restore = (first + 5..insns.len().min(first + 40))
-            .find(|&i| insns[i].dst.first() == Some(&Opnd::ExecLo))?;
+        // The restore is the first EXEC write after the DPP steps from a saved
+        // mask. A literal EXEC write inside the region (the half-wave masks of
+        // the per-lane form) is not a restore; waits and nops may be scheduled
+        // between the broadcasts and the restore.
+        let window = first + 5..insns.len().min(first + 40);
+        let from_mask = |i: usize| {
+            insns[i].dst.first() == Some(&Opnd::ExecLo)
+                && !matches!(insns[i].src.first(), Some(Opnd::ConstInt(_) | Opnd::Literal(_)))
+        };
+        let restore = window.clone().find(|&i| from_mask(i))
+            .or_else(|| window.into_iter().find(|&i| insns[i].dst.first() == Some(&Opnd::ExecLo)))?;
         Some((first, start..=restore))
     })
 }
@@ -794,7 +1005,17 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<
         let last_read = *region.end() - 1;
         for (branch_index, branch) in insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp) {
             let pc = branch.offset as i64;
-            if branch.op == 1 && pc < start {
+            // A non-final s_endpgm ends the wave on its path, so a reduction it
+            // precedes would only run on a subset of the lanes. An s_endpgm that
+            // an unconditional branch immediately jumps over is unreachable and
+            // cannot end anything.
+            let dead_exit = branch.op == 1 && branch_index.checked_sub(1).is_some_and(|p| {
+                let prev = &insns[p];
+                prev.enc == Enc::Sopp
+                    && prev.op == 2
+                    && prev.offset as i64 + 4 + 4 * prev.aux.imm > pc
+            });
+            if branch.op == 1 && pc < start && !dead_exit {
                 return Err(format!("wave reduction at {start:#x} after an early exit"));
             }
             if Emitter::branch_cond(branch.op).is_some() {

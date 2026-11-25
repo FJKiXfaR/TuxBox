@@ -278,31 +278,100 @@ fn full_mask_program(em: &Emitter<'_>) -> bool {
         && !em.compute_swizzle
         && !em.indexed_lane
         && em.vote_uses.is_empty()
-        && !em.insns.iter().any(|op| {
-            (op.mnemonic.starts_with("tb_") && op.mnemonic != ray_resolve::READ_LANE)
-                || op.enc == Enc::Ds
-                || matches!(
-                    op.mnemonic.as_str(),
-                    "s_barrier" | "s_sendmsg" | "s_sendmsghalt"
-                )
-        })
+        && !em.insns.iter().any(ds_memory_or_collective)
+}
+
+/// Shared-memory accesses and collectives that change state outside the scalar
+/// registers. `ds_swizzle_b32` is not one of them: it touches no LDS memory, it
+/// only exchanges the four lanes of a quad through the LDS crossbar, and its
+/// resolve-wave32 lowering is a single `WaveReadLaneAt` whose partner depends
+/// only on the lane index (see `emit_ds`). It therefore needs neither a
+/// rendezvous nor a shared allocation, and it is safe to reach from every
+/// invocation exactly when the surrounding scalar control flow is.
+fn ds_memory_or_collective(op: &Insn) -> bool {
+    (op.mnemonic.starts_with("tb_") && op.mnemonic != ray_resolve::READ_LANE)
+        || (op.enc == Enc::Ds && op.mnemonic != "ds_swizzle_b32")
+        || matches!(
+            op.mnemonic.as_str(),
+            "s_barrier" | "s_sendmsg" | "s_sendmsghalt"
+        )
 }
 
 /// Interleaved loops go through the block dispatcher, where no loop needs a
 /// bound of its own: it is enough that every scalar write keeps the entry
 /// scalars wave-uniform, so each branch is a decision of the whole wave and the
 /// lanes follow the same blocks.
+fn debug() -> bool { std::env::var("TUXBOX_WAVE_DEBUG").is_ok() }
+
 pub(super) fn uniform_dispatch(em: &Emitter<'_>) -> bool {
     let code = &em.insns;
     if !full_mask_program(em) {
+        if debug() { eprintln!("UNIFORMDISPATCH: full_mask_program false (resolve_wave32={} packed={} wave_cull={} page_waves={} swizzle={} indexed={} votes={} tb/ds={})",
+            em.resolve_wave32, em.packed.is_some(), em.wave_cull, em.page_waves, em.compute_swizzle, em.indexed_lane, em.vote_uses.len(),
+            em.insns.iter().filter(|op| ds_memory_or_collective(op)).count()); }
         return false;
     }
-    let Some(flow) = Flow::graph(code) else { return false };
-    if flow.structured() || wave_sum::reduction_regions(code, 32).any(|(_, region)| !region_is_intact(&flow, &region)) {
+    let Some(flow) = Flow::graph(code) else { if debug() { eprintln!("UNIFORMDISPATCH: no CFG"); } return false };
+    if flow.structured() {
+        if debug() { eprintln!("UNIFORMDISPATCH: CFG structured (try uniform_scalars)"); }
         return false;
+    }
+    for (_first, region) in wave_sum::reduction_regions(code, 32) {
+        if !region_is_intact(&flow, &region) {
+            if debug() { eprintln!("UNIFORMDISPATCH: region {:#x}..{:#x} not intact", code[*region.start()].offset, code[*region.end()].offset);
+                for i in *region.start()..=*region.end() {
+                    if !(flow.incoming[i] == [i - 1]) || !(i == *region.end() || flow.edges[i] == [None, Some(i + 1)]) {
+                        eprintln!("   at idx={i} {:#x} {} incoming={:?} edges={:?}", code[i].offset, code[i].mnemonic, flow.incoming[i], flow.edges[i]);
+                    }
+                } }
+            return false;
+        }
     }
     let effects: Vec<_> = code.iter().map(Effect::new).collect();
-    (0..code.len()).all(|i| !flow.reachable[i] || scalar::scalar_step(em, &flow, &effects, i))
+    for i in 0..code.len() {
+        if !flow.reachable[i] || scalar::scalar_step(em, &flow, &effects, i) { continue; }
+        if debug() { eprintln!("UNIFORMDISPATCH: scalar_step fail idx={i} {:#x} {} {:?} <- {:?}",
+            code[i].offset, code[i].mnemonic, code[i].dst, code[i].src); }
+        return false;
+    }
+    true
+}
+
+/// A structured program whose scalar values are wave-uniform under the
+/// full-mask (resolve wave32) emitter.
+///
+/// In that mode EXEC, VCC and every other scalar register hold the whole
+/// guest 32-bit word, not one bit of a lane mask: the same word in every
+/// invocation. Ballots, lane reads and comparisons therefore produce the same
+/// scalar value everywhere, and every SOPP branch — on SCC, VCC or EXEC — is a
+/// decision of the whole wave. All invocations of the group follow the same
+/// instruction sequence and reach every whole-wave collective (DPP reduction,
+/// `v_readlane`, `ds_swizzle_b32`) together, which is exactly the arrival
+/// property the targeted per-branch guards try to prove one region at a time.
+/// The scalar provenance proof below is the same one `uniform_dispatch` relies
+/// on; only the loop shape differs, so this handles the structured (nested
+/// do/while) programs that the block dispatcher cannot express.
+pub(super) fn uniform_scalars(em: &Emitter<'_>) -> bool {
+    let code = &em.insns;
+    if !full_mask_program(em) {
+        if debug() { eprintln!("UNIFORMSCALARS: full_mask_program false"); }
+        return false;
+    }
+    let Some(flow) = Flow::new(code) else { if debug() { eprintln!("UNIFORMSCALARS: unstructured CFG"); } return false };
+    for (_first, region) in wave_sum::reduction_regions(code, 32) {
+        if !region_is_intact(&flow, &region) {
+            if debug() { eprintln!("UNIFORMSCALARS: region {:#x}..{:#x} not intact", code[*region.start()].offset, code[*region.end()].offset); }
+            return false;
+        }
+    }
+    let effects: Vec<_> = code.iter().map(Effect::new).collect();
+    for i in 0..code.len() {
+        if !flow.reachable[i] || scalar::scalar_step(em, &flow, &effects, i) { continue; }
+        if debug() { eprintln!("UNIFORMSCALARS: scalar_step fail idx={i} {:#x} {} {:?} <- {:?}",
+            code[i].offset, code[i].mnemonic, code[i].dst, code[i].src); }
+        return false;
+    }
+    true
 }
 
 /// In this emitter mode the entry scalars already have wave-uniform values.

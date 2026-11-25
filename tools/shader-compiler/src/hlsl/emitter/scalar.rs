@@ -217,6 +217,36 @@ impl<'a> Emitter<'a> {
         self.ws(&d, &result)
     }
 
+    /// Write one guest EXEC word of the masked per-lane reduction. A literal is
+    /// a physical mask over the wave's lanes; a saved register holds this
+    /// invocation's own bit. The emitter carries one activity boolean per
+    /// invocation in bit 0 of `exec_lo`, so a literal selects the guest lane and,
+    /// in a wave64, the half its word covers.
+    pub(in crate::hlsl) fn emit_exec_mask(&mut self, d: &Opnd, src: &Opnd) -> Result<(), String> {
+        let literal = match src {
+            Opnd::Literal(v) => Some(*v),
+            Opnd::ConstInt(v) => Some(*v as u32),
+            _ => None,
+        };
+        let Some(word) = literal else {
+            let value = r(src)?;
+            return self.ws(d, &format!("({value} & 1u)"));
+        };
+        let bit = format!("(({word:#x}u >> (tb_lane & 31u)) & 1u)");
+        if self.exec_mask_width <= 32 {
+            return self.ws(d, &bit);
+        }
+        // A 64-lane wave: `exec_lo` covers lanes 0..31 and `exec_hi` lanes 32..63.
+        // The other word must not clear this invocation's activity.
+        match d {
+            Opnd::ExecLo => self.ws(d, &format!("(((tb_lane & 63u) < 32u) ? {bit} : exec_lo)")),
+            _ => {
+                self.ws(d, &bit)?;
+                self.ws(&Opnd::ExecLo, &format!("(((tb_lane & 63u) >= 32u) ? exec_hi : exec_lo)"))
+            }
+        }
+    }
+
     /// Scalar operations on one source.
     pub(in crate::hlsl) fn emit_sop1(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
@@ -225,6 +255,17 @@ impl<'a> Emitter<'a> {
         let d = d.ok_or("no dst")?;
         let a = r(&s[0])?;
         match m {
+            // A literal EXEC word of the masked per-lane reduction is a physical
+            // lane mask shared by the whole wave, while this emitter keeps one
+            // boolean per invocation. Select this invocation's guest lane from
+            // the word; a saved EXEC register already holds that bit. In a
+            // 64-lane wave the upper half is selected from `exec_hi`, which the
+            // guest writes as the second word of the same mask.
+            "s_mov_b32" if self.exec_mask_width != 0
+                && matches!(d, Opnd::ExecLo | Opnd::ExecHi) =>
+            {
+                self.emit_exec_mask(&d, &s[0])
+            }
             "s_mov_b32" => self.ws(&d, &a),
             LANE_STORE => {
                 let ord = match (self.lane_area.as_ref(), ins.dst.first()) {

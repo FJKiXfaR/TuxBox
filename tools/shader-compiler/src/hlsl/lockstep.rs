@@ -341,7 +341,16 @@ pub(super) fn prove(insns: &[Insn], width: u32) -> Option<BTreeMap<usize, Vote>>
         let mut state = states[at].clone()?;
         // Classes only move towards `Conflict`, so a later visit may need a vote
         // an earlier one did not, or refuse, but never the reverse.
-        if let Some(vote) = step(op, &mut state, words)? {
+        if let Some(vote) = match step(op, &mut state, words) {
+            Some(vote) => vote,
+            None => {
+                if std::env::var("TUXBOX_LOCKSTEP_DEBUG").is_ok() {
+                    eprintln!("LOCKSTEP refuse idx={at} {:#x} {} {:?} <- {:?} imm={}",
+                        op.offset, op.mnemonic, op.dst, op.src, op.aux.imm);
+                }
+                return None;
+            }
+        } {
             votes.insert(at, vote);
         }
         let mut next = Vec::with_capacity(2);

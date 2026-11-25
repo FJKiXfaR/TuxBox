@@ -818,3 +818,87 @@ fn execz_skip_allows_uniform_merge_branch_in_window() {
         assert!(check_control_flow(&ops, width).is_ok());
     }
 }
+
+#[test]
+fn row_shift_controls_are_only_the_full_mask_step_sizes() {
+    // DPP_CTRL 0x111/0x112/0x114/0x118 are ROW_SR by 1, 2, 4 and 8 with every
+    // row and bank enabled; the control word also carries FI, BOUND_CTRL and the
+    // source modifiers.
+    assert_eq!(super::row_shift(0xff0911), Some(1));
+    assert_eq!(super::row_shift(0xff0112), Some(2));
+    assert_eq!(super::row_shift(0xff0114), Some(4));
+    assert_eq!(super::row_shift(0xff0118), Some(8));
+    // row_mirror, a quad permute, a partial row mask and a negated source.
+    for control in [0xff0940, 0xff04b1, 0xf00112, 0xff0112 | (1 << 12)] {
+        assert_eq!(super::row_shift(control), None, "{control:#x}");
+    }
+    // FI (bit 10 of raw[1] >> 8) is not a row shift either.
+    assert_eq!(super::row_shift(0xff0512), None);
+}
+
+// The masked per-lane "sum of the other lanes": SAVEEXEC, CNDMASK to the
+// neutral zero, a rename of the selected value, four DPP16 row shifts, the
+// upper-half mask, the cross-row add, full EXEC, and the subtraction of the
+// lane's own value.
+fn per_lane_sum(word_control: u32) -> Vec<Insn> {
+    let acc = Opnd::Vgpr(2);
+    let mut ops = vec![
+        insn("s_or_saveexec_b32", Enc::Sop1, 0, vec![Opnd::Sgpr(4)], vec![Opnd::ConstInt(-1)]),
+        insn("v_cndmask_b32", Enc::Vop2, 0,
+             vec![Opnd::Vgpr(1)], vec![Opnd::ConstInt(0), Opnd::Vgpr(7), Opnd::Sgpr(4)]),
+        insn("v_mov_b32", Enc::Vop1, 0, vec![acc], vec![Opnd::Vgpr(1)]),
+    ];
+    for shift in [1u32, 2, 4, 8] {
+        let mut step = insn("v_add_nc_u32", Enc::Vop2, 0, vec![acc], vec![Opnd::Raw(250), acc]);
+        let bank = if shift == 1 { 0x9 } else { 0x1 };
+        step.raw = vec![0x4a04_04fa | u32::from(word_control as u8), 0xff00_0000 | (bank << 16) | ((0x110 + shift) << 8) | 2];
+        ops.push(step);
+    }
+    ops.push(insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::Literal(0xffff_0000)]));
+    ops.push(insn("v_permlanex16_b32", Enc::Vop3, 0,
+                 vec![Opnd::Vgpr(3)], vec![acc, Opnd::ConstInt(-1), Opnd::ConstInt(-1)]));
+    ops.push(insn("v_add_nc_u32", Enc::Vop2, 0, vec![acc], vec![Opnd::Vgpr(3), acc]));
+    ops.push(insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::ConstInt(-1)]));
+    ops.push(insn("v_sub_nc_u32", Enc::Vop2, 0, vec![acc], vec![acc, Opnd::Vgpr(1)]));
+    ops.push(insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::Sgpr(4)]));
+    ops
+}
+
+#[test]
+fn masked_per_lane_sum_rewrites_only_the_four_row_shifts() {
+    let mut ops = per_lane_sum(2);
+    let before = ops.iter().map(|i| (i.mnemonic.clone(), i.op, i.dst.clone(), i.src.clone())).collect::<Vec<_>>();
+    let first = 3;
+    let (width, next) = super::lower(&mut ops, first).unwrap();
+    assert_eq!((width, next), (32, ops.len()));
+    for step in 0..4 {
+        let ins = &ops[first + step];
+        assert_eq!(ins.op, DPP_REDUCE);
+        assert_eq!(ins.aux.imm, step as i64);
+        assert_eq!(ins.src, vec![Opnd::Vgpr(2)]);
+    }
+    // Every other instruction, including the literal EXEC mask and the
+    // subtraction of the lane's own value, is left exactly as encoded.
+    for (index, (mnemonic, op, dst, src)) in before.into_iter().enumerate() {
+        if (first..first + 4).contains(&index) { continue; }
+        assert_eq!(ops[index].mnemonic, mnemonic);
+        assert_eq!(ops[index].op, op);
+        assert_eq!(ops[index].dst, dst);
+        assert_eq!(ops[index].src, src);
+    }
+}
+
+#[test]
+fn masked_per_lane_sum_needs_full_rows_and_banks() {
+    // A partial bank mask, a partial row mask, a step size that is not one of
+    // the four shifts, and a negated source are each rejected.
+    for (index, word) in [(0, 0xf0_0111u32), (1, 0xef_0112), (2, 0xff_0115), (3, 0xff21_0118)] {
+        let mut ops = per_lane_sum(2);
+        ops[3 + index].raw[1] = word;
+        assert!(super::lower(&mut ops, 3).is_err(), "{word:#x}");
+    }
+    // Without the upper-half mask the cross-row add is not this shape.
+    let mut ops = per_lane_sum(2);
+    ops[7].src = vec![Opnd::ConstInt(-1)];
+    assert!(super::lower(&mut ops, 3).is_err());
+}
