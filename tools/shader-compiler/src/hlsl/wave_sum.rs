@@ -239,11 +239,21 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
     // DPP16 row_mirror combines the two octets in each 16-lane row.
     let controls = [0xde54c1, 0x936012, 0x000924, 0xff0940];
     for (i, (&ctrl, ins)) in controls.iter().zip(&block[2..6]).enumerate() {
-        let selector = if i == 3 { 250 } else { 233 };
+        let [Opnd::Raw(selector), rhs] = ins.src[..] else {
+            return Err("unrecognized DPP reduction shuffle");
+        };
+        // SAVEEXEC enabled all lanes. FI has no effect, and ROW_MIRROR's
+        // source stays within its row, so its BOUND_CTRL has no effect either.
+        let (valid_selector, ignored_bits) = if i == 3 {
+            (selector == 250, (1 << 18) | (1 << 19))
+        } else {
+            (matches!(selector, 233 | 234), 0)
+        };
+        let expected = ctrl << 8 | u32::from(acc);
         if &ins.mnemonic != operation
             || ins.dst != [Opnd::Vgpr(acc)]
-            || ins.src != [Opnd::Raw(selector), Opnd::Vgpr(acc)]
-            || ins.raw.get(1) != Some(&(ctrl << 8 | u32::from(acc)))
+            || !valid_selector || rhs != Opnd::Vgpr(acc)
+            || ins.raw.get(1).is_none_or(|word| (word ^ expected) & !ignored_bits != 0)
         {
             return Err("unrecognized DPP reduction shuffle");
         }
@@ -1042,6 +1052,55 @@ mod tests {
         exchange.remove(1);
         assert!(straight_exchange(&mut exchange,[64,1,1]));
         assert_eq!(exchange[0].op,DPP8_EXCHANGE);
+    }
+
+    #[test]
+    fn row_mirror_reduction_accepts_either_bound_ctrl_with_full_masks() {
+        for width in [32, 64] {
+            let (mut shader, mut words, _) = fixture::shader(width);
+            let reference = super::super::translate(&shader).unwrap();
+            for word in &mut words {
+                if *word == 0xff09_4002 { *word = 0xff01_4002; }
+            }
+            shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            shader.isa_data = shader.isa.clone();
+            let translated = super::super::translate(&shader).unwrap();
+            assert_eq!(translated.hlsl, reference.hlsl);
+            assert_eq!(translated.required_wave_size, reference.required_wave_size);
+
+            for bit in [1 << 24, 1 << 28] {
+                let mut ops = crate::rdna2::disassemble(&shader.isa);
+                let mirror = ops.iter().position(|i| i.raw.get(1) == Some(&0xff01_4002)).unwrap();
+                ops[mirror].raw[1] ^= bit;
+                assert!(lower(&mut ops, mirror - 3).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn full_exec_reduction_ignores_fetch_inactive_at_each_shuffle() {
+        for width in [32, 64] {
+            let (mut shader, words, _) = fixture::shader(width);
+            let expected = super::super::translate(&shader).unwrap();
+            // Three DPP8 selectors followed by the DPP16 ROW_MIRROR control word.
+            for word_index in [3, 5, 7, 10] {
+                let mut changed = words.clone();
+                if word_index == 10 {
+                    changed[word_index] |= 1 << 18;
+                } else {
+                    changed[word_index] += 1; // DPP8 FI=1 uses selector 234 instead of 233.
+                }
+                shader.isa = changed.iter().flat_map(|w| w.to_le_bytes()).collect();
+                shader.isa_data = shader.isa.clone();
+                let translated = super::super::translate(&shader).unwrap();
+                assert_eq!(translated.hlsl, expected.hlsl);
+                assert_eq!(translated.required_wave_size, expected.required_wave_size);
+
+                let mut ops = crate::rdna2::disassemble(&shader.isa);
+                ops[0].src = vec![Opnd::ConstInt(0)];
+                assert!(lower(&mut ops, 2).is_err(), "reduction requires full EXEC");
+            }
+        }
     }
 
     #[test]
