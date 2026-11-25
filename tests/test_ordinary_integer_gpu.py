@@ -1,6 +1,6 @@
 import unittest
 
-from tools.check_ordinary_integer_gpu import reference, selectors, HALF_OPS, WORD_OPS
+from tools.check_ordinary_integer_gpu import reference, selectors, CLAMP, HALF_OPS, WORD_OPS
 
 
 class OrdinaryIntegerReferenceTests(unittest.TestCase):
@@ -26,8 +26,15 @@ class OrdinaryIntegerReferenceTests(unittest.TestCase):
         self.assertEqual(reference("v_mad_i32_i16", [0, 0, 0xfffffff0], 0, 0), 0xfffffff0)
         self.assertEqual(reference("v_mad_u32_u16", [0xffff0000, 0x0002ffff, 1], 0b11, 0), 0x1ffff)
 
+    def test_signed_saturation(self):
+        self.assertEqual(reference("v_add_nc_i32", [0x7fffffff, 1, 0], CLAMP, 0), 0x7fffffff)
+        self.assertEqual(reference("v_add_nc_i32", [0x80000000, 0xffffffff, 0], CLAMP, 0), 0x80000000)
+        self.assertEqual(reference("v_sub_nc_i32", [0x80000000, 1, 0], CLAMP, 0), 0x80000000)
+        self.assertEqual(reference("v_sub_nc_i32", [0x7fffffff, 0xffffffff, 0], CLAMP, 0), 0x7fffffff)
+        self.assertEqual(reference("v_add_nc_i32", [5, 0xfffffff9, 0], CLAMP, 0), 0xfffffffe)
+
     def test_every_selector_is_enumerated(self):
-        self.assertEqual(sum(len(selectors(n)) for n in HALF_OPS | WORD_OPS), 154)
+        self.assertEqual(sum(len(selectors(n)) for n in HALF_OPS | WORD_OPS), 156)
 
 
 if __name__ == "__main__":

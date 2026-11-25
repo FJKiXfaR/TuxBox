@@ -84,16 +84,23 @@ def translate(emitter,words):
     return subprocess.run([str(emitter),*[f"{v:08x}" for v in words]],
                           text=True,capture_output=True,timeout=20)
 
+def load_input(text, reg, value, source):
+    """Make a test input dynamic: the one instruction that gives `v{reg}` its
+    literal `value` reads `source` instead. The translator writes predicated
+    instructions singly or grouped in a block, so only the assignment is matched."""
+    text, found = re.subn(rf"\b(v{reg} = )0x{value:x}u;", rf"\g<1>{source};", text)
+    if found != 1:
+        raise ValueError(f"expected one initial literal for v{reg}, found {found}")
+    return text
+
+
 def instrument(text,count):
     marker="[numthreads(1, 1, 1)]"
     if text.count(marker)!=1:
         raise ValueError("unexpected compute entry")
     text=text.replace(marker,"RWStructuredBuffer<uint> output : register(u0);\n"+marker)
     for j,v in enumerate(INIT):
-        pat=rf"(    // 0x[0-9a-f]+ v_mov_b32\n    if \(exec_lo & 1u\) v{4+j} = )0x{v:x}u;"
-        text,n=re.subn(pat,rf"\g<1>output[{STRIDE}u * gid.x + {j}u];",text)
-        if n!=1:
-            raise ValueError("unexpected initial literal statement")
+        text=load_input(text,4+j,v,f"output[{STRIDE}u * gid.x + {j}u]")
     suffix="\n".join(f"    output[{STRIDE}u * gid.x + {3+j}u] = v{7+j};" for j in range(count))
     if not text.rstrip().endswith("}"):
         raise ValueError("missing main ending")

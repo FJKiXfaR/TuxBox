@@ -38,6 +38,8 @@ On Linux it also runs the [D3D12 regression controls](tools/check_d3d12_regressi
 python tuxbox.py check --proton PROTON --prefix PREFIX --windows-dxc DXC/bin/x64
 ```
 
+With the same options it runs the [shader translator checks](tools/check_translator_gpu.py): synthetic console programs translated, run on the GPU and compared word for word with a reference model. They also need `llvm-mc` from LLVM. When you add or fix an instruction, add it to one of these checks.
+
 Put the printed summary, your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/results.json`.
 
 If your change adds or fixes behaviour, add or extend a Lanes scenario that fails without it. If it cannot be exercised from Lanes, say why in the pull request.

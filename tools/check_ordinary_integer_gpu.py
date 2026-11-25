@@ -25,6 +25,9 @@ HALF_OPS = {"v_add_nc_i16": 2, "v_sub_nc_i16": 2, "v_mad_u16": 3, "v_mad_i16": 3
             "v_min3_u16": 3, "v_max3_u16": 3, "v_med3_u16": 3,
             "v_min3_i16": 3, "v_max3_i16": 3, "v_med3_i16": 3}
 WORD_OPS = {"v_add_nc_i32": 2, "v_sub_nc_i32": 2, "v_mad_u32_u16": 3, "v_mad_i32_i16": 3}
+# The forms whose signed saturation the translator accepts.
+CLAMP_OPS = {"v_add_nc_i32", "v_sub_nc_i32"}
+CLAMP = 1 << 8
 EDGE = [0, 1, 0xffff, 0x10000, 0x7fff8000, 0x80007fff, 0xffff0001, 0xffffffff,
         0x00008000, 0x7fffffff, 0x80000000, 0x8000ffff]
 
@@ -41,13 +44,17 @@ def selectors(name):
                 for sel in range(1 << (n + 1))]
     if name.startswith("v_mad_"):
         return [(f" op_sel:[{sel & 1},{sel >> 1},0,0]", sel) for sel in range(4)]
-    return [("", 0)]
+    return [("", 0), (" clamp", CLAMP)] if name in CLAMP_OPS else [("", 0)]
 
 
 def reference(name, values, sel, old):
     half = lambda j: values[j] >> (16 * (sel >> j & 1)) & 0xffff
     if name in WORD_OPS:
         a, b = values[0], values[1]
+        if sel & CLAMP:
+            x, y = signed(a, 32), signed(b, 32)
+            total = x + y if name == "v_add_nc_i32" else x - y
+            return max(-2**31, min(2**31 - 1, total)) % 2**32
         if name == "v_add_nc_i32":
             return (a + b) % 2**32
         if name == "v_sub_nc_i32":
@@ -148,8 +155,10 @@ def main():
                              "instrumented_sha256": digest(shader), "dxil_sha256": digest(blob)})
             # Clamp (saturation) and non-VGPR sources remain unsupported.
             rest = ", ".join(f"v{5 + j}" for j in range(n - 1))
-            for kind, inst in [("clamp", f"{name} v7, v4, {rest} clamp"),
-                               ("scalar_source", f"{name} v7, s4, {rest}")]:
+            refused = [("scalar_source", f"{name} v7, s4, {rest}")]
+            if name not in CLAMP_OPS:
+                refused.append(("clamp", f"{name} v7, v4, {rest} clamp"))
+            for kind, inst in refused:
                 bad = translate(a.emitter, assemble([inst, "s_endpgm"], a.llvm_mc))
                 if bad.returncode != 65:
                     raise ValueError(f"unexpected acceptance {inst}")

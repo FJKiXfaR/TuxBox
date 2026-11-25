@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 from tools.check_packed_integer_cpu import assembly, assemble_many, generate, EDGE, REGS, ALL_FORMS, VARIANTS, SINGLE, SAT
 from tools.reference.rdna2_packed_integer import execute
 from tools.frosty_gpu_guest import run_gpu_guest
+from tools.check_packed_integer_gpu import load_input
 
 # Six inputs + six outputs per group, with unused guard words around the view.
 GROUPS, STRIDE, WORDS, START = 16, 12, 384, 96
@@ -38,10 +39,7 @@ def instrument(text):
         raise ValueError("unexpected compute entry")
     text = text.replace(marker, "RWStructuredBuffer<uint> output : register(u0);\n" + marker)
     for i, reg in enumerate(REGS):
-        pattern = rf"(    // 0x[0-9a-f]+ v_mov_b32\n    if \(exec_lo & 1u\) v{reg} = )0x{INIT[i]:x}u;"
-        text, count = re.subn(pattern, rf"\g<1>output[{STRIDE}u * gid.x + {i}u];", text)
-        if count != 1:
-            raise ValueError(f"expected one initial literal for v{reg}")
+        text = load_input(text, reg, INIT[i], f"output[{STRIDE}u * gid.x + {i}u]")
     stores = "".join(f"    output[{STRIDE}u * gid.x + {len(REGS)+i}u] = v{reg};\n" for i,reg in enumerate(REGS))
     return text.rstrip()[:-1] + stores + "}\n"
 

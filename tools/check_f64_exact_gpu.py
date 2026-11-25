@@ -21,7 +21,7 @@ from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from check_packed_integer_gpu import assemble, digest, translate
+from check_packed_integer_gpu import assemble, digest, load_input, translate
 from frosty_gpu_guest import run_gpu_guest
 
 INIT = (0x13572468, 0x24681357)
@@ -110,10 +110,7 @@ def instrument(text):
         raise ValueError("unexpected compute entry")
     text = text.replace(marker, "RWStructuredBuffer<uint> output : register(u0);\n" + marker)
     for j, v in enumerate(INIT):
-        pattern = rf"(    // 0x[0-9a-f]+ v_mov_b32\n    if \(exec_lo & 1u\) v{4 + j} = )0x{v:x}u;"
-        text, n = re.subn(pattern, rf"\g<1>output[{STRIDE}u * gid.x + {j}u];", text)
-        if n != 1:
-            raise ValueError(f"expected one initial literal for v{4 + j}")
+        text = load_input(text, 4 + j, v, f"output[{STRIDE}u * gid.x + {j}u]")
     stores = "".join(f"    output[{STRIDE}u * gid.x + {2 + i}u] = v{10 + i};\n" for i in range(16))
     return text.rstrip()[:-1] + stores + "}\n"
 

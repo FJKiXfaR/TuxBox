@@ -18,7 +18,9 @@ class CheckCommandTests(unittest.TestCase):
             commands.append(command)
             return SimpleNamespace(returncode=1 if any(word in command for word in failing) else 0)
 
-        with mock.patch.object(check, "host_target", return_value="x86_64-unknown-linux-gnu"):
+        with mock.patch.object(check, "host_target", return_value="x86_64-unknown-linux-gnu"), \
+                mock.patch.object(check, "find_native_dxc", return_value="/dxc/bin/dxc"), \
+                mock.patch.object(check.shutil, "which", return_value="/usr/bin/llvm-mc"):
             code = check.run_checks(run=run, report=lines.append, **options)
         return code, commands, "\n".join(lines)
 
@@ -47,19 +49,22 @@ class CheckCommandTests(unittest.TestCase):
     def test_regression_controls_need_their_inputs(self):
         code, commands, report = self.run_checks(host_options=["--backend", "proton"])
         self.assertEqual(code, 0)
-        self.assertIn("D3D12 regression controls did not run", report)
+        self.assertIn("Did not run: D3D12 regression controls", report)
+        self.assertIn("Did not run: Shader translator on the GPU", report)
         self.assertFalse(any("tools/check_d3d12_regressions.py" in command for command in commands))
 
     def test_regression_controls_run_every_case_on_the_chosen_adapter(self):
         options = ["--proton", "/proton", "--prefix", "/prefix", "--adapter", "10de:2705"]
         code, commands, report = self.run_checks(host_options=options, windows_dxc="/dxc")
         self.assertEqual(code, 0)
-        controls = commands[-1]
-        self.assertIn("tools/check_d3d12_regressions.py", controls)
+        controls = next(c for c in commands if "tools/check_d3d12_regressions.py" in c)
         for case in CASES:
             self.assertIn(case, controls)
         self.assertEqual(controls[controls.index("--adapter") + 1], "10de:2705")
         self.assertIn("passed   D3D12 regression controls", report)
+        translator = commands[-1]
+        self.assertIn("tools/check_translator_gpu.py", translator)
+        self.assertEqual(translator[translator.index("--adapter") + 1], "10de:2705")
 
     def test_without_a_gpu_says_the_change_is_not_ready(self):
         code, commands, report = self.run_checks(gpu=False)
