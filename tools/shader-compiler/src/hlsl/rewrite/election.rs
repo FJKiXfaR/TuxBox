@@ -136,6 +136,38 @@ pub(in crate::hlsl) fn vgpr_def(insns: &[Insn], targets: &BTreeSet<i64>, at: usi
     None
 }
 
+/// Width in dwords of the value named by source operand `i` of `ins`. Operand
+/// widths follow the scalar or vector form rather than the neighbouring SGPR
+/// index, so a 32-bit operand next to the elected lane does not read it.
+fn source_dwords(ins: &Insn, _i: usize) -> u16 {
+    let m = ins.mnemonic.as_str();
+    if m.starts_with("image_") { 8 }
+    else if m.starts_with("s_buffer") || m.starts_with("buffer_") || m.starts_with("tbuffer_") { 4 }
+    else if m.starts_with("s_load") || m.starts_with("global_") { 2 }
+    else if m.starts_with("s_") && (m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64")
+        || m.contains("saveexec_b64")) { 2 }
+    else if m.starts_with("v_") && (m.ends_with("_f64") || m.ends_with("_u64") || m.ends_with("_i64")) { 2 }
+    else { 1 }
+}
+
+/// Whether `ins` reads SGPR `lane` as part of a multi-dword operand. A single
+/// 32-bit read leaves the election proof intact; a wide read consumes the lane
+/// pair and is not proven here.
+fn wide_lane_read(ins: &Insn, lane: u8) -> bool {
+    ins.src.iter().enumerate().any(|(i, o)| {
+        let Opnd::Sgpr(k) = *o else { return false };
+        let width = source_dwords(ins, i);
+        width >= 2 && u16::from(k) <= u16::from(lane) && u16::from(lane) < u16::from(k) + width
+    })
+}
+
+/// Whether `ins` is the scalar/EXEC equality compare that elects `lane`.
+fn eq_compares_lane(ins: &Insn, lane: u8) -> bool {
+    matches!(ins.mnemonic.as_str(),
+        "v_cmp_eq_i32" | "v_cmp_eq_u32" | "v_cmpx_eq_i32" | "v_cmpx_eq_u32")
+        && ins.src.iter().take(2).any(|o| *o == Opnd::Sgpr(lane))
+}
+
 /// Verify a first-active-lane election that the generic lowering already expresses:
 /// `s_ff1_i32_b64 s, exec` (or `_b32`) compared with the full-mask `v_mbcnt` lane index. The
 /// elected lane usually adds the number of active lanes to a counter; that count
@@ -150,18 +182,24 @@ pub(in crate::hlsl) fn verify_lane_election(insns: &mut [Insn], ff1: usize, stra
         let two = ins.mnemonic.starts_with("v_cmp_") || ins.mnemonic.starts_with("v_mbcnt_");
         ins.src.iter().take(if two { 2 } else { usize::MAX }).cloned().collect::<Vec<_>>()
     };
-    let cmp = (ff1 + 1..insns.len())
-        .find(|&j| {
-            let ins = &insns[j];
-            if straight_compute && ins.mnemonic == "s_mov_b32" {
-                return ins.src.iter().chain(&ins.dst).any(|o| *o == Opnd::Sgpr(lane));
-            }
-            sources(ins).iter().chain(&ins.dst).any(|o| may_touch_sgpr(o, lane))
-        })
-        .ok_or_else(|| bad("unused lane"))?;
-    if (ff1 + 1..=cmp).any(|j| targets.contains(&(insns[j].offset as i64))) {
-        return Err(bad("branch enters the election"));
+    // The elected lane may be copied or read for unrelated arithmetic before the
+    // comparison. Walk to the equality compare that names it, refusing when the
+    // lane is redefined or consumed as a wide operand first.
+    let mut cmp = None;
+    for j in ff1 + 1..insns.len() {
+        if targets.contains(&(insns[j].offset as i64)) {
+            return Err(bad("branch enters the election"));
+        }
+        let ins = &insns[j];
+        if eq_compares_lane(ins, lane) { cmp = Some(j); break; }
+        if crate::rdna2::clobbers_scalar(ins, lane) {
+            return Err(bad("lane is redefined before its comparison"));
+        }
+        if wide_lane_read(ins, lane) {
+            return Err(bad("lane is used by a wide operation before its comparison"));
+        }
     }
+    let cmp = cmp.ok_or_else(|| bad("lane is not compared for equality"))?;
     let c = &insns[cmp];
     // The compare either fills a mask for a later saveexec or narrows EXEC itself.
     let narrows = matches!(c.mnemonic.as_str(), "v_cmpx_eq_i32" | "v_cmpx_eq_u32");
@@ -256,11 +294,13 @@ pub(in crate::hlsl) fn counted_lanes(insns: &[Insn], targets: &BTreeSet<i64>, cm
         (Opnd::Sgpr(a), Opnd::Sgpr(b)) => a == b || a + 1 == b || a == b + 1,
         (a, b) => a == b || (b == Opnd::VccLo && a == Opnd::VccHi),
     };
-    let def = (0..count).rev().find(|&j| insns[j].dst.iter().any(names))?;
+    // `v_cmpx` names VCC as a destination it does not write (it narrows EXEC),
+    // so the counted predicate is the earlier compare that filled the mask.
+    let def = (0..count).rev().find(|&j| {
+        insns[j].dst.iter().any(names) && !insns[j].mnemonic.starts_with("v_cmpx")
+    })?;
     let d = &insns[def];
     if def >= cmp || d.dst.first() != Some(&mask) { return None; }
-    // `v_cmpx` names VCC as a destination it does not write.
-    if d.mnemonic.starts_with("v_cmpx") { return None; }
     let active_only = d.mnemonic == "s_mov_b64" && d.src == [Opnd::ExecLo]
         || d.mnemonic == "s_and_b64" && d.src.contains(&Opnd::ExecLo)
         || d.mnemonic.starts_with("v_cmp_");

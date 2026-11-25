@@ -760,6 +760,32 @@ fn const_lane_readlane_still_group_read_when_group_reads() {
 }
 
 #[test]
+fn plain_lane_read_bound_names_the_highest_lane_a_spill_does_not_own() {
+    // A wave64 add carry chain reads lane 32 of a vreg no writelane touches.
+    let insns = vec![const_lane_readlane(1, 32, 12), const_lane_readlane(2, 32, 13), const_lane_readlane(1, 0, 12)];
+    assert_eq!(plain_lane_read_max(&insns), Some(32));
+    // Lane 63 is the last lane of the wave.
+    assert_eq!(plain_lane_read_max(&[const_lane_readlane(8, 63, 3)]), Some(63));
+    // A dynamic selector already takes the group read.
+    assert_eq!(plain_lane_read_max(&[sgpr_lane_readlane(4, 2, 7)]), None);
+    // A spill area owns its lanes; those reads stay slot lookups.
+    assert_eq!(plain_lane_read_max(&[spill_writelane(4, 3, 2), const_lane_readlane(4, 3, 7)]), None);
+    // Nothing to broadcast.
+    assert_eq!(plain_lane_read_max(&[]), None);
+}
+
+#[test]
+fn plain_lane_readlane_becomes_group_read_when_group_reads() {
+    // The bound is what the pipeline needs to prove the launch covers the lane.
+    let mut insns = vec![const_lane_readlane(1, 32, 12)];
+    assert_eq!(plain_lane_read_max(&insns), Some(32));
+    lower_lane_spills(&mut insns, false, true).expect("group read");
+    assert_eq!(insns[0].mnemonic, "tb_group_readlane");
+    assert_eq!(insns[0].dst, vec![Opnd::Sgpr(12)]);
+    assert_eq!(insns[0].src, vec![Opnd::Vgpr(1), Opnd::ConstInt(32)]);
+}
+
+#[test]
 fn floating_max_masked_prologue_rejects_immediate_select_identity() {
     // A select with an immediate identity does not match the register-held
     // floating shape.

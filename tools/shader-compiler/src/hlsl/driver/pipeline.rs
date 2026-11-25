@@ -175,6 +175,17 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     let has_dynamic_lane_read = insns.iter().any(|i| i.enc == Enc::Vop3
         && i.op == 0x360
         && matches!(i.src.get(1), Some(Opnd::Sgpr(_))));
+    // A constant read of a VGPR that no spill writes is an ordinary lane
+    // broadcast. The group read reaches every lane of a block only when the
+    // block launched it, so the highest lane read must exist in the last
+    // (possibly partial) block of 64 workgroup threads.
+    let lane_broadcast = plain_lane_read_max(&insns).is_some_and(|max_lane| {
+        let [x, y, z] = compute_group(ex);
+        let Some(count) = x.checked_mul(y).and_then(|n| n.checked_mul(z)) else { return false };
+        let tail = count % 64;
+        count != 0 && count % 32 == 0 && count <= 1024 && max_lane < 64
+            && (tail == 0 || max_lane < i64::from(tail))
+    });
     if !wave_cull && !page_waves { {
         // Swizzles already exchange values through group memory; so can a lane read.
         let [x, y, z] = compute_group(ex);
@@ -184,7 +195,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         let swizzle_group_reads = insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32")
             && insns.iter().any(|i| i.mnemonic.ends_with("exec_b64") || i.mnemonic == "s_mov_b64");
         let group_reads = ex.stage == Stage::Compute && !resolve_wave32 && !lone_lane::on() && x * y * z % 32 == 0
-            && (swizzle_group_reads || has_dynamic_lane_read)
+            && (swizzle_group_reads || has_dynamic_lane_read || lane_broadcast && scan_width.is_none())
             && !insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32" && i.mnemonic.starts_with("ds_ordered"));
         if ex.stage == Stage::Pixel && pixel_heap_base(ex, 5).is_some() { lower_first_lane_reads(&mut insns); }
         lower_lane_spills(&mut insns, resolve_wave32, group_reads)?;
@@ -298,15 +309,25 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     // 32-lane waves; operations that depend on the 64th lane become approximate.
     // Applied last so it covers every path that can still require a wave64
     // program: ballots, votes, scan widths and register wave sizes.
+    // A compute group of at most 32 threads never fills more than the low half of
+    // the guest's 64-lane wave: ballots, votes and whole-wave reductions then only
+    // observe lanes 0..31, and one host wave32 holds exactly those threads. Lowering
+    // such a program at 32 lanes is exact, not an approximation.
+    let compute_threads = {
+        let [x, y, z] = compute_group(ex);
+        x.checked_mul(y).and_then(|n| n.checked_mul(z))
+    };
+    let single_wave_group = ex.stage == Stage::Compute
+        && compute_threads.is_some_and(|n| (1..=32).contains(&n));
     let required_wave_size = match required_wave_size {
-        Some(64) if std::env::var_os("XSHADER_FORCE_WAVE32").is_some() => Some(32),
+        Some(64) if std::env::var_os("XSHADER_FORCE_WAVE32").is_some() || single_wave_group => Some(32),
         other => other,
     };
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
     em.compute_swizzle = ex.stage == Stage::Compute && scan_width.is_none() && !resolve_wave32
-        && (em.insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") || has_dynamic_lane_read);
+        && (em.insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") || has_dynamic_lane_read || lane_broadcast);
     if em.compute_swizzle {
         let [x, y, z] = compute_group(ex);
         let count = x.checked_mul(y).and_then(|n| n.checked_mul(z)).unwrap_or(0);
@@ -318,11 +339,17 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             return Err("compute swizzle following an early exit".into());
         }
         // Moving a shared exchange out of a forward guest branch is safe once every
-        // invocation rejoins. A backward branch could execute it different numbers of times.
-        for branch in em.insns.iter().filter(|i| i.enc == Enc::Sopp && Emitter::branch_cond(i.op).is_some() && i.aux.imm < 0) {
-            let head = branch.offset as i64 + 4 + 4 * branch.aux.imm;
-            if em.insns.iter().any(|i| exchanges(i) && (head..=branch.offset as i64).contains(&(i.offset as i64))) {
-                return Err("compute swizzle inside a loop".into());
+        // invocation rejoins. A backward branch can execute it a different number of
+        // times only when the group spans several guest waves; while the whole group
+        // is a single guest wave (at most 64 threads) the guest's scalar loop branch
+        // is wave-uniform, so every invocation reaches each rendezvous in the body the
+        // same number of times and the in-loop lowering stays convergent.
+        if count > 64 {
+            for branch in em.insns.iter().filter(|i| i.enc == Enc::Sopp && Emitter::branch_cond(i.op).is_some() && i.aux.imm < 0) {
+                let head = branch.offset as i64 + 4 + 4 * branch.aux.imm;
+                if em.insns.iter().any(|i| exchanges(i) && (head..=branch.offset as i64).contains(&(i.offset as i64))) {
+                    return Err("compute swizzle inside a loop".into());
+                }
             }
         }
     }
@@ -349,8 +376,21 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             }
         }
         let [x, y, z] = compute_group(ex);
-        if ex.stage != Stage::Compute || !x.checked_mul(y).and_then(|n| n.checked_mul(z)).is_some_and(|n| n % width == 0 || partial_election && n > 0 && n < width) {
-            return Err(format!("wave operation requires complete {width}-lane compute waves"));
+        let count = x.checked_mul(y).and_then(|n| n.checked_mul(z));
+        let complete = match ex.stage {
+            // A pixel program's invocations are not a thread group: they form waves
+            // of the rasteriser's own width, which on this host is 32 lanes. A guest
+            // 32-lane pixel wave is therefore natively satisfied; a 64-lane one would
+            // need a second half-wave the host cannot offer.
+            Stage::Pixel => width == 32,
+            _ => count.is_some_and(|n| n % width == 0 || partial_election && n > 0 && n < width),
+        };
+        if !complete {
+            return Err(if ex.stage == Stage::Pixel {
+                format!("wave operation requires complete {width}-lane pixel waves on a 32-lane host")
+            } else {
+                format!("wave operation requires complete {width}-lane compute waves")
+            });
         }
     }
     em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)

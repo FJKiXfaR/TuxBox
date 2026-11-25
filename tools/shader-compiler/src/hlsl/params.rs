@@ -90,10 +90,17 @@ pub(super) fn inputs(ex: &ShaderExtract, insns: &[Insn]) -> Vec<Param> {
     let count = ex.fssm.get(0x238..).and_then(|b| b.first_chunk()).map(|b| u32::from_le_bytes(*b) as usize);
     let paired: Vec<Param> = all.iter().filter(|p| p.registers().into_iter().any(read)).cloned().collect();
     let reads = reads(insns);
-    let mut fits: Vec<_> = [used.clone(), paired, all].into_iter().filter(|p| Some(p.len()) == count).collect();
+    let candidates = [used, paired, all];
+    let mut fits: Vec<_> = candidates.iter().filter(|p| Some(p.len()) == count).cloned().collect();
+    if fits.is_empty() {
+        // No reading of the signature agrees with the declared count: keep the one that
+        // leaves the fewest interpolations without their component.
+        let missed = |p: &Vec<Param>| reads.iter().filter(|&&r| !carries(p, sig, r)).count();
+        return candidates.into_iter().min_by_key(missed).unwrap_or_default();
+    }
     // The first of equals.
     fits.sort_by_key(|p| reads.iter().filter(|&&r| !carries(p, sig, r)).count());
-    fits.into_iter().next().unwrap_or(used)
+    fits.into_iter().next().unwrap_or_default()
 }
 
 /// Parameter, channel and half (`None` for the whole channel) of each interpolation.
@@ -113,8 +120,12 @@ fn carries(params: &[Param], sig: &[SigElement], (attr, channel, half): (usize, 
     let Some(param) = params.get(attr) else { return false };
     let (register, component) = match (param, half) {
         (Param::Full(register), _) => (*register, channel),
-        (Param::Half(_), None) => return false,
         (Param::Half(_), Some(high)) => match param.component(channel, high) {
+            Some(found) => found,
+            None => return false,
+        },
+        // A 32-bit interpolation of a half-float channel works on its low component.
+        (Param::Half(_), None) => match param.component(channel, false) {
             Some(found) => found,
             None => return false,
         },

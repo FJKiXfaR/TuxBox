@@ -16,3 +16,26 @@ fn half_registers_share_parameters_by_channel() {
     assert_eq!(params[2].channel(5, 2), Some((2, Some(false))));
     assert_eq!(params[3].channel(6, 3), Some((3, None)));
 }
+
+#[test]
+fn thirty_two_bit_reads_of_a_half_channel_take_its_low_component() {
+    // TEXCOORD0 declares four 16-bit components in one register, TEXCOORD1 three in the next,
+    // so both fit one parameter: two channels each.
+    let sig = [element(1, 6, 15), element(2, 6, 7)];
+    let params = assign(&sig, &[], |_| true);
+    assert_eq!(params, vec![Param::Half(vec![(1, 0), (2, 2)])]);
+    // A 32-bit interpolation selects a channel (ATTRCHAN), not a half, so it reads the
+    // channel's first component; the f16 opcodes select the half within it.
+    assert_eq!(params[0].component(0, false), Some((1, 0)));
+    assert_eq!(params[0].component(1, false), Some((1, 2)));
+    assert_eq!(params[0].component(2, false), Some((2, 0)));
+    assert_eq!(params[0].channel(2, 0), Some((2, Some(false))));
+    assert!(carries(&params, &sig, (0, 1, None)));
+    assert!(carries(&params, &sig, (0, 3, None)));
+    // A component the signature does not declare is not carried.
+    let sig = [element(1, 6, 3)];
+    let params = assign(&sig, &[], |_| true);
+    assert_eq!(params, vec![Param::Half(vec![(1, 0)])]);
+    assert_eq!(params[0].component(1, false), Some((1, 2)));
+    assert!(!carries(&params, &sig, (0, 1, None)));
+}

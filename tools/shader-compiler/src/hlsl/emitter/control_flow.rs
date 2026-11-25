@@ -43,6 +43,15 @@ impl<'a> Emitter<'a> {
                     target.insert(i, ti);
                 }
             }
+            if let Some(ti) = setpc_target(&self.insns, i, prog_end, n_insns)? {
+                if ti <= i {
+                    return Err(format!(
+                        "s_setpc_b64 at {:#x} jumps backwards to {:#x}",
+                        ins.offset, self.insns[ti].offset
+                    ));
+                }
+                target.insert(i, ti);
+            }
         }
         // Validate loop structure.
         // Several back-edges to one header = `continue`s. The last one (highest address)
@@ -517,4 +526,136 @@ impl<'a> Emitter<'a> {
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(())
     }
+}
+
+/// The last instruction before `at` that writes scalar `reg`, provided no branch
+/// target or program exit lies between it and the use.
+fn scalar_def(insns: &[Insn], targets: &BTreeSet<i64>, at: usize, reg: u8) -> Option<usize> {
+    for j in (at.saturating_sub(64)..at).rev() {
+        if targets.contains(&(insns[j + 1].offset as i64))
+            || insns[j].enc == Enc::Sopp && Emitter::branch_cond(insns[j].op).is_some()
+            || insns[j].mnemonic == "s_endpgm"
+        {
+            return None;
+        }
+        if crate::rdna2::clobbers_scalar(&insns[j], reg) {
+            return Some(j);
+        }
+    }
+    None
+}
+
+/// Exact 32-bit value of `reg` at `at`, from the PC and literals only.
+fn scalar_const(insns: &[Insn], targets: &BTreeSet<i64>, at: usize, reg: u8, depth: u8) -> Option<u32> {
+    if depth == 0 {
+        return None;
+    }
+    let j = scalar_def(insns, targets, at, reg)?;
+    let ins = &insns[j];
+    let lit = |op: &Opnd| -> Option<u32> {
+        match *op {
+            Opnd::ConstInt(n) => Some(n as u32),
+            Opnd::Literal(n) => Some(n),
+            _ => None,
+        }
+    };
+    // GETPC writes the byte address of the next instruction into a pair: the
+    // low word is that address, the high word is zero.
+    if ins.mnemonic == "s_getpc_b64" {
+        let Opnd::Sgpr(d) = *ins.dst.first()? else { return None };
+        return Some(if d == reg { ins.offset as u32 + 4 } else { 0 });
+    }
+    if ins.dst.first() != Some(&Opnd::Sgpr(reg)) {
+        return None;
+    }
+    match (ins.mnemonic.as_str(), ins.src.as_slice()) {
+        ("s_mov_b32", [a]) => lit(a),
+        ("s_movk_i32", _) => Some(ins.aux.imm as i32 as u32),
+        ("s_add_u32" | "s_add_i32", [Opnd::Sgpr(a), b]) if *a != reg => {
+            Some(scalar_const(insns, targets, j, *a, depth - 1)?.wrapping_add(lit(b)?))
+        }
+        ("s_add_u32" | "s_add_i32", [a, Opnd::Sgpr(b)]) if *b != reg => {
+            Some(lit(a)?.wrapping_add(scalar_const(insns, targets, j, *b, depth - 1)?))
+        }
+        _ => None,
+    }
+}
+
+/// The code address a `s_setpc_b64` jumps to, when it is a compile-time constant:
+/// either a pair of literal moves (absolute) or `s_getpc_b64` plus an
+/// `s_add_u32`/`s_addc_u32` displacement (PC-relative). A target read from a
+/// table or fed by any other SGPR is a dynamic jump: `None`.
+fn setpc_address(insns: &[Insn], at: usize) -> Option<u64> {
+    let ins = insns.get(at)?;
+    if ins.enc != Enc::Sop1 || ins.op != 32 {
+        return None;
+    }
+    let Opnd::Sgpr(r) = *ins.src.first()? else { return None };
+    if r > 104 {
+        return None;
+    }
+    let targets = branch_targets(insns);
+    let lit = |op: &Opnd| -> Option<u32> {
+        match *op {
+            Opnd::ConstInt(n) => Some(n as u32),
+            Opnd::Literal(n) => Some(n),
+            _ => None,
+        }
+    };
+    let lo = scalar_def(insns, &targets, at, r)?;
+    let hi = scalar_def(insns, &targets, at, r + 1)?;
+    // Absolute address: both halves are literals.
+    if insns[lo].mnemonic == "s_mov_b32" && insns[hi].mnemonic == "s_mov_b32" {
+        let low = lit(insns[lo].src.first()?)? as u64;
+        let high = lit(insns[hi].src.first()?)? as u64;
+        return Some((high << 32) | low);
+    }
+    // PC-relative: the pair is added to a literal displacement, optionally with
+    // the carry of that add folded into the high word by S_ADDC.
+    let add = &insns[lo];
+    if !matches!(add.mnemonic.as_str(), "s_add_u32" | "s_add_i32")
+        || add.dst.first() != Some(&Opnd::Sgpr(r))
+        || add.src.first() != Some(&Opnd::Sgpr(r))
+    {
+        return None;
+    }
+    let bias = lit(add.src.get(1)?)? as u64;
+    let base_low = scalar_const(insns, &targets, lo, r, 8)? as u64;
+    let base_high = scalar_const(insns, &targets, lo, r + 1, 8)? as u64;
+    let sum = base_low + bias;
+    let high = if hi == lo + 1 {
+        let carry = &insns[hi];
+        if carry.mnemonic != "s_addc_u32"
+            || carry.dst.first() != Some(&Opnd::Sgpr(r + 1))
+            || carry.src.first() != Some(&Opnd::Sgpr(r + 1))
+            || lit(carry.src.get(1)?)? != 0
+        {
+            return None;
+        }
+        base_high.wrapping_add(sum >> 32)
+    } else if hi < lo {
+        // The high word was not touched by the add.
+        base_high
+    } else {
+        return None;
+    };
+    Some((high << 32) | (sum as u32) as u64)
+}
+
+/// Branch target index for a `s_setpc_b64` with a constant address. `Ok(None)`
+/// leaves a dynamic jump to the emitter, which refuses it with its own message.
+fn setpc_target(insns: &[Insn], i: usize, prog_end: usize, n_insns: usize) -> Result<Option<usize>, String> {
+    let Some(addr) = setpc_address(insns, i) else { return Ok(None) };
+    let ins = &insns[i];
+    if addr > prog_end as u64 {
+        return Err(format!("s_setpc_b64 at {:#x} jumps outside the program ({addr:#x})", ins.offset));
+    }
+    if addr as usize >= prog_end {
+        return Ok(Some(n_insns));
+    }
+    insns
+        .iter()
+        .position(|x| x.offset == addr as usize)
+        .map(Some)
+        .ok_or_else(|| format!("s_setpc_b64 at {:#x} targets mid-instruction {addr:#x}", ins.offset))
 }

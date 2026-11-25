@@ -14,12 +14,53 @@ pub(in crate::hlsl) const LANE_TEMP_BASE: u16 = 10_000;
 /// temporary and the two instructions become plain `s_mov_b32`. The descriptor dataflow
 /// tracks those temporaries like registers (keys 1000+), so descriptors survive a spill.
 ///
-/// Refused (explicit error): a non-constant lane index, a read of a slot that was never
-/// written, or a spill VGPR that is also used as an ordinary vector.
-/// A read of one lane of the caller's 64-lane block, exchanged like `ds_swizzle_b32`.
+/// Refused (explicit error): a non-constant lane index, or a spill VGPR that is also used as
+/// an ordinary vector.
+///
+/// A constant read of a lane no `v_writelane_b32` writes is not a spill at all (see
+/// [`plain_lane_read_max`]): it broadcasts another lane's ordinary VGPR value, which the
+/// pipeline lowers to [`GROUP_READ`] when the launch covers that lane. A *non-constant*
+/// selector that can address spilled lanes stays refused: a slot is a translator temporary
+/// keyed by a constant lane, so an indexed read would have to select among slots
+/// (`sel == 12 ? tb_s0 : ...`), and the ranges that remain in this cache are loop-carried
+/// lane arrays — the console compiler parks a table of scalars in lanes 0..7, 12..14 of one
+/// VGPR and reads it with a selector bounded only by `v_and 7` / `v_min3_u32`
+/// (`50d4da5b:0x838`), so which slot a selector names depends on an earlier iteration.
 pub(in crate::hlsl) const GROUP_READ: &str = "tb_group_readlane";
 
+/// A read of one lane of the caller's 64-lane block, exchanged like `ds_swizzle_b32`.
 pub(in crate::hlsl) fn exchanges(i: &Insn) -> bool { i.mnemonic == "ds_swizzle_b32" || i.mnemonic == GROUP_READ }
+
+/// The highest lane any `v_readlane_b32` takes from a VGPR that no
+/// `v_writelane_b32` writes.
+///
+/// Such a read is not a spill slot: it broadcasts the value the source lane's own
+/// VGPR holds (observed: the upper half of a wave64 add carry chain, and per-lane
+/// tables the console compiler reads back as scalars). No slot names it, so it
+/// needs a whole-wave exchange; the caller decides whether the program can
+/// express one. Non-constant selectors already take the dynamic group read and
+/// are ignored here.
+pub(in crate::hlsl) fn plain_lane_read_max(insns: &[Insn]) -> Option<i64> {
+    let written: BTreeSet<u8> = insns.iter()
+        .filter(|i| i.enc == Enc::Vop3 && i.op == 0x361)
+        .filter_map(|i| match i.dst.first() {
+            Some(Opnd::Vgpr(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    let mut max = None;
+    for i in insns {
+        if i.enc != Enc::Vop3 || i.op != 0x360 { continue; }
+        let Some(Opnd::Vgpr(v)) = i.src.first() else { continue };
+        if written.contains(v) { continue; }
+        if let Some(Opnd::ConstInt(lane)) = i.src.get(1) {
+            if (0..64).contains(lane) {
+                max = Some(max.map_or(*lane, |m: i64| m.max(*lane)));
+            }
+        }
+    }
+    max
+}
 
 /// A pixel is a wave of its own, so the first lane of a mask that covers it is its own.
 /// `s_ff1` names that lane for `v_readlane`; anything else that uses the lane is left alone.

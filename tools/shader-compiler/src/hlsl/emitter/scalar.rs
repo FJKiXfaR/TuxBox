@@ -218,7 +218,7 @@ impl<'a> Emitter<'a> {
     }
 
     /// Scalar operations on one source.
-    pub(in crate::hlsl) fn emit_sop1(&mut self, idx: usize, ins: &Insn, is_ps: bool) -> Result<(), String> {
+    pub(in crate::hlsl) fn emit_sop1(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
         let s = &ins.src;
         let d = ins.dst.first().cloned();
@@ -244,6 +244,23 @@ impl<'a> Emitter<'a> {
                 self.touch(&d);
                 let cur = r(&d)?;
                 self.ws(&d, &format!("({cur} | (1u << (({a}) & 31u)))"))
+            }
+            // D.u64[S0.u[5:0]] = 0 / 1 (the bit index selects the word).
+            "s_bitset0_b64" | "s_bitset1_b64" => {
+                let one = m == "s_bitset1_b64";
+                self.touch(&d);
+                self.touch(&hi(&d));
+                self.touch(&hi(&s[0]));
+                let (cur_lo, cur_hi) = (r(&d)?, r(&hi(&d))?);
+                let (op, not) = if one { ("|", "") } else { ("&", "~") };
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint t{t}k = ({a}) & 63u, t{t}m = 1u << (t{t}k & 31u);"));
+                self.line(&format!("uint t{t}l = (t{t}k >= 32u) ? {cur_lo} : ({cur_lo} {op} {not}t{t}m);"));
+                self.line(&format!("uint t{t}h = (t{t}k >= 32u) ? ({cur_hi} {op} {not}t{t}m) : {cur_hi};"));
+                self.ws(&d, &format!("t{t}l"))?;
+                let dh = hi(&d);
+                return self.ws(&dh, &format!("t{t}h"));
             }
             "s_wqm_b32" | "s_wqm_b64" => {
                 // For an ordinary scalar mask, replicate each nonempty nibble.
@@ -407,11 +424,30 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("exec_lo = t{t}l; scc = ({mask} != 0u);"));
                 Ok(())
             }
+            // A jump to a constant code address, resolved by the control-flow pass
+            // from the GETPC pair (`RDNA 2` ISA 12.3: PC = S0.u64). It behaves like
+            // an unconditional S_BRANCH: set the skip flag of its target label.
+            "s_setpc_b64" if br.is_some() => {
+                let t = br.unwrap_or_default();
+                let to = self.insns.get(t).map_or("the end of the program".to_string(), |i| format!("{:#x}", i.offset));
+                self.line(&format!("j{t} = true; // (jump to {to})"));
+                Ok(())
+            }
             // Return from a vertex shader chained in front of a geometry shader: the
             // program ends here (it is followed directly by s_endpgm).
             "s_setpc_b64" if self.ex.stage == Stage::Vertex && idx + 2 >= self.insns.len() => {
                 self.line("// (return to the chained stage)");
                 Ok(())
+            }
+            // A jump through a value that is not a compile-time code address (a
+            // table entry, a link register, ...) cannot be lowered to structured HLSL.
+            "s_setpc_b64" => Err("unsupported SOP1: dynamic jump target".into()),
+            // GPR-indexed addressing reads/writes the SGPR pair selected by M0[4:0].
+            // HLSL has no indexed scalar register file; these need a rewrite of the
+            // whole SGPR file into an array, which nothing in the archive requires.
+            "s_movrels_b32" | "s_movrels_b64" | "s_movreld_b32" | "s_movreld_b64"
+            | "s_movrelsd_2_b32" | "s_set_gpr_idx_on" | "s_set_gpr_idx_off" => {
+                Err("unsupported SOP1: GPR-indexed register access".into())
             }
             _ => Err("unsupported SOP1".into()),
         }

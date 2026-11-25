@@ -8,6 +8,31 @@ enum Access {
     Atomic,
 }
 
+/// DS instructions that atomically read *and* write LDS memory (the `_rtn` forms
+/// included). They order against LDS reads and writes in both directions.
+/// The emitter lowers them with `Interlocked*` or a compare-exchange loop.
+pub(in crate::hlsl) fn is_lds_atomic(name: &str) -> bool {
+    matches!(
+        name.replace("_rtn", "").as_str(),
+        "ds_add_u32"
+            | "ds_sub_u32"
+            | "ds_rsub_u32"
+            | "ds_inc_u32"
+            | "ds_dec_u32"
+            | "ds_min_i32"
+            | "ds_max_i32"
+            | "ds_min_u32"
+            | "ds_max_u32"
+            | "ds_and_b32"
+            | "ds_or_b32"
+            | "ds_xor_b32"
+            | "ds_mskor_b32"
+            | "ds_cmpst_b32"
+            | "ds_wrxchg_b32"
+            | "ds_wrap_b32"
+    )
+}
+
 /// A masked set of producers can publish LDS, restore EXEC, and let a
 /// different set of lanes read the data. The host may split that guest
 /// wave into two subgroups. Rendezvous outside the emulated branch guards,
@@ -85,7 +110,7 @@ pub(super) fn exchange_waits(insns: &[Insn], loops: &[(usize, usize)]) -> BTreeS
             Some(Access::Write)
         } else if name.starts_with("ds_read") {
             Some(Access::Read)
-        } else if name == "ds_max_u32" {
+        } else if is_lds_atomic(name) {
             Some(Access::Atomic)
         } else {
             None

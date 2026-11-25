@@ -173,6 +173,23 @@ fn allocation(seq: &mut Sequence<'_>) -> Result<(Opnd, Opnd, Opnd, [Opnd; 3]), S
 }
 
 fn allocation_128(seq: &mut Sequence<'_>) -> Result<(Opnd, Opnd, Opnd, [Opnd; 3], Opnd), String> {
+    // Both shapes start with the vertex count guard. The second instruction of
+    // the prologue then either materialises the 128-vertex limit or compares
+    // the count directly against it.
+    let mut after_count = seq.at;
+    while seq.code.get(after_count).is_some_and(is_wait) {
+        after_count += 1;
+    }
+    if !seq.code.get(after_count).is_some_and(|op| op.mnemonic == "s_cmp_eq_u32") {
+        return Err("missing mesh count guard".into());
+    }
+    after_count += 1;
+    while seq.code.get(after_count).is_some_and(is_wait) {
+        after_count += 1;
+    }
+    if !seq.code.get(after_count).is_some_and(|op| op.mnemonic == "s_movk_i32") {
+        return allocation_128_single(seq);
+    }
     let vertices = seq.count()?;
     let limit = seq.imm("s_movk_i32", 128)?;
     let [limit @ (S(6) | S(14..))] = limit.dst[..] else {
@@ -245,25 +262,124 @@ fn allocation_128(seq: &mut Sequence<'_>) -> Result<(Opnd, Opnd, Opnd, [Opnd; 3]
     Ok((vertices, primitives, invalid, temps, lane))
 }
 
+// A group whose vertex and primitive counts are the same value: the shader
+// derives one dynamic count, bounds it against 128 and writes it to both halves
+// of M0. The emitted HLSL therefore reports `uint2(count, count)`.
+fn allocation_128_single(
+    seq: &mut Sequence<'_>,
+) -> Result<(Opnd, Opnd, Opnd, [Opnd; 3], Opnd), String> {
+    let count = seq.next("s_cmp_eq_u32")?;
+    // The count is computed just before the guard and must survive s0..s7.
+    let [vertices @ S(8..), I(0)] = count.src[..] else {
+        return Err("unsupported mesh count guard".into());
+    };
+    if count.dst != [Scc] {
+        return Err("unsupported mesh count guard".into());
+    }
+    seq.write(S(0), "s_cselect_b64", &[ExecLo, I(0)])?;
+    let limit = seq.next("s_cmpk_gt_u32")?;
+    if limit.dst != [vertices] || limit.aux.imm != 128 || limit.aux.sdwa.is_some() {
+        return Err("mesh count limit uses a different register".into());
+    }
+    seq.write(S(2), "s_cselect_b64", &[ExecLo, I(0)])?;
+    // The compiler folds `x | x` into the mask sequence; either form is the
+    // same union of the zero and over-limit masks.
+    while seq.code.get(seq.at).is_some_and(|op| {
+        op.mnemonic == "s_or_b64"
+            && op.dst.len() == 1
+            && op.src.len() == 2
+            && op.src[0] == op.dst[0]
+            && op.src[1] == op.dst[0]
+    }) {
+        seq.at += 1;
+    }
+    seq.write(S(0), "s_or_b64", &[S(2), S(0)])?;
+    let bad = seq.assign("v_cndmask_b32", &[I(0), I(1), S(0)])?;
+    seq.write(S(0), "v_readfirstlane_b32", &[bad])?;
+    seq.write(S(0), "s_and_b32", &[I(1), S(0)])?;
+    seq.write(Scc, "s_cmp_eq_u32", &[S(0), I(1)])?;
+    seq.write(S(0), "s_mov_b64", &[ExecLo])?;
+    let invalid = seq.assign("s_cselect_b64", &[ExecLo, I(0)])?;
+    if invalid != S(2) {
+        return Err("unsupported mesh allocation mask register".into());
+    }
+    // One value guards both outputs, so a single cndmask materialises it.
+    let vert = seq.assign("v_cndmask_b32", &[vertices, I(1), invalid])?;
+    let temps = [bad, vert, vert];
+    if !temps.iter().all(|op| matches!(op, V(_))) {
+        return Err("unsupported temporary registers in mesh allocation".into());
+    }
+    seq.write(S(4), "s_xor_b64", &[invalid, I(-1)])?;
+    seq.write(S(6), "v_readfirstlane_b32", &[vert])?;
+    let first = seq.next("v_cmpx_eq_u32")?;
+    let [I(0), lane @ V(_)] = first.src[..] else {
+        return Err(format!("unsupported operands for mesh v_cmpx_eq_u32 at {:#x}", first.offset));
+    };
+    if first.dst != [VccLo] || temps.contains(&lane) {
+        return Err("unsupported temporary registers in mesh allocation".into());
+    }
+    let restore = seq.branch("s_cbranch_execz")?;
+    // s7 holds the primitive count in the two-count shape; here it is scratch.
+    seq.write(S(7), "s_lshl_b32", &[S(6), I(12)])?;
+    seq.write(VccLo, "s_andn2_b64", &[ExecLo, invalid])?;
+    seq.write(S(6), "s_or_b32", &[S(7), S(6)])?;
+    seq.write(M0, "s_mov_b32", &[S(6)])?;
+    seq.imm("s_sendmsg", 9)?;
+    seq.imm("s_waitcnt", 0)?;
+    let valid = seq.branch("s_cbranch_vccnz")?;
+    seq.imm("s_barrier", 0)?;
+    let null = seq.assign("v_bfrev_b32", &[I(1)])?;
+    if null != bad {
+        return Err("unexpected null primitive register".into());
+    }
+    seq.export(12, 0, 2)?;
+    if seq.export(20, 1, 2)?.src.first() != Some(&null) {
+        return Err("missing null primitive in mesh allocation".into());
+    }
+    seq.arrive(valid)?;
+    seq.arrive(restore)?;
+    seq.imm("s_waitcnt", -241)?;
+    seq.write(ExecLo, "s_mov_b64", &[S(0)])?;
+    seq.imm("s_barrier", 0)?;
+    Ok((vertices, vertices, invalid, temps, lane))
+}
+
 pub(super) fn recognize(
     insns: &[Insn],
     max_vertices: u16,
     clip_mask: Option<u8>,
 ) -> Result<MeshExports, String> {
-    let compact = max_vertices == 128;
-    let start = insns
+    let send = insns
         .iter()
         .position(|op| op.mnemonic == "s_sendmsg")
-        .and_then(|send| {
-            insns[..send]
-                .iter()
-                .enumerate()
-                .rev()
-                .filter(|(_, op)| !is_wait(op))
-                .nth(if compact { 28 } else { 27 })
-                .map(|(index, _)| index)
-        })
         .ok_or("missing mesh allocation request")?;
+    // The allocation prologue starts at the first output-count guard, but the
+    // scheduler moves it relative to the allocation request. Try every count
+    // comparison in the window before the request; the full sequence parse
+    // accepts exactly one of them.
+    let lower = send.saturating_sub(48);
+    let mut first_error = None;
+    for start in (lower..send).rev() {
+        if insns[start].mnemonic != "s_cmp_eq_u32" {
+            continue;
+        }
+        match recognize_at(insns, start, max_vertices, clip_mask) {
+            Ok(exports) => return Ok(exports),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| "missing mesh allocation request".into()))
+}
+
+fn recognize_at(
+    insns: &[Insn],
+    start: usize,
+    max_vertices: u16,
+    clip_mask: Option<u8>,
+) -> Result<MeshExports, String> {
+    let compact = max_vertices == 128;
     let mut seq = Sequence {
         code: insns,
         at: start,

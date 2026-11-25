@@ -95,6 +95,19 @@ enum NeutralIdentity {
     LiteralBits(u32),
 }
 
+/// The next instruction that is not a scheduling placeholder. The guest inserts
+/// s_waitcnt (and, inside a masked region, s_nop) between the DPP steps and the
+/// scalar broadcasts that read their result; those carry no lane state.
+fn next_real<'a>(insns: &'a [Insn], at: &mut usize) -> Option<&'a Insn> {
+    while let Some(ins) = insns.get(*at) {
+        *at += 1;
+        if !matches!(ins.mnemonic.as_str(), "s_nop" | "s_waitcnt" | "v_nop") {
+            return Some(ins);
+        }
+    }
+    None
+}
+
 fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> Option<(usize, Opnd, Opnd)> {
     let select = insns.get(first.checked_sub(1)?)?;
     let [ident, _, mask @ Opnd::Sgpr(_)] = select.src[..] else {
@@ -162,6 +175,7 @@ fn masked_identity(operation: &str) -> Option<NeutralIdentity> {
         "v_max_i32" => Some(NeutralIdentity::LiteralBits(i32::MIN as u32)),
         "v_min_f32" => Some(NeutralIdentity::LiteralBits(f32::INFINITY.to_bits())),
         "v_max_f32" => Some(NeutralIdentity::LiteralBits(f32::NEG_INFINITY.to_bits())),
+        "v_add_f16" => Some(NeutralIdentity::Immediate(0)),
         _ => None,
     }
 }
@@ -214,9 +228,8 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
         "s_or_saveexec_b64" => 64,
         _ => return Err("unrecognized DPP reduction prologue"),
     };
-    let last_read = if width == 32 { 8 } else { 10 };
     let block = tail
-        .get(..last_read + 2)
+        .get(..6)
         .ok_or("truncated wave reduction")?;
     let [Opnd::Sgpr(saved)] = save.dst[..] else {
         return Err("invalid saved EXEC register");
@@ -267,17 +280,21 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
             return Err("unrecognized DPP reduction shuffle");
         }
     }
-    let perm = &block[6];
+    // Cross-row combine, optional upper-half add and the scalar broadcasts. The
+    // guest schedules s_waitcnt/nops between them; nothing else is admitted.
+    let vr = Opnd::Vgpr(acc);
+    let mut at = start + 6; // first instruction after the four DPP steps
+    let perm = next_real(insns, &mut at).ok_or("truncated wave reduction")?;
     let [tmp @ Opnd::Vgpr(_)] = perm.dst[..] else {
         return Err("invalid cross-row destination");
     };
-    let vr = Opnd::Vgpr(acc);
     if perm.mnemonic != "v_permlanex16_b32"
         || perm.src != [vr, Opnd::ConstInt(0), Opnd::ConstInt(0)]
-        || &block[7].mnemonic != operation
-        || block[7].dst != [vr]
-        || block[7].src != [tmp, vr]
     {
+        return Err("unrecognized cross-row add");
+    }
+    let combined = next_real(insns, &mut at).ok_or("truncated wave reduction")?;
+    if combined.mnemonic != *operation || combined.dst != [vr] || combined.src != [tmp, vr] {
         return Err("unrecognized cross-row add");
     }
     let lane_read = |ins: &Insn, lane| match ins.dst[..] {
@@ -295,17 +312,21 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
         }
         _ => Err("invalid integer sum lane read"),
     };
+    let mut reads = Vec::new();
     if width == 64 {
-        let high = lane_read(&block[8], 32)?;
-        if &block[9].mnemonic != operation
-            || block[9].dst != [vr]
-            || block[9].src != [Opnd::Sgpr(high), vr]
+        let high = lane_read(next_real(insns, &mut at).ok_or("truncated wave reduction")?, 32)?;
+        reads.push(at - 1);
+        let add = next_real(insns, &mut at).ok_or("truncated wave reduction")?;
+        if add.mnemonic != *operation
+            || add.dst != [vr]
+            || add.src != [Opnd::Sgpr(high), vr]
         {
             return Err("missing upper-half add");
         }
     }
-    lane_read(&block[last_read], 0)?;
-    let restore = &block[last_read + 1];
+    lane_read(next_real(insns, &mut at).ok_or("truncated wave reduction")?, 0)?;
+    reads.push(at - 1);
+    let restore = &insns[at];
     if restore.mnemonic
         != (if width == 32 {
             "s_mov_b32"
@@ -325,8 +346,8 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
     }
     // READLANE's encoded destination names an SGPR. Mark just the actual
     // broadcasts here so the independent scalar lane-spill pass ignores them.
-    for i in (8..=last_read).step_by(2) {
-        let ins = &mut insns[start + i];
+    for &i in &reads {
+        let ins = &mut insns[i];
         let Opnd::Vgpr(dst) = ins.dst[0] else {
             return Err("invalid lane result");
         };
@@ -334,7 +355,7 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
         ins.dst[0] = Opnd::Sgpr(dst);
         ins.src.truncate(2);
     }
-    Ok((width, start + last_read + 2))
+    Ok((width, at + 1))
 }
 
 // Restrict the proof to a small straight-line scalar slice. No lane reads,
@@ -572,7 +593,7 @@ fn execz_forward_guard(
 }
 
 /// Instruction ranges from the save-EXEC prologue through the EXEC restore.
-pub(super) fn reduction_regions(insns: &[Insn], width: u32)
+pub(super) fn reduction_regions(insns: &[Insn], _width: u32)
     -> impl Iterator<Item = (usize, std::ops::RangeInclusive<usize>)> + '_
 {
     insns.iter().enumerate().filter_map(move |(first, ins)| {
@@ -583,7 +604,10 @@ pub(super) fn reduction_regions(insns: &[Insn], width: u32)
         let start = masked_identity(&ins.mnemonic)
             .and_then(|neutral| masked_prologue(insns, first, neutral))
             .map_or_else(|| first - prologue_len, |(index, _, _)| index);
-        let restore = first + if width == 32 { 7 } else { 9 };
+        // The restore is the first EXEC write after the DPP steps; waits and
+        // nops may be scheduled between the broadcasts and it.
+        let restore = (first + 5..insns.len().min(first + 40))
+            .find(|&i| insns[i].dst.first() == Some(&Opnd::ExecLo))?;
         Some((first, start..=restore))
     })
 }

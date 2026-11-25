@@ -174,6 +174,11 @@ impl<'a> Emitter<'a> {
             "v_min_i32" => format!("asuint(min(asint({partner}), asint({acc})))"),
             "v_max_i32" => format!("asuint(max(asint({partner}), asint({acc})))"),
             "v_add_f32" => format!("asuint(asfloat({partner}) + asfloat({acc}))"),
+            // v_add_f16 rounds each partial sum to binary16 and leaves the high
+            // half of the destination untouched.
+            "v_add_f16" => format!(
+                "(({acc} & 0xffff0000u) | (tb_f16_rne(f16tof32({partner} & 0xffffu) + f16tof32({acc} & 0xffffu)) & 0xffffu))"
+            ),
             "v_min_f32" => format!("asuint(min(asfloat({partner}), asfloat({acc})))"),
             "v_max_f32" => format!("asuint(max(asfloat({partner}), asfloat({acc})))"),
             _ => return Err("invalid DPP reduction operation".into()),

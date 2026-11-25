@@ -124,7 +124,6 @@ fn verified_nsa_atomic_uses_the_encoded_second_coordinate() {
 /// Refuse returning, packed, differently shaped, and nonzero-padded NSA encodings.
 fn unverified_nsa_atomic_forms_stay_rejected() {
     for (word, bits) in [
-        (0, 1 << 13), // GLC returns the previous value.
         (1, 1 << 30), // A16 changes coordinates.
         (1, 1 << 31), // D16 changes data width.
         (0, 1 << 8),  // DMASK=2.
@@ -156,6 +155,89 @@ fn unverified_nsa_atomic_forms_stay_rejected() {
     em.resolve_wide_image_atomics().unwrap();
     let op = em.insns[0].clone();
     assert!(em.emit_mimg(0, &op).is_err());
+}
+
+#[test]
+/// GLC is a return-value bit, not a layout change (ISA Table 100): the atomic keeps
+/// the same 64-bit operand and hands the pre-operation value back in VDATA.
+fn glc_atomic_returns_the_previous_value() {
+    let mut ex = fixture();
+    ex.isa[0..4].copy_from_slice(&(0xf05c3308u32).to_le_bytes());
+    ex.isa_data = ex.isa.clone();
+    let mut em = bind(&ex);
+    em.resolve_wide_image_atomics().unwrap();
+    assert!(em.wide_visibility_uavs.contains(&0));
+    let op = em.insns[0].clone();
+    assert!(super::wide_atomic_coordinates(&op).is_ok());
+    em.emit_mimg(0, &op).unwrap();
+    assert!(em.body.contains("uint64_t old0 = InterlockedMax(uav0[uint2(v1, v2)], (uint64_t(v4) << 32) | v3);"), "{}", em.body);
+    assert!(em.body.contains("v3 = (uint)old0; v4 = (uint)(old0 >> 32);"), "{}", em.body);
+}
+
+#[test]
+/// IMAGE_ATOMIC_CMPSWAP takes two data dwords: DATA[0] is the new value and DATA[1]
+/// the comparator (ISA 12.16), so InterlockedCompareExchange's compare operand comes
+/// from the second VGPR and GLC returns the pre-operation value to DATA[0].
+fn cmpswap_uses_comparator_then_value_order() {
+    let ex = compute_extract(&[0xf0403308, 0x00000204, 0xbf810000]);
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.res.insert(0, vec![Res::Uav(0, 1)]);
+    em.uav.insert(0, 1);
+    em.uav_uint.insert(0);
+    let op = em.insns[0].clone();
+    assert_eq!(op.mnemonic, "image_atomic_cmpswap");
+    assert_eq!((op.aux.mask, op.aux.imm), (3, 1));
+    em.emit_mimg(0, &op).unwrap();
+    assert!(em.body.contains("InterlockedCompareExchange(uav0[uint2(v4, v5)], v3, v2, t0);"), "{}", em.body);
+    assert!(em.body.contains("v2 = t0;"), "{}", em.body);
+
+    // Without GLC the previous value stays unavailable and VDATA[0] keeps its input.
+    let ex = compute_extract(&[0xf0401308, 0x00000204, 0xbf810000]);
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.res.insert(0, vec![Res::Uav(0, 1)]);
+    em.uav.insert(0, 1);
+    em.uav_uint.insert(0);
+    let op = em.insns[0].clone();
+    em.emit_mimg(0, &op).unwrap();
+    assert!(em.body.contains("InterlockedCompareExchange(uav0[uint2(v4, v5)], v3, v2, t0);"), "{}", em.body);
+    assert!(!em.body.contains("v2 = t0;"), "{}", em.body);
+
+    // DMASK=0x1 (a 32-bit atomic shape) is not a compare-swap encoding.
+    let ex = compute_extract(&[0xf0401308, 0x00000204, 0xbf810000]);
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.res.insert(0, vec![Res::Uav(0, 1)]);
+    em.uav.insert(0, 1);
+    em.uav_uint.insert(0);
+    let mut op = em.insns[0].clone();
+    op.aux.mask = 1;
+    assert!(em.emit_mimg(0, &op).is_err());
+}
+
+#[test]
+/// D16 loads from an integer-typed view pack the raw low halves of a pair of
+/// components into each VGPR (ISA 12.16 D16, "LSBs first, then MSBs"); no f16
+/// conversion applies because the view already holds 16-bit elements.
+fn d16_integer_load_packs_raw_halves() {
+    let ex = compute_extract(&[0xf0000308, 0x80000201, 0xbf810000]);
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.res.insert(0, vec![Res::Tex(0, 1)]);
+    em.tex.insert(0, 1);
+    em.img_ty.insert((false, 0), 1);
+    let op = em.insns[0].clone();
+    assert_eq!(op.mnemonic, "image_load");
+    assert_eq!((op.aux.mask, op.aux.imm), (3, 1));
+    em.emit_mimg(0, &op).unwrap();
+    assert!(em.body.contains("uint4 t0 = tex0.Load("), "{}", em.body);
+    assert!(em.body.contains("v2 = (((uint)t0.x & 0xffffu) | (((uint)t0.y & 0xffffu) << 16));"), "{}", em.body);
+
+    // A float view keeps the f16 conversion path.
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.res.insert(0, vec![Res::Tex(0, 1)]);
+    em.tex.insert(0, 1);
+    let op = em.insns[0].clone();
+    em.emit_mimg(0, &op).unwrap();
+    assert!(em.body.contains("float4 t0 = tex0.Load("), "{}", em.body);
+    assert!(em.body.contains("tb_f16_rne("), "{}", em.body);
 }
 
 #[test]

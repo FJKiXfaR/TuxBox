@@ -606,7 +606,7 @@ impl<'a> Emitter<'a> {
                             let words = (|| Some([word(0)?, word(1)?, word(2)?, word(3)?]))().or_else(|| {
                                 (self.ex.stage == Stage::Compute).then(|| sampler_heap::guarded_words(insns, idx, ss as u8, compute_group(self.ex))).flatten()
                             });
-                            words.and_then(|w| sampler_heap::inline_sampler(self.ex, w, ins.op & 8 != 0))
+                            words.and_then(|w| sampler_heap::inline_sampler(self.ex, w, ins.op & 8 != 0, dim))
                                 .or_else(|| self.static_sampler())
                         } else { self.static_sampler() } {
                             if self.binding_spaces.insert((3, slot), space).is_some_and(|old| old != space) {

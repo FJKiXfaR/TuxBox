@@ -248,14 +248,34 @@ pub(super) fn resource_base(ex: &ShaderExtract) -> Option<u8> {
 /// sampler is immutable, so any register with identical state samples alike;
 /// one the shader declares (PSV) is preferred. `compare` selects comparison
 /// samplers (depth-compare image ops) and only those.
-pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: bool) -> Option<(u32, u32)> {
+pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: bool, dim: u32) -> Option<(u32, u32)> {
+    // MIMG dimensions without a W texel coordinate. The RDNA2 sampler descriptor still
+    // serializes an address mode for the (unused) W axis, and the native compiler may
+    // leave any value there, so a static sampler that differs only in AddressW is
+    // indistinguishable at runtime. Only relax that field for these dimensions.
+    let no_w = matches!(dim, 0 | 1 | 4 | 5 | 6);
+    // Inverse of the emitter's descriptor axis mapping (RDNA2 clamp -> D3D12 mode):
+    // 0 -> WRAP, 2 -> CLAMP, 6 -> BORDER.
+    let w_bits = |mode: u32| match mode {
+        1 => Some(0x0),
+        3 => Some(0x2),
+        4 => Some(0x6),
+        _ => None,
+    };
+    // Rewrite the W-axis clamp bits (dword0[8:6]) to the candidate's address mode. Every
+    // other serialized field is still compared exactly by `matches_static`.
+    let with_w = |words: [u32; 4], mode: u32| -> Option<[u32; 4]> {
+        let bits = w_bits(mode)?;
+        Some([(words[0] & !0x1c0) | (bits << 6), words[1], words[2], words[3]])
+    };
     let state = |s: &[u32; 13]| -> Option<(u32, u32)> {
         let vis = s[12];
         if !(vis == 0 || (vis == 5 && ex.stage == Stage::Pixel) || (vis == 7 && ex.stage == Stage::Mesh)) {
             return None;
         }
-        tuxbox_dxbc::inline_sampler::matches_static(literal, s, compare)
-            .then_some((s[10], s[11]))
+        let matches = tuxbox_dxbc::inline_sampler::matches_static(literal, s, compare)
+            || (no_w && with_w(literal, s[3]).is_some_and(|words| tuxbox_dxbc::inline_sampler::matches_static(words, s, compare)));
+        matches.then_some((s[10], s[11]))
     };
     let Some(root) = ex.root_sig.as_ref() else {
         // Root-less programs: the title's own root signature supplies the static

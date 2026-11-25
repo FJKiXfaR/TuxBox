@@ -15,27 +15,73 @@ impl<'a> Emitter<'a> {
 
     /// The stride of an indexed load through the heap, when another path through the
     /// program loads the same field of the same element at `index << n`.
+    ///
+    /// The title compiles a byte-addressed form of one access next to the indexed
+    /// form: a root-table descriptor read at `index * N + field`, and a heap
+    /// descriptor read with IDXEN where the hardware applies the descriptor's own
+    /// stride. When this program scales the index by `1 << k` and adds (or ORs) the
+    /// same field displacement the indexed load carries, the element is `1 << k`
+    /// bytes and IDXEN is an element index. `v_lshl_or_b32` folds the field into
+    /// the shift, and one more vector add may combine the byte offset with a base.
     pub(in crate::hlsl) fn sibling_stride(&self, ins: &Insn) -> Option<u32> {
         let Some(&Opnd::Vgpr(index)) = ins.src.first() else { return None };
         let here = self.insns.iter().position(|i| i.offset == ins.offset)?;
-        let dwords = |m: &str| Self::mubuf_dwords(m).unwrap_or(1) as i64 * 4;
-        for (j, shift) in self.insns.iter().enumerate() {
-            let k = match (shift.mnemonic.as_str(), shift.src.as_slice()) {
-                ("v_lshl_add_u32", [Opnd::Vgpr(v), Opnd::ConstInt(k), ..]) if *v == index => *k,
-                ("v_lshlrev_b32", [Opnd::ConstInt(k), Opnd::Vgpr(v), ..]) if *v == index => *k,
+        let imm = u32::try_from(ins.aux.imm).ok()?;
+        let dwords = Self::mubuf_dwords(&ins.mnemonic).unwrap_or(1) as i64 * 4;
+        for (j, scale) in self.insns.iter().enumerate() {
+            // `index * stride`, with the element's field displacement folded in when
+            // the third operand is a constant (a base VGPR carries none).
+            let src = scale.src.as_slice();
+            let scaled = matches!(src.first(), Some(&Opnd::Vgpr(v)) if v == index)
+                && matches!(src.get(1), Some(&Opnd::ConstInt(_)));
+            let (k, field) = match (scale.mnemonic.as_str(), src) {
+                ("v_lshl_add_u32" | "v_lshl_or_b32", [_, Opnd::ConstInt(k), rest @ ..]) if scaled => {
+                    (*k, rest.first().and_then(|c| match c { Opnd::ConstInt(c) => Some(*c), _ => None }).unwrap_or(0))
+                }
+                ("v_lshlrev_b32", [Opnd::ConstInt(k), Opnd::Vgpr(v), ..]) if *v == index => (*k, 0),
                 _ => continue,
             };
-            if !(2..=10).contains(&k) { continue; }
-            let Some(&Opnd::Vgpr(address)) = shift.dst.first() else { continue };
-            // The index holds one value throughout.
+            if !(1..=10).contains(&k) { continue; }
+            let Some(&Opnd::Vgpr(address)) = scale.dst.first() else { continue };
+            // Both paths read the same incoming index. The byte-address path may keep
+            // updating that register in place (scale, then base offset), which is the
+            // only rewrite allowed here; a clobber from another value is not.
             let (from, to) = (here.min(j), here.max(j));
-            if self.insns[from..to].iter().any(|i| i.dst.contains(&Opnd::Vgpr(index))) { continue; }
-            let same = self.insns[j + 1..].iter().take(16)
-                .take_while(|i| !i.dst.contains(&Opnd::Vgpr(address)) || i.enc == Enc::Mubuf)
-                .any(|i| i.enc == Enc::Mubuf && i.mnemonic.starts_with("buffer_load_dword") && i.aux.mask & 3 == 1
-                    && i.src.first() == Some(&Opnd::Vgpr(address))
-                    && (i.aux.imm..i.aux.imm + dwords(&i.mnemonic)).contains(&ins.aux.imm));
-            if same && ins.aux.imm + dwords(&ins.mnemonic) <= 1 << k { return Some(1 << k); }
+            if self.insns[from..to].iter().any(|i| i.offset != scale.offset
+                && i.dst.contains(&Opnd::Vgpr(index)) && !i.src.contains(&Opnd::Vgpr(index)))
+            { continue; }
+            // The byte offset may pick up a further base offset before the load,
+            // possibly written back over the same register.
+            let is_add = |i: &Insn| matches!(i.mnemonic.as_str(),
+                "v_add_nc_u32" | "v_add_u32" | "v_add_co_u32" | "v_add_i32");
+            let mut candidates = vec![address];
+            let mut same = false;
+            let mut scanned = 0;
+            for i in &self.insns[j + 1..] {
+                scanned += 1;
+                if scanned > 24 { break; }
+                if i.enc == Enc::Mubuf {
+                    // A consumer of that byte address moves the same field of the same
+                    // element. Its displacement plus any folded constant must place this
+                    // load's immediate inside the vector it reads.
+                    same = i.mnemonic.starts_with("buffer_load_dword")
+                        && i.aux.mask & 3 == 1
+                        && matches!(i.src.first(), Some(&Opnd::Vgpr(v)) if candidates.contains(&v))
+                        && i.aux.imm + field <= i64::from(imm)
+                        && i64::from(imm) < i.aux.imm + field
+                            + i64::from(Self::mubuf_dwords(&i.mnemonic).unwrap_or(1) * 4);
+                    if same { break; }
+                    continue;
+                }
+                if is_add(i) && i.src.contains(&Opnd::Vgpr(address)) {
+                    if let Some(&Opnd::Vgpr(sum)) = i.dst.first() {
+                        if sum != address { candidates.push(sum); }
+                        continue;
+                    }
+                }
+                if i.dst.contains(&Opnd::Vgpr(address)) { break; }
+            }
+            if same && ins.aux.imm + dwords <= 1 << k { return Some(1 << k); }
         }
         None
     }
@@ -54,7 +100,11 @@ impl<'a> Emitter<'a> {
             if (stride.is_none() && !self.raw_byte_index.contains(&ins.offset))
                 || !ins.mnemonic.starts_with("buffer_load_dword")
             {
-                return Err("raw buffer IDXEN needs the console descriptor stride".into());
+                return Err(format!(
+                    "raw buffer IDXEN needs the console descriptor stride ({} mask={} proof={} heap={})",
+                    ins.mnemonic, ins.aux.mask, self.raw_byte_index.contains(&ins.offset),
+                    matches!(self.res.get(&self.cur_idx).and_then(|v| v.first()), Some(Res::HeapRaw(_)))
+                ));
             }
             let mut index = r(&ins.src[0])?;
             if let Some(stride) = stride { index = format!("({index} * {stride}u)"); }

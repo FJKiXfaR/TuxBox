@@ -57,6 +57,9 @@ mod compute_swizzle;
 #[cfg(test)]
 #[path = "tests/hlsl/sat_pk_u8_i16.rs"]
 mod sat_pk_u8_i16;
+#[cfg(test)]
+#[path = "tests/hlsl/vector_width.rs"]
+mod vector_width;
 mod fssm_bindings;
 mod micropoly;
 mod mesh;

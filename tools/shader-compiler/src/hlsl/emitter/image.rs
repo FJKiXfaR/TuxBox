@@ -127,7 +127,8 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
-        if atomic.is_some() || matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip") {
+        let cmpswap = ins.mnemonic == "image_atomic_cmpswap";
+        if atomic.is_some() || cmpswap || matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_store_mip") {
             let with_mip = ins.mnemonic == "image_load_mip";
             let (slot, dim, is_uav) = match rs.first() {
                 Some(Res::Tex(t, d)) => (*t, *d, false),
@@ -173,9 +174,41 @@ impl<'a> Emitter<'a> {
             let ity = self.img_ty.get(&(is_uav, slot)).copied();
             // A packed zero stored to a scalar uint UAV survives either widening convention.
             let uint_zero = store && as_uint && ins.aux.mask == 1 && self.immediate_zero_before(idx, Opnd::Vgpr(vd));
-            if d16 && !uint_zero && (as_uint || ity.is_some() || ins.mnemonic.starts_with("image_atomic_")) {
-                // The conversion of integer formats to 16 bits is not specified.
-                return Err("D16 image access to an integer-typed image unsupported".into());
+            if d16 && !uint_zero && (as_uint || ins.mnemonic.starts_with("image_atomic_")) {
+                // A uint-atomically-typed view is R32_UINT; the conversion of a
+                // 32-bit integer format to 16 bits is not specified (ISA 12.16,
+                // "D16 Instructions"), and image atomics are 32- or 64-bit only.
+                return Err("D16 image access to an atomically-typed image unsupported".into());
+            }
+            if cmpswap {
+                // ISA 12.16 IMAGE_ATOMIC_CMPSWAP: tmp = MEM[ADDR]; src = DATA[0];
+                // cmp = DATA[1]; MEM[ADDR] = (tmp == cmp) ? src : tmp;
+                // RETURN_DATA[0] = tmp. Table 100: DMASK 0x3 is the 32-bit form
+                // (two data dwords), 0xf the 64-bit form.
+                if !is_uav || !as_uint {
+                    return Err("image_atomic_cmpswap requires a UAV uint32 image".into());
+                }
+                if ins.aux.mask == 0xf {
+                    return Err("64-bit image_atomic_cmpswap unsupported".into());
+                }
+                if ins.aux.mask != 3 {
+                    return Err(format!("image_atomic_cmpswap requires DMASK=0x3, got {:#x}", ins.aux.mask));
+                }
+                let src = Opnd::Vgpr(vd);
+                let cmp = Opnd::Vgpr(vd.checked_add(1).ok_or("comparator register overflow")?);
+                self.touch(&src);
+                self.touch(&cmp);
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint t{t} = 0u;"));
+                self.line(&format!(
+                    "if (exec_lo & 1u) InterlockedCompareExchange(uav{slot}[uint{ncoord}({})], {}, {}, t{t});",
+                    c.join(", "), r(&cmp)?, r(&src)?
+                ));
+                if image_atomic_returns_previous(ins) {
+                    self.wv(&src, &format!("t{t}"))?;
+                }
+                return Ok(());
             }
             if let Some(func) = atomic {
                 // Image atomics → Interlocked* on a RWTexture<uint> texel; vdata carries the
@@ -185,16 +218,16 @@ impl<'a> Emitter<'a> {
                         && wide_atomic_coordinates(ins).is_ok()
                         && self.wide_visibility_uavs.contains(&slot);
                     if !visibility {
-                        return Err("unknown two-word visibility atomic".into());
+                        return Err("unknown two-word visibility atomic: a 64-bit image atomic needs a corroborated uint64 UAV binding (ISA Table 100, DMASK 0x3)".into());
                     }
                     self.wide_visibility_uavs.insert(slot);
                     return packed_root::ps09_raster::emit_wide_image(self, ins, &format!("uav{slot}"));
                 }
                 if ins.aux.mask != 1 {
-                    return Err("image atomic requires a verified two-word binding for DMASK=3 or DMASK=1 for one word".into());
+                    return Err("image atomic requires a verified two-word binding for DMASK=3 or DMASK=1 for one word (ISA Table 100)".into());
                 }
                 if !as_uint {
-                    return Err("image atomic on a non-UAV table".into());
+                    return Err("image atomic on a non-UAV table (ISA 12.16 atomics need a UAV descriptor)".into());
                 }
                 let o = Opnd::Vgpr(vd);
                 self.touch(&o);
@@ -228,23 +261,31 @@ impl<'a> Emitter<'a> {
             }
             if store {
                 if !is_uav {
-                    return Err("image_store to a non-UAV table".into());
+                    return Err("image_store to a non-UAV table (ISA 12.16 image stores need a UAV descriptor)".into());
                 }
                 if let Some(t) = ity {
-                    // Integer texels: the registers are stored as they are.
+                    let signed = t == 2;
+                    // Integer texels: the registers are stored as they are. With
+                    // D16 each DMASK bit counts one 16-bit element, packed low
+                    // half first into consecutive VGPRs (ISA Table 100).
+                    let elements = if d16 { ins.aux.mask.count_ones() } else { (ins.aux.mask & 0xf).count_ones() };
                     let mut comp = vec![];
                     let mut n = 0u8;
                     for ch in 0..4 {
-                        if (ins.aux.mask >> ch) & 1 != 0 {
-                            let o = Opnd::Vgpr(vd + n);
+                        if (ch as u32) < elements {
+                            let o = Opnd::Vgpr(vd + if d16 { n / 2 } else { n });
                             self.touch(&o);
-                            comp.push(r(&o)?);
+                            let word = r(&o)?;
+                            let value = if d16 { format!("(({word} >> {}u) & 0xffffu)", 16 * (n % 2)) } else { word };
+                            comp.push(if signed && d16 { format!("(int){value}") } else { value });
                             n += 1;
+                        } else if signed {
+                            comp.push("0".into());
                         } else {
                             comp.push("0u".into());
                         }
                     }
-                    let ctor = if t == 2 { "int4" } else { "uint4" };
+                    let ctor = if signed { "int4" } else { "uint4" };
                     self.line(&format!("if (exec_lo & 1u) uav{slot}[uint{ncoord}({})] = {ctor}({});", c.join(", "), comp.join(", ")));
                     return Ok(());
                 }
@@ -294,6 +335,20 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("{ety} t{t} = {e};"));
                 let chans: Vec<String> = (0..4).filter(|ch| (ins.aux.mask >> ch) & 1 != 0).map(|ch| format!("t{t}.{}", XYZW[ch])).collect();
                 if d16 {
+                    if ity.is_some() {
+                        // An integer view already holds 16-bit elements; the D16
+                        // load packs a pair of them into each VGPR, low half
+                        // first, without a conversion (ISA 12.16 D16).
+                        for (k, pair) in chans.chunks(2).enumerate() {
+                            let lo = format!("((uint){} & 0xffffu)", pair[0]);
+                            let e = match pair.get(1) {
+                                Some(hi) => format!("({lo} | (((uint){} & 0xffffu) << 16))", hi),
+                                None => lo,
+                            };
+                            self.wv(&Opnd::Vgpr(vd + k as u8), &e)?;
+                        }
+                        return Ok(());
+                    }
                     return self.write_d16(vd, &chans);
                 }
                 for (n, x) in chans.iter().enumerate() {
@@ -318,6 +373,10 @@ impl<'a> Emitter<'a> {
                 };
                 (self.bind_heap(view, src), dim)
             }
+            Some(Res::Uav(..)) => return Err(format!(
+                "{} samples a descriptor bound as a UAV; desktop sampling needs an SRV view (ISA 12.16 image ops share one descriptor)",
+                ins.mnemonic
+            )),
             _ => return Err("unresolved image".into()),
         };
         if ins.mnemonic == "image_get_resinfo" {

@@ -11,8 +11,22 @@ impl<'a> Emitter<'a> {
         }
         let attr = ins.aux.imm as usize;
         let chan = ins.aux.imm2 as usize;
-        let Param::Full(reg) = *self.ps_attrs.get(attr).ok_or_else(|| format!("PS attr{attr} has no signature register"))? else {
-            return Err(format!("32-bit read of half-float PS attr{attr}"));
+        let param = self
+            .ps_attrs
+            .get(attr)
+            .cloned()
+            .ok_or_else(|| format!("PS attr{attr} has no signature register"))?;
+        // A half-float parameter holds two 16-bit components per 32-bit channel (ATTRCHAN
+        // selects the channel, not the half). A 32-bit interpolation of such a parameter
+        // therefore works on the channel's low component: the vertex program exports each
+        // half as the float it stands for, so the pixel input field already holds that
+        // value and the arithmetic below is plain float work. The upper half of the channel
+        // is read only by the f16 interpolation opcodes, which have their own emitter.
+        let (reg, chan) = match param {
+            Param::Full(reg) => (reg, chan),
+            Param::Half(_) => param
+                .component(chan, false)
+                .ok_or_else(|| format!("PS attr{attr} has no signature register"))?,
         };
         let val = if let Some((ei, k)) = sig_lookup(&self.ex.input_sig, reg, chan) {
             let acc = format!("i.i{ei}.{}", XYZW[k]);
@@ -37,7 +51,7 @@ impl<'a> Emitter<'a> {
                     0 => format!("{p0} + {} * {}", f(&s[0])?, delta(1)),
                     1 => format!("{} + {} * {}", f(&dst)?, f(&s[0])?, delta(2)),
                     2 => match ins.raw[0] & 255 {
-                        0 => delta(1), 1 => delta(2), 2 => p0, _ => return Err("invalid interpolation parameter".into()),
+                        0 => delta(1), 1 => delta(2), 2 => p0, other => return Err(format!("invalid interpolation parameter {other}")),
                     },
                     _ => return Err("unsupported interpolation opcode".into()),
                 };
@@ -59,6 +73,11 @@ impl<'a> Emitter<'a> {
         }
         // p1 computes a partial term in hardware; the full interpolated value is
         // already available per-pixel here, so both steps assign it.
+        //
+        // v_interp_mov_f32 selects one of P10, P20 and P0 by VSRC[1:0] (0, 1 and 2). A
+        // smooth attribute read that way belongs to `pulled_attrs` above; a P0 read of a
+        // flat attribute is the provoking vertex value, which is what a `nointerpolation`
+        // input already holds, so the pixel value is the answer for every form.
         self.wv(&d.ok_or("no dst")?, &val)
     }
 }

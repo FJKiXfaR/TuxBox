@@ -6,13 +6,29 @@ pub(in crate::hlsl) fn clamped_product24(ins: &Insn) -> bool {
         && (ins.aux.imm != 0 || ins.aux.sdwa.is_some_and(|ext| ext & (1 << 13) != 0))
 }
 
-/// Prove the non-returning 2D, DMASK=3 UMAX encoding and return its X/Y VGPRs.
-/// NSA accepts one extension word with zero unused bytes; A16/D16 stay rejected.
+/// MIMG bits that do not change operand or result layout (RDNA2 ISA Table 100):
+/// DLC [7], GLC [13] and SLC [25] only select cache policy, and for atomics GLC
+/// asks for the pre-operation value in VDATA. UNRM [12] is required for stores
+/// and atomics but is part of the patterns below. A16 [62] and D16 [63] change the
+/// layout and stay rejected by the `flags` tests.
+const LAYOUT_NEUTRAL: u32 = (1 << 7) | (1 << 13) | (1 << 25);
+
+/// GLC on an image atomic: the pre-operation value returns to VDATA
+/// (ISA 12.16 "Atomics with Return", Table 100 GLC).
+pub(in crate::hlsl) fn image_atomic_returns_previous(ins: &Insn) -> bool {
+    ins.raw.first().is_some_and(|word| word & (1 << 13) != 0)
+}
+
+/// Prove the 2D, DMASK=3 UMAX encoding and return its X/Y VGPRs. DMASK=0x3 with
+/// this opcode is the 64-bit form (ISA Table 100 "0x3 = 64-bit atomics except
+/// cmpswap"). NSA accepts one extension word with zero unused bytes; A16/D16 stay
+/// rejected because they change the address and data layout.
 pub(in crate::hlsl) fn wide_atomic_coordinates(ins: &Insn) -> Result<[u8; 2], String> {
     let nsa = match ins.raw.as_slice() {
-        [0xf05c1308, flags] if flags & 0xc000_0000 == 0 => false,
-        [0xf05c130a, flags, coordinates]
-            if flags & 0xc000_0000 == 0 && coordinates & 0xffff_ff00 == 0 => true,
+        [word, flags] if flags & 0xc000_0000 == 0 && word & !LAYOUT_NEUTRAL == 0xf05c1308 => false,
+        [word, flags, coordinates]
+            if flags & 0xc000_0000 == 0 && coordinates & 0xffff_ff00 == 0
+                && word & !LAYOUT_NEUTRAL == 0xf05c130a => true,
         _ => return Err("unsupported 64-bit image access flags".into()),
     };
     if ins.enc != Enc::Mimg || ins.mnemonic != "image_atomic_umax"

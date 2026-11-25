@@ -198,7 +198,7 @@ impl<'a> Emitter<'a> {
             Enc::Sopp => self.emit_sopp(idx, ins, br),
             Enc::Vop2 | Enc::Vop1 | Enc::Vop3 | Enc::Vopc => self.emit_vec(ins),
             Enc::Sop2 => self.emit_sop2(idx, ins, is_ps),
-            Enc::Sop1 => self.emit_sop1(idx, ins, is_ps),
+            Enc::Sop1 => self.emit_sop1(idx, ins, is_ps, br),
             Enc::Sopk => self.emit_sopk(ins),
             Enc::Sopc => self.emit_sopc(ins),
             Enc::Smem if self.packed.is_some() => self.emit_packed_load(idx, ins),

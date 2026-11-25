@@ -353,7 +353,14 @@ fn validate_launch(body: &[Insn], group_shift: i64, lane_index: Opnd) -> Result<
             _ => 1,
         };
         ins.dst.iter().any(|dst| match (*dst, reg) {
-            (S(first), S(n)) | (V(first), V(n)) => n >= first && u16::from(n - first) < width,
+            (S(first), S(n)) => n >= first && u16::from(n - first) < width,
+            // v_readlane_b32 encodes its scalar destination as a VGPR operand.
+            (V(first), V(n)) if ins.mnemonic != "v_readlane_b32" => {
+                n >= first && u16::from(n - first) < width
+            }
+            (V(first), S(n)) if ins.mnemonic == "v_readlane_b32" => {
+                n >= first && u16::from(n - first) < width
+            }
             _ => false,
         })
     }
@@ -630,7 +637,12 @@ fn wave_mask_operands(ins: &Insn) -> bool {
         // can use that bit directly. Numeric reads of a mask need both words.
         return matches!(
             ins.mnemonic.as_str(),
+            // A scalar SOP write to VCC followed by a numeric scalar read is
+            // uniform address arithmetic: every invocation stores the same
+            // 32-bit result, so the per-invocation copy matches the guest's
+            // single scalar register.
             "s_cselect_b64" | "s_mov_b64" | "s_and_b64" | "s_andn2_b64" | "v_cndmask_b32"
+                | "s_add_i32"
                 | "s_or_b64" | "s_xor_b64" | "s_orn2_b64" | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64"
                 | "s_not_b64" | "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_andn2_saveexec_b64"
         );

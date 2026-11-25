@@ -205,6 +205,14 @@ pub(in crate::hlsl) fn emit_wide_image(em: &mut Emitter<'_>, ins: &Insn, image: 
             "v{d} = (uint)val{temp}; v{} = (uint)(val{temp} >> 32);",
             d1
         ));
+    } else if image_atomic_returns_previous(ins) {
+        // GLC returns the pre-operation value to the same two VDATA dwords
+        // (ISA 12.16 "Atomics with Return", Table 100).
+        em.line(&format!(
+            "uint64_t old{temp} = InterlockedMax({image}[{uv}], (uint64_t(v{}) << 32) | v{d});",
+            d1
+        ));
+        em.line(&format!("v{d} = (uint)old{temp}; v{} = (uint)(old{temp} >> 32);", d1));
     } else {
         em.line(&format!(
             "InterlockedMax({image}[{uv}], (uint64_t(v{}) << 32) | v{d});",

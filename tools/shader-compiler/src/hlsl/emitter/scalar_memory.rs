@@ -165,6 +165,25 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Data width, in dwords, of a FLAT/global store opcode.
+    ///
+    /// ISA 9.7: FLAT instructions use "zero to four consecutive Dwords of data" in VGPRs;
+    /// the DATA field names the first source VGPR and the 12-bit OFFSET is signed. The dword
+    /// forms move one dword per size suffix (x2/x3/x4 = 2/3/4 dwords, so an x3 store leaves
+    /// the fourth register of the quad untouched). The byte, short and D16_HI forms write one
+    /// dword through a sub-dword lane.
+    fn flat_store_width(m: &str) -> Option<u32> {
+        Some(match m {
+            "flat_store_dword" => 1,
+            "flat_store_dwordx2" => 2,
+            "flat_store_dwordx3" => 3,
+            "flat_store_dwordx4" => 4,
+            "flat_store_byte" | "flat_store_byte_d16_hi"
+            | "flat_store_short" | "flat_store_short_d16_hi" => 1,
+            _ => return None,
+        })
+    }
+
     /// Loads through a flat address.
     pub(in crate::hlsl) fn emit_flat(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
@@ -217,6 +236,23 @@ impl<'a> Emitter<'a> {
                     self.wv(&Opnd::Vgpr(vd + k), &format!("t{t}_{k}"))?;
                 }
                 Ok(())
+            }
+            Enc::Flat if m.starts_with("flat_store_") => {
+                // The data moves through consecutive VGPRs from the DATA field (the decoder
+                // keeps it in src[1]; VDST does not hold store data) and the address is a
+                // per-lane 64-bit VA in ADDR plus the signed immediate. TuxBox binds guest
+                // memory through descriptors, so a store whose address is not a bound view
+                // has no HLSL form yet: name the segment and the width so the refusal says
+                // which access is missing instead of reporting an unknown encoding.
+                let n = Self::flat_store_width(m)
+                    .ok_or_else(|| format!("unsupported flat store {m}"))?;
+                let segment = match ins.aux.mask {
+                    1 => "scratch",
+                    2 => "global",
+                    _ => "flat",
+                };
+                let ngpr = if n == 1 { "1 dword".to_string() } else { format!("{n} dwords") };
+                Err(format!("{segment} store of {ngpr} through a per-lane 64-bit address has no bound view ({m})"))
             }
             _ => Err("unsupported encoding".into()),
         }

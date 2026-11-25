@@ -1,5 +1,6 @@
 //! Group shared memory and the lane exchanges encoded with it.
 use super::*;
+use crate::hlsl::lds_order::is_lds_atomic;
 
 impl<'a> Emitter<'a> {
     /// Group shared memory, ring buffer and lane exchange instructions.
@@ -196,15 +197,10 @@ impl<'a> Emitter<'a> {
                 };
                 return self.wv(&dst, &e);
             }
-            Enc::Ds
-                if self.is_cs
-                    && (m == "ds_wrxchg_rtn_b32" || matches!(
-                        m.replace("_rtn", "").as_str(),
-                        "ds_add_u32" | "ds_min_u32" | "ds_max_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32"
-                    )) =>
-            {
+            Enc::Ds if self.is_cs && is_lds_atomic(m) => {
                 // Atomic read-modify-write on group-shared memory (the `_rtn` forms also
-                // return the old value) → the matching HLSL Interlocked* intrinsic.
+                // return the old value) → the matching HLSL `Interlocked*` intrinsic when
+                // one exists, else a compare-exchange retry loop.
                 self.uses_lds = true;
                 if m == "ds_wrxchg_rtn_b32" && ins.raw[0] & (1 << 17) != 0 {
                     return Err("global data store exchange unsupported".into());
@@ -213,23 +209,72 @@ impl<'a> Emitter<'a> {
                     op.enc == Enc::Sopp && Self::branch_cond(op.op).is_some()) {
                     return Err("LDS exchange with unverified branch convergence".into());
                 }
-                let func = match m.replace("_rtn", "").as_str() {
-                    "ds_add_u32" => "InterlockedAdd",
-                    "ds_min_u32" => "InterlockedMin",
-                    "ds_max_u32" => "InterlockedMax",
-                    "ds_and_b32" => "InterlockedAnd",
-                    "ds_or_b32" => "InterlockedOr",
-                    "ds_wrxchg_b32" => "InterlockedExchange",
-                    _ => "InterlockedXor",
-                };
+                let base = m.replace("_rtn", "");
                 let off = ins.aux.imm as u32 & 0xffff;
                 let addr = r(&s[0])?;
+                let word = format!("tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u]");
+                let data = r(&s[1])?;
                 let t = self.tmp;
                 self.tmp += 1;
-                self.line(&format!(
-                    "uint t{t} = 0u; if (exec_lo & 1u) {{ {func}(tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u], {}, t{t}); }}",
-                    r(&s[1])?
-                ));
+                match base.as_str() {
+                    "ds_add_u32" | "ds_sub_u32" | "ds_min_u32" | "ds_max_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" | "ds_wrxchg_b32" => {
+                        let func = match base.as_str() {
+                            "ds_add_u32" => "InterlockedAdd",
+                            // Wrapping subtract is an add of the negated source; the old
+                            // value and the stored bit pattern match DS_SUB_U32.
+                            "ds_sub_u32" => "InterlockedAdd",
+                            "ds_min_u32" => "InterlockedMin",
+                            "ds_max_u32" => "InterlockedMax",
+                            "ds_and_b32" => "InterlockedAnd",
+                            "ds_or_b32" => "InterlockedOr",
+                            "ds_xor_b32" => "InterlockedXor",
+                            _ => "InterlockedExchange",
+                        };
+                        let value = if base == "ds_sub_u32" {
+                            format!("(0u - {data})")
+                        } else {
+                            data
+                        };
+                        self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({word}, {value}, t{t}); }}"));
+                    }
+                    "ds_cmpst_b32" => {
+                        // DATA0 is the compare value, DATA1 the replacement, and the
+                        // instruction returns the pre-operation memory contents.
+                        let src = r(&s[2])?;
+                        self.line(&format!(
+                            "uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedCompareExchange({word}, {data}, {src}, t{t}); }}"
+                        ));
+                    }
+                    _ => {
+                        // No intrinsic for these; atomically retry a compare-exchange.
+                        // Keep every operand in a local: only registers are read, and the
+                        // expression is evaluated once per attempt.
+                        let setup = match base.as_str() {
+                            "ds_mskor_b32" => format!("uint t{t}mask = {data}, t{t}src = {};", r(&s[2])?),
+                            "ds_wrap_rtn_b32" => format!("uint t{t}data = {data}, t{t}next = {};", r(&s[2])?),
+                            _ => format!("uint t{t}data = {data};"),
+                        };
+                        let updated = match base.as_str() {
+                            "ds_rsub_u32" => format!("t{t}data - t{t}seen"),
+                            "ds_inc_u32" => format!("(t{t}seen >= t{t}data) ? 0u : t{t}seen + 1u"),
+                            "ds_dec_u32" => format!("(t{t}seen == 0u || t{t}seen > t{t}data) ? t{t}data : t{t}seen - 1u"),
+                            "ds_min_i32" => format!("(asint(t{t}data) < asint(t{t}seen)) ? t{t}data : t{t}seen"),
+                            "ds_max_i32" => format!("(asint(t{t}data) > asint(t{t}seen)) ? t{t}data : t{t}seen"),
+                            "ds_mskor_b32" => format!("(t{t}seen & ~t{t}mask) | t{t}src"),
+                            "ds_wrap_rtn_b32" => format!("(t{t}seen >= t{t}data) ? t{t}seen - t{t}data : t{t}seen + t{t}next"),
+                            other => return Err(format!("unsupported LDS atomic {other}")),
+                        };
+                        self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {setup}"));
+                        // InterlockedOr with 0 is an atomic read of the current word.
+                        self.line(&format!("uint t{t}old; InterlockedOr({word}, 0u, t{t}old);"));
+                        self.line(&format!("uint t{t}seen; [allow_uav_condition] do {{ t{t}seen = t{t}old;"));
+                        self.line(&format!("uint t{t}new = {updated};"));
+                        self.line(&format!(
+                            "InterlockedCompareExchange({word}, t{t}seen, t{t}new, t{t}old); }} while (t{t}old != t{t}seen);"
+                        ));
+                        self.line(&format!("t{t} = t{t}old; }}"));
+                    }
+                }
                 if m.contains("_rtn") {
                     self.wv(&d.ok_or("no dst")?, &format!("t{t}"))?;
                 }
@@ -308,3 +353,7 @@ impl<'a> Emitter<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/hlsl/lds_atomics.rs"]
+mod tests;
