@@ -46,6 +46,25 @@ class FloatToIntegerTests(unittest.TestCase):
         self.check_conversion(0x7e080eff, [(bits, u) for bits, _, u in cases])
 
     def check_conversion(self, instruction, cases):
+        self.check_programs(([instruction, bits], expected) for bits, expected in cases)
+
+    def test_pack_byte_rounds_and_preserves_the_other_three_bytes(self):
+        # Set the FP32 round and denormal modes, then insert v1 into byte 2 of v4.
+        cases = [
+            # Input bits, round mode, denormal mode, expected byte.
+            (0x3f000000, 0, 0, 0), (0x3f000000, 1, 0, 1),  # 0.5
+            (0x3fc00000, 2, 0, 1), (0x3fc00000, 3, 0, 1),  # 1.5
+            (1, 1, 0, 0), (1, 1, 1, 1), (1, 1, 2, 0), (1, 1, 3, 1),
+            (0x7f800000, 1, 0, 255), (0x7fc00001, 1, 0, 0),
+        ]
+        programs = []
+        for bits, rounding, denorm, byte in cases:
+            code = [0xbfa40000 | rounding, 0xbfa50000 | denorm,
+                    0x7e0202ff, bits, 0x7e0802ff, 0x12345678, 0xd55e0004, 0x04110501]
+            programs.append((code, 0x12005678 | (byte << 16)))
+        self.check_programs(programs)
+
+    def check_programs(self, cases):
         xshader = os.environ.get("TUXBOX_XSHADER") or shutil.which("xshader")
         dxc = os.environ.get("DXC") or shutil.which("dxc")
         if not (xshader and dxc):
@@ -56,9 +75,9 @@ class FloatToIntegerTests(unittest.TestCase):
         store = [0x340a0082, 0xe0701000, 0x80040405, 0xbf810000]
         with TemporaryDirectory() as directory:
             trial = Path(directory)
-            for bits, expected in cases:
-                with self.subTest(instruction=hex(instruction), bits=hex(bits)):
-                    code = load + [instruction, bits] + store
+            for program, expected in cases:
+                with self.subTest(program=[hex(word) for word in program]):
+                    code = load + program + store
                     (trial / "native.dxbc").write_bytes(native_shader(code))
                     for command in (
                         [xshader, trial / "native.dxbc", "--hlsl-out", trial / "shader.hlsl"],

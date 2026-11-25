@@ -4519,7 +4519,7 @@ impl<'a> Emitter<'a> {
         }
         h.push_str(if self.single_wave32 { HALF_RNE_STRAIGHT_LINE } else { HALF_RNE });
         h.push_str(HALF_HELPERS);
-        if self.insns.iter().any(|ins| matches!(ins.mnemonic.as_str(), "v_cvt_u32_f32" | "v_cvt_i32_f32")) {
+        if self.insns.iter().any(|ins| matches!(ins.mnemonic.as_str(), "v_cvt_u32_f32" | "v_cvt_i32_f32" | "v_cvt_pk_u8_f32")) {
             h.push_str(include_str!("float_to_integer.hlsl"));
         }
         if self.insns.iter().any(|ins| ins.mnemonic == "v_fract_f32") {
@@ -7114,7 +7114,8 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let t = self.tmp;
             self.tmp += 1;
             self.line(&format!("uint t{t}shift = ({} & 3u) * 8u;", r(&s[1])?));
-            self.line(&format!("uint t{t}byte = tb_isnan({x}) ? 0u : (uint)round(clamp({x}, 0.0, 255.0));"));
+            let mode = if self.regs.contains("tb_fp_mode") { "tb_fp_mode" } else { "0u" };
+            self.line(&format!("uint t{t}byte = tb_round_u8({x}, {mode});"));
             return self.wv(&d, &format!("({} & ~(255u << t{t}shift)) | (t{t}byte << t{t}shift)", r(&s[2])?));
         }
         if matches!(m.as_str(), "v_pk_fma_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_min_f16" | "v_pk_max_f16") {
@@ -10582,6 +10583,18 @@ mod tests {
         let hlsl = translate(Stage::Compute, &[0x7e08_16f9, 0x0035_7601]).unwrap();
         assert!(hlsl.contains("((v1 >> 16) & 0xffffu)"), "{hlsl}");
         assert!(hlsl.contains("saturate((((-abs(f16tof32("), "{hlsl}");
+    }
+
+    #[test]
+    fn byte_pack_uses_the_current_single_precision_round_mode() {
+        // gfx1030: v_cvt_pk_u8_f32 v4, v1, v0, v4, with and without s_round_mode.
+        let pack = [0xd55e_0004, 0x0412_0101];
+        let translate = |words: &[u32]| float64::tests::translate(Stage::Compute, words).unwrap();
+        let default = translate(&pack);
+        assert!(default.contains("tb_round_u8(asfloat(v1), 0u)"));
+        let mut words = vec![0xbfa4_0001];
+        words.extend(pack);
+        assert!(translate(&words).contains("tb_round_u8(asfloat(v1), tb_fp_mode)"));
     }
 
     fn dpp16_word(src0_reg: u32, ctrl: u32, fi: u32, bc: u32, bank_m: u32, row_m: u32) -> u32 {
