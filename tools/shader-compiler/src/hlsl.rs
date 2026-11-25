@@ -4519,7 +4519,9 @@ impl<'a> Emitter<'a> {
         }
         h.push_str(if self.single_wave32 { HALF_RNE_STRAIGHT_LINE } else { HALF_RNE });
         h.push_str(HALF_HELPERS);
-        if self.insns.iter().any(|ins| matches!(ins.mnemonic.as_str(), "v_cvt_u32_f32" | "v_cvt_i32_f32" | "v_cvt_pk_u8_f32")) {
+        let has_fp_mode = self.regs.contains("tb_fp_mode");
+        if self.insns.iter().any(|ins| matches!(ins.mnemonic.as_str(), "v_cvt_u32_f32" | "v_cvt_i32_f32" | "v_cvt_pk_u8_f32")
+            || (has_fp_mode && matches!(ins.mnemonic.as_str(), "v_cvt_f32_i32" | "v_cvt_f32_u32"))) {
             h.push_str(include_str!("float_to_integer.hlsl"));
         }
         if self.insns.iter().any(|ins| ins.mnemonic == "v_fract_f32") {
@@ -7639,6 +7641,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             // ISA: any NaN operand -> V_MIN3_F32 of the three; otherwise the median.
             "v_med3_f32" => Some(format!("tb_med3({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_ldexp_f32" => Some(format!("tb_ldexp({}, asint({b}))", fa()?)),
+            "v_cvt_f32_i32" | "v_cvt_f32_u32" if self.regs.contains("tb_fp_mode") => {
+                let signed = m == "v_cvt_f32_i32";
+                Some(format!("tb_integer_to_f32({a}, {signed}, tb_fp_mode)"))
+            }
             "v_cvt_f32_i32" => Some(format!("(float)asint({a})")),
             "v_cvt_f32_u32" => Some(format!("(float)({a})")),
             "v_cvt_off_f32_i4" => Some(format!("((float)(asint({a} << 28) >> 28) * 0.0625f)")),

@@ -64,6 +64,33 @@ class FloatToIntegerTests(unittest.TestCase):
             programs.append((code, 0x12005678 | (byte << 16)))
         self.check_programs(programs)
 
+    def test_integer_to_float_uses_single_precision_rounding(self):
+        # v_cvt_f32_{i32,u32} v4, v1. The four results are nearest-even,
+        # toward +infinity, toward -infinity, and toward zero.
+        signed, unsigned = 0x7e080b01, 0x7e080d01
+        cases = [
+            (unsigned, 0x01000001, [0x4b800000, 0x4b800001, 0x4b800000, 0x4b800000]),
+            (unsigned, 0x01000003, [0x4b800002, 0x4b800002, 0x4b800001, 0x4b800001]),
+            (unsigned, 0xffffffff, [0x4f800000, 0x4f800000, 0x4f7fffff, 0x4f7fffff]),
+            (signed, 0xfeffffff, [0xcb800000, 0xcb800000, 0xcb800001, 0xcb800000]),
+            (signed, 0x7fffffff, [0x4f000000, 0x4f000000, 0x4effffff, 0x4effffff]),
+            (signed, 0x80000000, [0xcf000000] * 4),
+            (signed, 0, [0] * 4),
+        ]
+        self.check_programs(
+            ([0xbfa40000 | mode, 0x7e0202ff, bits, instruction], expected)
+            for instruction, bits, results in cases
+            for mode, expected in enumerate(results)
+        )
+
+    def test_round_mode_changes_between_two_conversions(self):
+        # Convert 2**24 + 1 upward into v2, then downward into v4.
+        # The two adjacent floats differ in the low bit.
+        self.check_programs([([
+            0x7e0202ff, 0x01000001, 0xbfa40001, 0x7e040d01,
+            0xbfa40002, 0x7e080d01, 0x3a080902,
+        ], 1)])
+
     def check_programs(self, cases):
         xshader = os.environ.get("TUXBOX_XSHADER") or shutil.which("xshader")
         dxc = os.environ.get("DXC") or shutil.which("dxc")
