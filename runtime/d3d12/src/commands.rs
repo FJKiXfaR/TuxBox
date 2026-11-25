@@ -23,6 +23,7 @@ mod enhanced;
 mod descriptors;
 mod graphics;
 mod media;
+mod copy_memory;
 mod memory_wait;
 pub(crate) mod page_mapping;
 mod queries;
@@ -1185,6 +1186,7 @@ static DEVICE11_LIST_SLOTS: Slots<149> = {
 static EXTENDED_LIST_SLOTS: Slots<149> = {
     let mut slots = DEVICE11_LIST_SLOTS;
     slots[131] = crate::slot!(extended_cache_barrier);
+    slots[62] = crate::slot!(copy_memory::copy_memory);
     slots[132] = crate::slot!(extended_cache_barrier);
     slots
 };

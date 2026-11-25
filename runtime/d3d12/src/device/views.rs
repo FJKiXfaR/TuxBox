@@ -37,6 +37,77 @@ unsafe fn view_resource<'a, D>(
     )
 }
 
+
+/// A zero-filled host buffer behind constant-buffer views whose guest address
+/// cannot be imported (the title can free or remap a constant buffer while a
+/// descriptor still names it). A menu that reads zero constants draws wrong
+/// colours, but the title keeps running instead of taking the process down.
+fn fallback_constant_buffer(device: &Device) -> Option<ID3D12Resource> {
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+    static FALLBACK: OnceLock<Mutex<Option<(usize, ID3D12Resource)>>> = OnceLock::new();
+    let key = core::ptr::from_ref(device) as usize;
+    let mut slot = FALLBACK.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if let Some((owner, buffer)) = slot.as_ref()
+        && *owner == key
+    {
+        return Some(buffer.clone());
+    }
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 65536,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: the descriptor and heap properties outlive the call, and the
+    // device writes the new resource into the writable out parameter.
+    let created = unsafe {
+        device.native.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    created.ok()?;
+    let buffer = buffer?;
+    crate::diagnostics::log(
+        "substituting a zero-filled host buffer for an unimportable constant buffer",
+    );
+    *slot = Some((key, buffer.clone()));
+    Some(buffer)
+}
+
+fn log_unimportable_cbv(address: u64, size: u32, error: windows::core::HRESULT) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
+    let Ok(mut seen) = SEEN.get_or_init(|| Mutex::new(Vec::new())).lock() else { return };
+    let key = address as usize ^ ((size as usize) << 48);
+    if seen.contains(&key) || seen.len() >= 16 {
+        return;
+    }
+    seen.push(key);
+    crate::diagnostics::log(&format!(
+        "constant buffer {address:#x} ({size} bytes) is no longer importable ({error:?}); using a zero-filled substitute"
+    ));
+}
+
 pub(super) unsafe extern "system" fn cbv(
     device: &Device,
     desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC,
@@ -57,10 +128,24 @@ pub(super) unsafe extern "system" fn cbv(
         }
         let address = value.BufferLocation;
         if address != 0 && value.SizeInBytes != 0 {
-            owner = buffer_at(device, address, u64::from(value.SizeInBytes), 1, false)
-                .unwrap_or_else(|e| fail_call(format_args!("CBV buffer {address:#x}, {} bytes: {:?}", value.SizeInBytes, e.code())));
-            if let Some(buffer) = &owner {
-                value.BufferLocation = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
+            match buffer_at(device, address, u64::from(value.SizeInBytes), 1, false) {
+                Ok(buffer) => {
+                    owner = buffer;
+                    if let Some(buffer) = &owner {
+                        value.BufferLocation = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
+                    }
+                }
+                Err(error) => {
+                    // A guest constant buffer can be freed while its descriptor
+                    // is still installed. Bind a zero-filled host buffer so the
+                    // title's next draw sees defined data instead of crashing.
+                    log_unimportable_cbv(address, value.SizeInBytes, error.code());
+                    if let Some(buffer) = fallback_constant_buffer(device) {
+                        value.BufferLocation = unsafe { buffer.GetGPUVirtualAddress() };
+                    } else {
+                        value.BufferLocation = 0;
+                    }
+                }
             }
         }
     }
@@ -658,4 +743,51 @@ pub(super) unsafe extern "system" fn sampler_x(
         BorderColor: [w[17], w[18], w[19], w[20]].map(f32::from_bits),
     };
     unsafe { sampler(device, &host, handle) };
+}
+
+/// Where a linear CPU upload should land. Textures are resolved before buffers
+/// so a placed image is not imported as a buffer over its guest pages.
+pub(crate) enum LinearResource {
+    Buffer { resource: ID3D12Resource, offset: u64 },
+    Texture { resource: ID3D12Resource, offset: u64 },
+}
+
+fn texture_address_covering(device: &Device, address: u64, bytes: u64) -> Option<LinearResource> {
+    let entry = device.state.texture_addresses.preceding(address as usize)?;
+    let desc = unsafe { entry.native.GetDesc() };
+    if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || address < entry.base as u64 {
+        return None;
+    }
+    let offset = address - entry.base as u64;
+    let end = offset.checked_add(bytes)?;
+    let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(&desc)) };
+    let covers = if info.SizeInBytes != 0 && info.SizeInBytes != u64::MAX {
+        end <= info.SizeInBytes
+    } else {
+        offset == 0
+    };
+    covers.then(|| LinearResource::Texture { resource: entry.native.clone(), offset })
+}
+
+pub(crate) unsafe fn linear_resource(device_ptr: *mut c_void, address: u64, bytes: u64) -> windows::core::Result<LinearResource> {
+    use windows::Win32::Foundation::E_INVALIDARG;
+    if address == 0 || bytes == 0 {
+        return Err(E_INVALIDARG.into());
+    }
+    let device = unsafe { &*device_ptr.cast::<Device>() };
+    if let Some(texture) = texture_address_covering(device, address, bytes) {
+        return Ok(texture);
+    }
+    let (buffer, host) = unsafe { command_buffer_address(device_ptr, address, bytes)? };
+    let Some(buffer) = buffer else {
+        crate::diagnostics::recording_error(format_args!(
+            "slot 62 address {address:#x} ({bytes:#x} bytes) is not a buffer or texture"
+        ));
+        return Err(E_INVALIDARG.into());
+    };
+    let base = unsafe { buffer.GetGPUVirtualAddress() };
+    let Some(offset) = host.checked_sub(base) else {
+        return Err(E_INVALIDARG.into());
+    };
+    Ok(LinearResource::Buffer { resource: buffer, offset })
 }

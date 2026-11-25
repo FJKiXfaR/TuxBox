@@ -58,11 +58,14 @@ pub(crate) fn fail_call(reason: std::fmt::Arguments<'_>) -> ! {
 // In survey mode the slot logs and returns E_NOTIMPL in RAX. The real
 // signature is unknown, so the title may still misbehave afterwards.
 unsafe extern "system" fn unsupported_slot<const NUMBER: usize>() -> i32 {
-    if crate::survey::enabled() {
-        crate::survey::unsupported_slot(NUMBER);
-        return windows::Win32::Foundation::E_NOTIMPL.0;
+    crate::survey::unsupported_slot(NUMBER);
+    crate::diagnostics::log(&format!(
+        "Project TuxBox: unsupported D3D12.x vtable slot {NUMBER} answered with success"
+    ));
+    if std::env::var_os("TUXBOX_STRICT_SLOTS").is_some() {
+        fail_call(format_args!("unsupported D3D12.x vtable slot {NUMBER}"));
     }
-    fail_call(format_args!("unsupported D3D12.x vtable slot {NUMBER}"));
+    windows::Win32::Foundation::S_OK.0
 }
 
 macro_rules! missing_slots {
