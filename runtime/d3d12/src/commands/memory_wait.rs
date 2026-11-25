@@ -400,7 +400,7 @@ impl Worker {
                                 report_stall(job.segment.address, job.segment.target, job.segment.word.value());
                                 break;
                             }
-                            std::thread::sleep(Duration::from_millis(1));
+                            pause(started.elapsed());
                         }
                         let mut waiting = active();
                         if let Some(at) = waiting.iter().position(|&w| w == held) {
@@ -434,6 +434,20 @@ impl Worker {
             })
             .map_err(|_| E_OUTOFMEMORY)?;
         Ok(Self(sender))
+    }
+}
+
+/// How long a wait is polled before the worker starts sleeping. Most labels
+/// are written within this time, and a one-millisecond sleep would then be the
+/// largest part of handing work from one queue to another.
+const SPIN: Duration = Duration::from_millis(2);
+
+/// Wait a moment before reading a label again.
+fn pause(elapsed: Duration) {
+    if elapsed < SPIN {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 

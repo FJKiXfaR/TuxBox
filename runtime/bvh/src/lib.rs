@@ -24,6 +24,11 @@ struct Entry {
 }
 const _: () = assert!(size_of::<Builder>() == 24 && size_of::<Entry>() == 80);
 
+// BuildRaytracingAccelerationStructure and CopyRaytracingAccelerationStructure
+// in the Series X|S command-list table, which this library's callers use.
+const BUILD_SLOT: usize = 119;
+const COPY_SLOT: usize = 121;
+
 // The Xbox COM vtable is distinct from the desktop interface. This provider
 // calls the same public slots as an Xbox title, preserving command-list errors.
 unsafe fn slot(object: Object, index: usize) -> *const c_void {
@@ -88,7 +93,7 @@ unsafe extern "system" fn tuxbox_bvh_build(
     post: *const Post,
 ) {
     let record: unsafe extern "system" fn(Object, *const Build, u32, *const Post) =
-        unsafe { core::mem::transmute(slot(list, 117)) };
+        unsafe { core::mem::transmute(slot(list, BUILD_SLOT)) };
     unsafe { record(list, desc, count, post) };
 }
 
@@ -134,7 +139,7 @@ unsafe extern "system" fn tuxbox_bvh_copy(
         u64,
         u64,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
-    ) = unsafe { core::mem::transmute(slot(list, 119)) };
+    ) = unsafe { core::mem::transmute(slot(list, COPY_SLOT)) };
     unsafe { record(list, dst, src, mode) };
 }
 
