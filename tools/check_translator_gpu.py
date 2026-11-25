@@ -8,6 +8,7 @@ model. No game data is used. Builds the translator's example emitters first.
 import argparse
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -17,44 +18,96 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tools/shader-compiler/Cargo.toml"
 TARGET = "x86_64-unknown-linux-gnu"
 
-# name: (tool, emitter example, needs llvm-mc, needs dxc and dxv, extra arguments)
+class Check:
+    """One tool and where its program comes from.
+
+    `emitter` names an example binary, or `xshader` for the compiler itself.
+    `capture` names a unit test that prints the translation the tool runs and
+    the option that takes it.
+    """
+
+    def __init__(self, tool, *, emitter=None, capture=None, llvm=False, dxc=False, extra=()):
+        self.tool, self.emitter, self.capture = tool, emitter, capture
+        self.llvm, self.dxc, self.extra = llvm, dxc, extra
+
+
+def assembled(tool, *extra):
+    return Check(tool, emitter="packed_integer", llvm=True, dxc=True, extra=extra)
+
+
 CHECKS = {
-    "alu": ("check_basic_alu_gpu", "packed_integer", True, True, ()),
-    "ordinary-integer": ("check_ordinary_integer_gpu", "packed_integer", True, True, ()),
-    "packed-integer": ("check_packed_integer_gpu", "packed_integer", True, True, ()),
-    "packed-saturate": ("check_packed_integer_gpu", "packed_integer", True, True, ("--clamp",)),
-    "packed-chain": ("check_packed_chain_gpu", "packed_integer", True, True, ()),
-    "packed-chain-saturate": ("check_packed_chain_gpu", "packed_integer", True, True, ("--include-saturate",)),
-    "packed-chain-unoptimized": ("check_packed_chain_gpu", "packed_integer", True, True, ("--optimization", "O0")),
-    "sad-mad64": ("check_sad_mad64_gpu", "packed_integer", True, True, ()),
-    "f64": ("check_f64_exact_gpu", "packed_integer", True, True, ()),
-    "swizzle": ("check_compute_swizzle", "compute_swizzle", False, False, ()),
-    **{f"wave-extrema-{width}": ("check_wave_extrema", "wave_extrema", False, True, ("--width", str(width)))
+    "alu": assembled("check_basic_alu_gpu"),
+    "ordinary-integer": assembled("check_ordinary_integer_gpu"),
+    "packed-integer": assembled("check_packed_integer_gpu"),
+    "packed-saturate": assembled("check_packed_integer_gpu", "--clamp"),
+    "packed-chain": assembled("check_packed_chain_gpu"),
+    "packed-chain-saturate": assembled("check_packed_chain_gpu", "--include-saturate"),
+    "packed-chain-unoptimized": assembled("check_packed_chain_gpu", "--optimization", "O0"),
+    "sad-mad64": assembled("check_sad_mad64_gpu"),
+    "f64": assembled("check_f64_exact_gpu"),
+    "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
+    **{f"wave-extrema-{width}": Check("check_wave_extrema", emitter="wave_extrema", dxc=True,
+                                      extra=("--width", str(width)))
        for width in (32, 64)},
-    **{f"wave-guard-{width}-{variant}": ("check_wave_guard", "wave_guard", False, False,
-                                         ("--width", str(width), "--variant", variant))
+    **{f"wave-guard-{width}-{variant}": Check("check_wave_guard", emitter="wave_guard",
+                                              extra=("--width", str(width), "--variant", variant))
        for width in (32, 64) for variant in ("original", "chain", "chain-zero")},
-    "pixel-heap-offsets": ("check_pixel_heap_offsets", "pixel_heap_offsets", False, True, ()),
+    "dpp8-exchange": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True),
+    "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
+    "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
+    "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
+    "raw-index": Check("check_raw_index",
+                       capture=("proven_byte_index_emits_addresses_without_widening_loads", "--hlsl")),
+    "dynamic-cbv": Check("check_dynamic_cbv", capture=("bounded_dynamic_cbv", "--hlsl"), dxc=True),
+    "dynamic-code-offset": Check("check_dynamic_code_offset",
+                                 capture=("bounded_runtime_code_offset", "--hlsl")),
+    "wide-atomic": Check("check_wide_atomic",
+                         capture=("verified_atomic_does_not_depend_on_shader_name", "--body")),
+    "wide-atomic-nsa": Check("check_wide_atomic",
+                             capture=("verified_nsa_atomic_uses_the_encoded_second_coordinate", "--body"),
+                             extra=("--non-sequential",)),
 }
+CARGO = ["--release", "--locked", "--target", TARGET, "--manifest-path", str(MANIFEST),
+         "--target-dir", str(ROOT / "build/shader-compiler")]
 
 
 def build_emitters():
-    """Build the example emitters and return the directory holding them."""
-    output = ROOT / "build/shader-compiler"
-    command = ["cargo", "build", "--release", "--locked", "--target", TARGET, "--manifest-path", str(MANIFEST),
-               "--target-dir", str(output)]
-    for example in sorted({check[1] for check in CHECKS.values()}):
+    """Build the compiler and the example emitters. Returns each one's path."""
+    command = ["cargo", "build", *CARGO, "--bins"]
+    examples = sorted({check.emitter for check in CHECKS.values()} - {None, "xshader"})
+    for example in examples:
         command += ["--example", example]
     subprocess.run(command, check=True, cwd=ROOT)
-    return output / TARGET / "release/examples"
+    release = ROOT / "build/shader-compiler" / TARGET / "release"
+    return {"xshader": release / "xshader", **{name: release / "examples" / name for name in examples}}
+
+
+def printed_block(output):
+    """The first text a unit test printed between `BEGIN_x` and `END_x` lines."""
+    # The test harness may print the test's name on the line the marker starts.
+    found = re.search(r"BEGIN_(\w+)[^\n]*\n(.*?)^END_\1\b", output, re.MULTILINE | re.DOTALL)
+    if not found:
+        raise ValueError("the unit test printed no program")
+    return found.group(2)
+
+
+def capture(test, path):
+    """Save the program that the shader compiler's unit test `test` prints."""
+    run = subprocess.run(["cargo", "test", *CARGO, "--lib", test, "--", "--nocapture", "--test-threads=1"],
+                         check=True, cwd=ROOT, capture_output=True, text=True, timeout=600)
+    path.write_text(printed_block(run.stdout))
 
 
 def command_for(name, emitters, tools, host, work):
-    tool, emitter, assembles, compiles, extra = CHECKS[name]
-    command = [sys.executable, str(ROOT / "tools" / f"{tool}.py"), *extra, "--emitter", str(emitters / emitter)]
-    if assembles:
+    check = CHECKS[name]
+    command = [sys.executable, str(ROOT / "tools" / f"{check.tool}.py"), *check.extra]
+    if check.emitter:
+        command += ["--emitter", str(emitters[check.emitter])]
+    if check.capture:
+        command += [check.capture[1], str(work / f"{name}.hlsl")]
+    if check.llvm:
         command += ["--llvm-mc", str(tools["llvm-mc"])]
-    if compiles:
+    if check.dxc:
         command += ["--dxc", str(tools["dxc"]), "--dxv", str(tools["dxv"])]
     for option, value in host.items():
         command += [f"--{option}", str(value)]
@@ -89,10 +142,15 @@ def main(argv=None):
         log = work / f"{name}.log"
         with log.open("w") as stream:
             try:
+                if CHECKS[name].capture:
+                    capture(CHECKS[name].capture[0], work / f"{name}.hlsl")
                 status = subprocess.run(command_for(name, emitters, tools, host, work), cwd=ROOT, stdout=stream,
                                         stderr=subprocess.STDOUT, timeout=600).returncode
             except subprocess.TimeoutExpired:
                 status = "timed out"
+            except (subprocess.CalledProcessError, ValueError) as error:
+                stream.write(f"{error}\n")
+                status = "no program"
         lines = log.read_text(errors="replace").strip().splitlines()
         summary = lines[-1][:300] if lines else ""
         results.append({"check": name, "passed": status == 0, "seconds": round(monotonic() - started, 1),

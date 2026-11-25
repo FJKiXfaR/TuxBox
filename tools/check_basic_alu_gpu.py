@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LLVM-assembled common vector and scalar 32-bit controls on a D3D12 GPU.
+"""LLVM-assembled common vector, scalar, float and comparison controls on a D3D12 GPU.
 
 Each instruction is translated, run on dynamic edge and random inputs and
 compared with an independent model of the console instruction. Instructions
@@ -7,7 +7,10 @@ the translator refuses are listed in the receipt; a wrong result fails the
 check. Synthetic inputs and guard words; no game is used.
 """
 import argparse
+from fractions import Fraction
 import json
+import math
+import operator
 from pathlib import Path
 import random
 import struct
@@ -181,19 +184,199 @@ SCALAR = {
 }
 OUTPUTS = 8
 
+INFINITY = float("inf")
+
+
+def to_float(bits):
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def to_bits(value):
+    """The nearest f32 of a Python float, rounding to even and overflowing to infinity."""
+    try:
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+    except OverflowError:
+        return 0xff800000 if value < 0 else 0x7f800000
+
+
+def is_nan(bits):
+    return bits & 0x7fffffff > 0x7f800000
+
+
+def is_denormal(bits):
+    return 0 < bits & 0x7fffffff < 0x00800000
+
+
+class Float:
+    """An expected f32. Any NaN matches a NaN. A denormal may be flushed to a
+    zero of the same sign, as the float mode decides. `ulps` allows for
+    approximate console instructions, and `any_zero` for an undefined zero sign."""
+
+    def __init__(self, bits, ulps=0, any_zero=False):
+        self.bits, self.ulps, self.any_zero = bits, ulps, any_zero
+
+    def matches(self, got):
+        want = self.bits
+        if is_nan(want):
+            return is_nan(got)
+        if got == want or (is_denormal(want) and got == want & 0x80000000):
+            return True
+        if self.any_zero and not want & 0x7fffffff and not got & 0x7fffffff:
+            return True
+        same_sign = not (got ^ want) & 0x80000000
+        return same_sign and not is_nan(got) and abs((got & 0x7fffffff) - (want & 0x7fffffff)) <= self.ulps
+
+    def __repr__(self):
+        return f"{self.bits:#010x}" + (f"~{self.ulps}ulp" if self.ulps else "")
+
+
+def matches(got, want):
+    return want.matches(got) if isinstance(want, Float) else got == want
+
+
+def fused(a, b, c):
+    """a * b + c rounded once."""
+    values = [to_float(x) for x in (a, b, c)]
+    if not all(math.isfinite(v) for v in values):
+        return to_bits(values[0] * values[1] + values[2])
+    exact = Fraction(values[0]) * Fraction(values[1]) + Fraction(values[2])
+    if not exact:
+        return to_bits(values[0] * values[1] + values[2])
+    near = to_bits(float(exact))
+    candidates = [near + step for step in (-1, 0, 1)
+                  if 0 <= (near & 0x7fffffff) + step <= 0x7f7fffff]
+
+    def distance(bits):
+        return abs(Fraction(to_float(bits)) - exact), bits & 1
+
+    if near & 0x7fffffff >= 0x7f800000:
+        return near
+    return min(candidates, key=distance)
+
+
+def arithmetic(function, ulps=0):
+    def model(a, b, c):
+        try:
+            return Float(to_bits(function(to_float(a), to_float(b), to_float(c))), ulps)
+        except (ValueError, ZeroDivisionError):
+            return Float(0x7fc00000)
+    return model
+
+
+def extreme(pick, count):
+    """min or max of `count` sources, ignoring NaN as the console's IEEE form does."""
+    def model(a, b, c):
+        numbers = [to_float(x) for x in (a, b, c)[:count] if not is_nan(x)]
+        return Float(to_bits(pick(numbers)) if numbers else 0x7fc00000, any_zero=True)
+    return model
+
+
+def whole(function):
+    def model(a, b, c):
+        value = to_float(a)
+        if not math.isfinite(value):
+            return Float(a)
+        result = function(value)
+        # A result of zero keeps the input's sign.
+        return Float(to_bits(math.copysign(0.0, value) if result == 0 else float(result)))
+    return model
+
+
+def to_integer(function, low, high):
+    def model(a, b, c):
+        value = to_float(a)
+        if math.isnan(value):
+            return 0
+        if math.isinf(value):
+            return (high if value > 0 else low) & M
+        return max(low, min(high, function(value))) & M
+    return model
+
+
+# name: (source count, model returning a word or an expected `Float`)
+FLOATS = {
+    "v_add_f32": (2, arithmetic(lambda a, b, c: a + b)),
+    "v_sub_f32": (2, arithmetic(lambda a, b, c: a - b)),
+    "v_subrev_f32": (2, arithmetic(lambda a, b, c: b - a)),
+    "v_mul_f32": (2, arithmetic(lambda a, b, c: a * b)),
+    "v_min_f32": (2, extreme(min, 2)),
+    "v_max_f32": (2, extreme(max, 2)),
+    "v_min3_f32": (3, extreme(min, 3)),
+    "v_max3_f32": (3, extreme(max, 3)),
+    "v_fma_f32": (3, lambda a, b, c: Float(fused(a, b, c))),
+    "v_floor_f32": (1, whole(math.floor)),
+    "v_ceil_f32": (1, whole(math.ceil)),
+    "v_trunc_f32": (1, whole(math.trunc)),
+    "v_rndne_f32": (1, whole(round)),
+    "v_sqrt_f32": (1, arithmetic(lambda a, b, c: math.sqrt(a) if a >= 0 else float("nan"), ulps=1)),
+    "v_rcp_f32": (1, arithmetic(lambda a, b, c: 1 / a if a else math.copysign(INFINITY, a), ulps=1)),
+    "v_cvt_i32_f32": (1, to_integer(math.trunc, -2**31, 2**31 - 1)),
+    "v_cvt_u32_f32": (1, to_integer(math.trunc, 0, M)),
+    "v_cvt_flr_i32_f32": (1, to_integer(math.floor, -2**31, 2**31 - 1)),
+    "v_cvt_rpi_i32_f32": (1, to_integer(lambda v: math.floor(v + 0.5), -2**31, 2**31 - 1)),
+}
+FLOAT_EDGE = [0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0xbf000000, 0x3fc00000,
+              0xc0200000, 0x4b000000, 0x4effffff, 0x4f000000, 0xcf000000, 0x4f800000, 0x7f7fffff,
+              0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x00800000, 0x3effffff]
+
+RELATIONS = {"eq": operator.eq, "ne": operator.ne, "lt": operator.lt, "gt": operator.gt,
+             "le": operator.le, "ge": operator.ge, "lg": operator.ne}
+
+
+def float_relation(name):
+    def model(a, b, c):
+        x, y = to_float(a), to_float(b)
+        unordered = math.isnan(x) or math.isnan(y)
+        if name in ("o", "u"):
+            return int(unordered == (name == "u"))
+        if name == "lg":
+            return int(not unordered and x != y)
+        if name == "neq":
+            return int(unordered or x != y)
+        if name.startswith("n"):
+            return int(not RELATIONS[name[1:]](x, y) or unordered)
+        return int(not unordered and RELATIONS[name](x, y))
+    return model
+
+
+# Vector comparisons: the lane's bit of VCC, selected into 0 or 1.
+COMPARES = {
+    **{f"v_cmp_{name}_u32": (2, lambda a, b, c, name=name: int(RELATIONS[name](a, b)))
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+    **{f"v_cmp_{name}_i32": (2, lambda a, b, c, name=name: int(RELATIONS[name](s32(a), s32(b))))
+       for name in ("eq", "ne", "lt", "gt", "le", "ge")},
+}
+FLOAT_COMPARES = {f"v_cmp_{name}_f32": (2, float_relation(name))
+                  for name in ("eq", "lt", "gt", "le", "ge", "lg", "o", "u", "neq", "nlt", "ngt", "nle", "nge")}
+SCALAR_COMPARES = {
+    **{f"s_cmp_{name}_u32": (2, lambda a, b, name=name: int(RELATIONS[name](a, b)))
+       for name in ("eq", "lg", "lt", "gt", "le", "ge")},
+    **{f"s_cmp_{name}_i32": (2, lambda a, b, name=name: int(RELATIONS[name](s32(a), s32(b))))
+       for name in ("eq", "lg", "lt", "gt", "le", "ge")},
+}
+
+
+def is_float(name):
+    return name in FLOATS or name in FLOAT_COMPARES
+
 
 def count(name):
     """Result words one instruction produces: scalar ones also report SCC."""
-    if name in OPERATIONS:
+    if name not in SCALAR:
         return 1
     return 1 if SCALAR[name][1](*[1] * SCALAR[name][0])[1] is None else 2
 
 
 def lines_for(name, destination):
     """Assembly leaving the instruction's results from `v{destination}` on."""
-    if name in OPERATIONS:
-        sources = ", ".join(f"v{4 + j}" for j in range(OPERATIONS[name][0]))
+    if name in OPERATIONS or name in FLOATS:
+        sources = ", ".join(f"v{4 + j}" for j in range({**OPERATIONS, **FLOATS}[name][0]))
         return [f"{name} v{destination}, {sources}"]
+    if name in COMPARES or name in FLOAT_COMPARES:
+        return [f"{name} vcc_lo, v4, v5", f"v_cndmask_b32_e64 v{destination}, 0, 1, vcc_lo"]
+    if name in SCALAR_COMPARES:
+        return ["v_readfirstlane_b32 s20, v4", "v_readfirstlane_b32 s21, v5", f"{name} s20, s21",
+                "s_cselect_b32 s24, 1, 0", f"v_mov_b32_e32 v{destination}, s24"]
     arity = SCALAR[name][0]
     sources = ", ".join(f"s{20 + j}" for j in range(arity))
     # Each input is uniform: a dispatch group holds one lane.
@@ -206,8 +389,11 @@ def lines_for(name, destination):
 
 
 def results(name, values):
-    if name in OPERATIONS:
-        return [OPERATIONS[name][1](*values)]
+    for table in (OPERATIONS, FLOATS, COMPARES, FLOAT_COMPARES):
+        if name in table:
+            return [table[name][1](*values)]
+    if name in SCALAR_COMPARES:
+        return [SCALAR_COMPARES[name][1](*values[:2])]
     arity, model = SCALAR[name]
     value, flag = model(*values[:arity])
     return [value] if flag is None else [value, flag]
@@ -223,8 +409,9 @@ def program(chunk):
 
 def chunks_of(names):
     chunk, used = [], 0
-    for name in names:
-        if used + count(name) > OUTPUTS:
+    # Float and integer instructions need different inputs, so a shader holds one kind.
+    for name in sorted(names, key=is_float):
+        if used + count(name) > OUTPUTS or (chunk and is_float(name) != is_float(chunk[0])):
             yield chunk
             chunk, used = [], 0
         chunk.append(name)
@@ -267,7 +454,8 @@ def main():
         ap.error("choose a fresh receipt")
     a.work.mkdir(parents=True, exist_ok=False)
     rng = random.Random(0x414c5531)
-    supported, refused = probe([*OPERATIONS, *SCALAR], a.emitter, a.llvm_mc)
+    every = [*OPERATIONS, *SCALAR, *COMPARES, *SCALAR_COMPARES, *FLOATS, *FLOAT_COMPARES]
+    supported, refused = probe(every, a.emitter, a.llvm_mc)
     expected, chunks = {}, {}
     with TemporaryDirectory(dir=a.work) as td:
         trial = Path(td)
@@ -292,16 +480,27 @@ def main():
                 want = seed.copy()
                 for lane in range(GROUPS):
                     index = turn * GROUPS + lane
+                    edges = FLOAT_EDGE if is_float(chunk[0]) else EDGE
                     # Edge values first, rotated so each source sees each of them.
-                    values = ([EDGE[(index + 7 * j) % len(EDGE)] for j in range(3)] if index < len(EDGE)
-                              else [rng.getrandbits(32) for _ in range(3)])
+                    if index < len(edges):
+                        values = [edges[(index + 7 * j) % len(edges)] for j in range(3)]
+                    elif is_float(chunk[0]):
+                        # Ordinary magnitudes of both signs, so results stay finite
+                        # and rounding matters. Some pairs are equal.
+                        values = [to_bits(rng.uniform(-1, 1) * 2.0 ** rng.randint(-30, 30)) for _ in range(3)]
+                        if rng.random() < 0.2:
+                            values[1] = values[0]
+                    else:
+                        values = [rng.getrandbits(32) for _ in range(3)]
+                        if rng.random() < 0.1:
+                            values[1] = values[0]
                     offset = 96 + STRIDE * lane
                     seed[offset:offset + 3] = values
                     want[offset:offset + 3] = values
                     row = [word for name in chunk for word in results(name, values)]
                     want[offset + 3:offset + 3 + outputs] = row
                 (trial / (label + ".seed")).write_bytes(struct.pack("<384I", *seed))
-                expected[label] = struct.pack("<384I", *want)
+                expected[label] = want
                 chunks[label] = chunk
         (trial / "cases.txt").write_text("".join(f"{n} 4 structured {GROUPS}\n" for n in expected))
         _, status, fields = run_gpu_guest(trial / "guest.cpp", "basic-alu.exe", trial, a.work, a.proton,
@@ -311,15 +510,15 @@ def main():
         wrong = {}
         for label, chunk in chunks.items():
             observed = struct.unpack("<384I", (trial / (label + ".bin")).read_bytes())
-            wanted = struct.unpack("<384I", expected[label])
+            wanted = expected[label]
             for index, (got_word, want_word) in enumerate(zip(observed, wanted)):
-                if got_word == want_word:
+                if matches(got_word, want_word):
                     continue
                 lane, column = divmod(index - 96, STRIDE)
                 owners = [name for name in chunk for _ in range(count(name))]
                 name = owners[column - 3] if 0 <= lane < GROUPS and 3 <= column < 3 + len(owners) else "guard"
                 wrong.setdefault(name, {"shader": label, "inputs": list(wanted[96 + STRIDE * lane:99 + STRIDE * lane]),
-                                        "got": got_word, "wanted": want_word})
+                                        "got": got_word, "wanted": repr(want_word)})
     receipt = {"schema": 1, "adapter": a.adapter, "tools_sha256": {n: digest(getattr(a, n))
                                                                    for n in ("emitter", "dxc", "provider")},
                "checked": supported, "refused": refused, "wrong": wrong, "inputs": a.rounds * GROUPS}
