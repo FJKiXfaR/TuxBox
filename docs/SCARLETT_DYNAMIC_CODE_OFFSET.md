@@ -28,7 +28,7 @@ The RTX 4080 control passed 64 dispatches, 24,576 words including 4,096
 result words, with zero mismatches. This is a bounded synthetic pattern,
 not a measured reduction in retail refusal counts. See the receipt.
 
-### Repeat the OR, XOR and bit-field GPU checks
+### Repeat the bounded table-index GPU checks
 
 From the repository root, build the Linux translator:
 
@@ -45,7 +45,7 @@ the Windows DXC DLLs. Set `ADAPTER` to the GPU's vendor and device ID
 project's Windows cross-build toolchain.
 
 ```sh
-for pattern in or xor bfe; do
+for pattern in or xor bfe cselect; do
     python3 tools/check_dynamic_code_offset.py \
         --xshader build/table-check/x86_64-unknown-linux-gnu/debug/xshader \
         --pattern "$pattern" --adapter "$ADAPTER" --proton "$PROTON" \

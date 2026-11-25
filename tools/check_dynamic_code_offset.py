@@ -31,11 +31,12 @@ def instrument(hlsl):
     return "RWBuffer<uint> output : register(u0);\n" + hlsl
 
 
-# gfx1030 instructions between GETPC and the table load. All three sequences
+# gfx1030 instructions between GETPC and the table load. These sequences
 # occupy three dwords, including the literal operand of S_BFE_U32.
 SELECTORS = {
     "or":  [0x870a830c, 0x8f0a820a, 0x880a900a],  # ((s12 & 3) << 2) | 16
     "xor": [0x870a830c, 0x8f0a820a, 0x890a940a],  # ((s12 & 3) << 2) ^ 20
+    "cselect": [0xbf0d830c, 0x850a8184, 0x8f0a820a],  # bit 3 selects word 4 or 1
     "bfe": [0x938aff0c, 0x0002000b, 0x8f0a820a],  # extract bits 11..12, then scale by 4
 }
 
@@ -67,6 +68,8 @@ def cases(pattern=None):
             index += 4
         elif pattern == "xor":
             index = (5, 4, 7, 6)[index]
+        elif pattern == "cselect":
+            index = 4 if value & 8 else 1
         elif pattern == "bfe":
             index = (value >> 11) & 3
         expected[160:224] = [11 * (index + 1)] * 64

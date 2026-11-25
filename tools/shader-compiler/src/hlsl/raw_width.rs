@@ -372,6 +372,23 @@ fn extracted_descriptor_index_requires_every_selected_cbv() {
 }
 
 #[test]
+fn conditional_cbv_offset_checks_both_possible_addresses() {
+    let resolves = |select: u32| {
+        let mut ex = bounded_cbv_fixture();
+        // Test bit 4 of the group ID, then choose a descriptor byte offset into s10.
+        ex.isa[..4].copy_from_slice(&0xbf0d8405u32.to_le_bytes());
+        ex.isa[4..8].copy_from_slice(&select.to_le_bytes());
+        let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+        em.resolve_resources().is_ok()
+    };
+    assert!(resolves(0x850a80a0)); // SCC ? 32 : 0
+    assert!(resolves(0x850aa080)); // SCC ? 0 : 32
+    assert!(!resolves(0x850aa081)); // unaligned true arm
+    assert!(!resolves(0x850ac0a0)); // false arm beyond the reflected range
+    assert!(!resolves(0x850a0ca0)); // unbounded false arm in s12
+}
+
+#[test]
 fn xor_flips_the_dynamic_cbv_slot_within_the_reflected_range() {
     let mut ex = bounded_cbv_fixture();
     // The existing selector is 0 or 32. XOR 32 swaps the two descriptors.
