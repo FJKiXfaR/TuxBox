@@ -657,3 +657,64 @@ not a change to the shipping translator or a claim of retail compatibility.
 Rechecked the same core corpus after updating to upstream `3086e0b`: all
 8,577 cases passed again. The earlier #58 and mutation receipts retain their
 original source fingerprints.
+
+
+### Bounded differential campaign and small reproducers
+
+Use the existing CPU reference and full-translator bridge; no new runtime
+dependencies. The campaign generates initialized straight-line scalar
+instruction chains, verifies every distinct native instruction encoding
+against LLVM gfx1030, checks the same programs with the #60 oracle and
+DXC/DXV, and groups refusals by exact text with the instruction offset
+removed (the same offset normalization principle as #44). Mismatches are
+grouped by differing output indices, not claimed identical root causes.
+A representative of each selected group is rechecked individually, reduced
+by removing complete instructions after the fixed nine-instruction
+initialization, then replayed twice in fresh compiler calls. Local
+one-deletion minimality is recorded; this is not a global minimum. The
+report stores the native words, assembly, expected state, case digest,
+classification and counts, as well as structural opcode/alias/adjacency
+features (not compiler branch coverage). Tool errors are not cached or
+reported as confirmed shader defects.
+
+```sh
+python tools/scarlett_campaign.py --bridge /path/to/test-binary \
+    --dxc /path/to/dxc --dxv /path/to/dxv --llvm-mc /path/to/llvm-mc \
+    --profile extended --count 2048 --reduce 12 \
+    --work /tmp/scalar-campaign --output /tmp/scalar-campaign.json
+```
+
+The default core profile is for main without #58. Extended requires the
+proposed #58 operations for a passing run. Use a wrapper executable for
+LLVM if it needs a container. Reuse a confirmed minimized corpus with
+`--replay-report evidence/scarlett-differential-campaign.json --require-pass`
+instead of generating new cases (use fresh work and output paths).
+Replay deliberately bypasses cache. The normal discovery mode reports
+refusals without failing the command; `--require-pass` also fails for them.
+The campaign does not establish actual title coverage.
+
+Optional trusted local `--cache /path/to/cache.json` and repeated
+`--dependency /path/to/compiler-library.so` arguments retain exact
+content-keyed results for repeat work. Include all actual loaded compiler
+libraries (e.g. identify via ldd on trusted local binaries); a different
+tool, source, dependency, Python version or environment refuses reuse.
+Use one owner per cache, not concurrently shared or externally supplied
+cache files. Cache is an optimization, not an independent proof; use a
+fresh cache or no cache for release/regression verification. The tool
+limits compiler workers to two, generated cases to 8,192, total evaluated
+cases/cache entries to 20,000, reductions per representative to 64 and
+representatives to 32. Work is temporary; per-tool timeouts apply and no
+new evaluation starts beyond the 240-second campaign budget.
+
+[Receipt](../evidence/scarlett-differential-campaign.json): 2,048 core
+programs pass; 2,048 extended programs on the original #58 expose 483
+refusals across twelve known provenance-related instruction signatures,
+all confirmed as small reproducible cases. With the conservative compute
+provenance follow-up all 2,048 pass, and the older 8,577 core plus 10,113
+extended cases pass. The fix remains a separate change to #58. No accepted
+case shows a numerical disagreement. Five alternating fresh/reused
+evaluations of 512 identical programs (seed 17294091; LLVM checks in
+both arms; cache primed once) measured 4.63 s vs 0.47 s median on the
+local machine. This is repeat validation with an unchanged toolchain,
+not faster cold discovery or a claim of higher FPS. The campaign remains
+deliberately narrow: no memory, wave execution, branches or GPU testing.
