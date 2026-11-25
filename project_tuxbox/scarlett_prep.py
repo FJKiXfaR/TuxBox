@@ -141,7 +141,7 @@ def prepare_scarlett(executable, host):
                     failure_counts[bucket] += 1
                 if reason is not None:
                     reasons[reason] += 1
-                if error and totals["failed"] <= 3:
+                if error and totals["failed"] <= 20:
                     report_progress(progress, f"ProjectScarlett shader preparation: {error}", completed, len(sources))
                 phase.update(completed, totals["compiled"],
                              unsupported=totals["unsupported"], failed=totals["failed"])
