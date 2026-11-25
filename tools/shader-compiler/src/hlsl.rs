@@ -1585,7 +1585,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     // `XSHADER_FORCE_WAVE32` the requirement is coerced so the program runs with
     // 32-lane waves; operations that depend on the 64th lane become approximate.
     let required_wave_size = match required_wave_size {
-        Some(64) if ex.stage == Stage::Compute && std::env::var_os("XSHADER_FORCE_WAVE32").is_some() => Some(32),
+        Some(64) if std::env::var_os("XSHADER_FORCE_WAVE32").is_some() => Some(32),
         other => other,
     };
     em.required_wave_size = required_wave_size;

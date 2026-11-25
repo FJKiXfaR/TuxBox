@@ -276,7 +276,7 @@ unsafe fn create_pipeline_x_inner(
     let max_host_code = std::env::var("TUXBOX_MAX_HOST_CODE_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1024 * 1024);
+        .unwrap_or(120_000);
     if max_host_code != 0 && code.len() > max_host_code {
         crate::diagnostics::log(&format!(
             "substituted oversized compute program ({} bytes of DXIL) to keep the host compiler alive",
@@ -285,21 +285,7 @@ unsafe fn create_pipeline_x_inner(
         crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
         return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
     }
-    // Translated programs whose DXIL faults the host driver's shader compiler;
-    // the pipeline is replaced by the fallback one instead of being submitted.
-    const DRIVER_REFUSED_DXIL: [&str; 7] = [
-        "1a4cc49811c9ba8a9a629dd89b66cebc1354b0474379db7410019032ba44da06",
-        "e951f7018607ad7f5c3abac8bc625c21acac087010ecd07bc70be1f5638c280e",
-        "c93880131432c6b01b3b43a49fefeeb38f96542feaf3c371c6c98127c32803db",
-        "3e0a42e6f112262c31133d592cbc2e8e00f82bf2ba423d77c207c11048459c04",
-        "4553864955f532c9cb654aeece3170b8f3c62e6e33da3e72c50b8fb9ff1f6561",
-        "6577a0c9c6cd7cc2857c96855661fa790950b5aea62d5ad0e2a7ef9e626093f6",
-        // Variant discovered by cptest: the host backend faults on this translation.
-        "5cce092978870dd9b0c5715f90b1c5e6cd46bde85aef464a9bb7d4b76102a50e",
-    ];
-    if let Some(digest) = super::shader_cache::source_digest(code)
-        && DRIVER_REFUSED_DXIL.contains(&digest.as_str())
-    {
+    if driver_refused(code) {
         crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
         return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
     }
@@ -333,6 +319,7 @@ unsafe fn create_pipeline_x_inner(
         let node_mask = desc.NodeMask;
         let flags = desc.Flags;
         let name = label.clone();
+        trace_compile(&label, shader.len());
         crate::big_stack::run_deadline(&label, move || {
             // Large programs queue here so the driver does not compile them
             // all at once. The queue is on the detached compile thread, so the
@@ -373,6 +360,7 @@ unsafe fn create_pipeline_x_inner(
     };
     if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err()
         && super::shader_cache::host_compatible(bytes)
+        && !driver_refused(bytes)
     {
         // Structural checks cannot validate DXIL instructions or root bindings.
         // Let the adapter handle the original guest shader if it rejects the cache,
@@ -428,7 +416,30 @@ pub(super) fn large_deferred(
     node_mask: u32,
     flags: D3D12_PIPELINE_STATE_FLAGS,
 ) -> crate::big_stack::PipelineWait<windows::core::Result<ID3D12PipelineState>> {
+    // The compute stream path reaches the driver without the size gate in
+    // `create`; apply the same gate here and let the caller substitute its null
+    // pipeline instead of faulting the host compiler.
+    let cap = std::env::var("TUXBOX_MAX_HOST_CODE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(120_000);
+    if cap != 0 && shader.len() > cap {
+        trace_compile(label, shader.len());
+        crate::diagnostics::log(&format!(
+            "stream compute program translated to {} bytes (cap {cap}); stand-in pipeline",
+            shader.len()
+        ));
+        return crate::big_stack::PipelineWait::Deferred;
+    }
+    if driver_refused(&shader) {
+        trace_compile(label, shader.len());
+        crate::diagnostics::log(&format!(
+            "stream compute program refused by the host driver; stand-in pipeline ({label})"
+        ));
+        return crate::big_stack::PipelineWait::Deferred;
+    }
     let name = label.to_owned();
+    trace_compile(label, shader.len());
     crate::big_stack::run_deadline(label, move || {
         let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
             crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
@@ -447,6 +458,25 @@ fn owned_compile(
     node_mask: u32,
     flags: D3D12_PIPELINE_STATE_FLAGS,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let digest = super::shader_cache::source_digest(&shader).unwrap_or_default();
+    if std::env::var_os("TUXBOX_TRACE_PIPELINES").is_some() {
+        // Runs on the detached compile thread: the last line on a thread names
+        // the program whose driver compile faulted.
+        let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        crate::diagnostics::log(&format!(
+            "owned compile tid={tid} bytes={} digest={}",
+            shader.len(),
+            &digest[..digest.len().min(16)]
+        ));
+    }
+    if driver_refused(&shader) {
+        crate::diagnostics::log(&format!(
+            "driver-faulting program refused before the host compile: bytes={} digest={}",
+            shader.len(),
+            &digest[..digest.len().min(16)]
+        ));
+        return Err(E_NOTIMPL.into());
+    }
     let mut descriptor = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(root),
         CS: D3D12_SHADER_BYTECODE {
@@ -465,6 +495,65 @@ fn owned_compile(
 }
 
 /// Create a resource-free compute pipeline on the guest root (see `fallback`).
+/// Translated programs whose DXIL faults the host driver's shader compiler.
+/// Matched by digest prefix so a learned entry needs no full rehash.
+const DRIVER_REFUSED_PREFIXES: [&str; 10] = [
+    "1a4cc49811c9ba8a",
+    "e951f7018607ad7f",
+    "c93880131432c6b0",
+    "3e0a42e6f112262c",
+    "4553864955f532c9",
+    "6577a0c9c6cd7cc2",
+    "5cce092978870dd9",
+    // Learned from a traced driver fault: the largest compiled program faulted
+    // the host compiler inside vkCreateComputePipelines.
+    "616289d7c9ace6ed",
+    "6b1c62f1cf99d751",
+    // Learned from the driver fault in runN1: the last program handed to the
+    // driver on the faulting compile thread.
+    "369153796b996ef6",
+];
+
+fn driver_refused(dxil: &[u8]) -> bool {
+    let Some(digest) = super::shader_cache::source_digest(dxil) else { return false; };
+    if DRIVER_REFUSED_PREFIXES.iter().any(|prefix| digest.starts_with(prefix)) {
+        return true;
+    }
+    // Programs the host driver faulted on in an earlier run. The native driver
+    // raises an access violation inside its own compiler with no recoverable
+    // error, so a fault can only be learned from the run that died: the launcher
+    // writes the digest here between runs and every later launch keeps the
+    // title alive with the null pipeline instead of faulting again.
+    refused_from_runs().iter().any(|prefix| digest.starts_with(prefix.as_str()))
+}
+
+fn refused_from_runs() -> &'static [String] {
+    static LEARNED: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let Ok(text) = std::fs::read_to_string(
+            std::env::temp_dir().join("tuxbox_shader_cache").join("driver-refused.txt"),
+        ) else {
+            return Vec::new();
+        };
+        text.lines()
+            .map(str::trim)
+            .filter(|line| line.len() >= 8 && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    });
+    &LEARNED
+}
+
+/// `TUXBOX_TRACE_PIPELINES=1`: record which program a compile thread is about
+/// to hand to the driver. A driver fault leaves no stack, so the last record on
+/// the crashing thread names the program.
+pub(super) fn trace_compile(label: &str, bytes: usize) {
+    if std::env::var_os("TUXBOX_TRACE_PIPELINES").is_none() {
+        return;
+    }
+    let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    crate::diagnostics::log(&format!("pipeline compile tid={tid} {label} bytes={bytes}"));
+}
+
 unsafe fn null_compute(
     this: &Device, root: Option<&ID3D12RootSignature>, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC, out: Out,
 ) -> Option<HRESULT> {

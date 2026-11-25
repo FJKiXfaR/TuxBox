@@ -30,8 +30,13 @@ impl Presentation {
         let _ = session.take();
     }
 
-    pub(crate) fn present(&self, queue: &ID3D12CommandQueue, source: &ID3D12Resource) -> HRESULT {
-        self.present_texture(queue, source)
+    pub(crate) fn present(
+        &self,
+        queue: &ID3D12CommandQueue,
+        source: &ID3D12Resource,
+        alternate: Option<&ID3D12Resource>,
+    ) -> HRESULT {
+        self.present_texture(queue, source, alternate)
             .unwrap_or_else(|error| error.code())
     }
 
@@ -39,6 +44,7 @@ impl Presentation {
         &self,
         queue: &ID3D12CommandQueue,
         source: &ID3D12Resource,
+        alternate: Option<&ID3D12Resource>,
     ) -> Result<HRESULT> {
         // SAFETY: source is a live native resource held by the caller.
         let desc = unsafe { source.GetDesc() };
@@ -66,7 +72,7 @@ impl Presentation {
             Some(chain) => chain,
             None => session.insert(SwapChain::new(queue, &device, &desc)?),
         };
-        let status = chain.present(queue, source, &desc)?;
+        let status = chain.present(queue, source, alternate, &desc)?;
         if status == S_OK {
             crate::diagnostics::presented(desc.Width, desc.Height);
         }
@@ -170,6 +176,7 @@ impl SwapChain {
         &mut self,
         queue: &ID3D12CommandQueue,
         source: &ID3D12Resource,
+        alternate: Option<&ID3D12Resource>,
         desc: &D3D12_RESOURCE_DESC,
     ) -> Result<HRESULT> {
         if let Some((failure, _)) = &self.failed_signal {
@@ -204,15 +211,38 @@ impl SwapChain {
             // The title leaves its display surface in RENDER_TARGET; a barrier
             // that claims COMMON is an invalid transition and the driver may
             // drop the copy. Non-display fallback targets are not rendered.
-            let source_state = if crate::diagnostics::display::is_display_any(
+            let display_surface = crate::diagnostics::display::is_display_any(
                 windows::core::Interface::as_raw(source),
-            ) {
+            );
+            let source_state = if display_surface && std::env::var_os("TUXBOX_PRESENT_STATE_COMMON").is_none() {
                 D3D12_RESOURCE_STATE_RENDER_TARGET
             } else {
                 D3D12_RESOURCE_STATE_COMMON
             };
+            static STATE_NOTE: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&STATE_NOTE, || format!(
+                "present source {:p} display={display_surface} barrier-before={:?}",
+                windows::core::Interface::as_raw(source), source_state
+            ));
             record_copy(&frame.list, source, &buffer, panel.as_ref(), source_state);
-            let sample = sampler::due().then(|| sampler::record(&frame.list, source, source_state)).flatten();
+            let due = sampler::due();
+            let sample = due.then(|| sampler::record(&frame.list, source, source_state)).flatten();
+            // `TUXBOX_SCAN_TARGETS=1`: read back every distinct render target the
+            // title has bound, so the resource that actually holds the frame can be
+            // identified instead of guessing between the display surface and the
+            // last full-size target.
+            let scan = std::env::var_os("TUXBOX_SCAN_TARGETS").is_some() && sampler::scan_due();
+            let scan_samples: Vec<crate::present::sampler::Sample> = if scan {
+                crate::diagnostics::display::target_resources()
+                    .iter()
+                    .filter_map(|target| sampler::record(&frame.list, target, D3D12_RESOURCE_STATE_COMMON))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let alt_sample = alternate
+                .filter(|alt| windows::core::Interface::as_raw(*alt) != windows::core::Interface::as_raw(source))
+                .and_then(|alt| sampler::record(&frame.list, alt, D3D12_RESOURCE_STATE_RENDER_TARGET));
             frame.list.Close()?;
             frame.source = Some(source.clone());
             queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
@@ -221,9 +251,17 @@ impl SwapChain {
                 return Err(error);
             }
             frame.retire = self.next;
-            if let Some(sample) = sample {
+            if sample.is_some() || alt_sample.is_some() || !scan_samples.is_empty() {
                 wait_for(&self.fence, self.next)?;
-                sample.report("present");
+                if let Some(sample) = &sample {
+                    sample.report("present");
+                }
+                if let Some(sample) = &alt_sample {
+                    sample.report("display");
+                }
+                for (index, sample) in scan_samples.iter().enumerate() {
+                    sample.report(&format!("scan{index}"));
+                }
             }
             self.next = next_value;
             // Return DXGI status codes such as DXGI_STATUS_OCCLUDED to the guest.
@@ -347,6 +385,15 @@ pub(crate) mod sampler {
         static COUNT: AtomicU64 = AtomicU64::new(0);
         let n = COUNT.fetch_add(1, Ordering::Relaxed);
         *EVERY != 0 && n % *EVERY == 0
+    }
+
+    /// One scan after the title has had time to render a few frames, so the
+    /// scan does not capture an empty loading frame.
+    pub(crate) fn scan_due() -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        matches!(n, 4 | 59 | 239)
     }
 
     #[derive(Clone)]
@@ -512,16 +559,29 @@ pub(crate) mod redirect {
         *DRAWN_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.clone());
     }
 
+    pub(crate) fn drawn_display() -> Option<ID3D12Resource> {
+        DRAWN_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn last_target() -> Option<ID3D12Resource> {
+        LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub(crate) fn source(display: &ID3D12Resource) -> Option<ID3D12Resource> {
         if !enabled() {
             return None;
         }
-        // A draw into the other display surface makes that surface the frame.
+        // A draw into this display surface makes it the frame: present it as it
+        // is. Falling through to an unrelated full-size target here is what made
+        // every presented frame black while the display surface itself was drawn.
         if let Some(drawn) = DRAWN_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             let different = windows::core::Interface::as_raw(&drawn)
                 != windows::core::Interface::as_raw(display);
+            if !different {
+                return None;
+            }
             let (a, b) = unsafe { (display.GetDesc(), drawn.GetDesc()) };
-            if different && a.Width == b.Width && a.Height == b.Height && a.Format == b.Format {
+            if a.Width == b.Width && a.Height == b.Height && a.Format == b.Format {
                 return Some(drawn);
             }
         }

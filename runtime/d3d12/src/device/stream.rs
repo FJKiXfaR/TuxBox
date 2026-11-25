@@ -170,6 +170,23 @@ unsafe fn create(
                     };
                     original[index] = Some((code, compiled.as_ref().map(|_| stages.len())));
                     if let Some(compiled) = compiled {
+                        // The host backend turns mesh pipelines into compute
+                        // pipelines on adapters without VK_EXT_mesh_shader and
+                        // faults on the largest programs, so those PSOs keep the
+                        // stand-in pipeline instead of the driver compile.
+                        if matches!(tag, AMPLIFICATION_X | MESH_X) {
+                            let cap = std::env::var("TUXBOX_MAX_HOST_CODE_BYTES")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(200_000);
+                            if compiled.len() > cap {
+                                crate::diagnostics::log(&format!(
+                                    "mesh stage {tag} translated to {} bytes (cap {cap}); stand-in pipeline",
+                                    compiled.len()
+                                ));
+                                return Err(E_NOTIMPL.into());
+                            }
+                        }
                         shader.pShaderBytecode = compiled.as_ptr().cast();
                         shader.BytecodeLength = compiled.len();
                         stages.push(compiled);

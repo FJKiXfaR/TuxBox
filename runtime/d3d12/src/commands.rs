@@ -1722,6 +1722,16 @@ unsafe fn present_planes(
     // present names the committed display surface. Show the render target the
     // title actually drew into when its shape matches (see present::redirect).
     let redirected = crate::present::redirect::source(&source);
+    static SOURCE_NOTE: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&SOURCE_NOTE, || format!(
+        "present names {:p}; redirect {}; drawn display {}; last render target {}",
+        source.as_raw(),
+        redirected.as_ref().map(|r| format!("{:p}", r.as_raw())).unwrap_or_else(|| "none".into()),
+        crate::present::redirect::drawn_display()
+            .map(|r| format!("{:p}", r.as_raw())).unwrap_or_else(|| "none".into()),
+        crate::present::redirect::last_target()
+            .map(|r| format!("{:p}", r.as_raw())).unwrap_or_else(|| "none".into()),
+    ));
     if redirected.is_some() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || {
@@ -1731,7 +1741,7 @@ unsafe fn present_planes(
     let result = queue
         .state
         .presentation
-        .present(&queue.native, redirected.as_ref().unwrap_or(&source));
+        .present(&queue.native, redirected.as_ref().unwrap_or(&source), Some(&source));
     if result == S_OK {
         frame_heartbeat(plane.token);
     }

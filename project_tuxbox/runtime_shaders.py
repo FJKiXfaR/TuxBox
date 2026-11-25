@@ -450,7 +450,7 @@ def request_notifications(directory, stop):
 # when the executable is simply rebuilt. Hashing the binary made every rebuild
 # start from an empty cache directory, which looked like the driver recompiling
 # everything.
-TRANSLATOR_CACHE_VERSION = "tuxbox-xshader-output-1"
+TRANSLATOR_CACHE_VERSION = "tuxbox-xshader-output-2"
 
 
 def snapshot_compiler_cache(xshader, cache_root):
@@ -476,6 +476,8 @@ def seed_cache_from_siblings(cache, cache_root):
     directory starts from the entries earlier directories already proved. Linked
     entries share storage and are ignored when they already exist.
     """
+    if os.environ.get("TUXBOX_CACHE_NO_SEED") == "1":
+        return
     runtime = cache_root / "runtime"
     if not runtime.is_dir():
         return

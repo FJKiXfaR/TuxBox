@@ -359,6 +359,25 @@ pub(crate) mod display {
         DRAW_TARGETS.lock().unwrap_or_else(|e| e.into_inner()).get(&handle).cloned()
     }
 
+    /// Distinct resources any render target view has addressed, for a diagnostic
+    /// scan that finds which one holds the frame's content.
+    pub(crate) fn target_resources() -> Vec<ID3D12Resource> {
+        use windows::core::Interface;
+        let (list, mut out): (Vec<ID3D12Resource>, Vec<ID3D12Resource>) = {
+            let targets = DRAW_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = std::collections::HashSet::new();
+            let mut list = Vec::new();
+            for resource in targets.values() {
+                if seen.insert(resource.as_raw() as usize) && list.len() < 16 {
+                    list.push(resource.clone());
+                }
+            }
+            (list, Vec::new())
+        };
+        out.extend(list);
+        out
+    }
+
     pub(crate) fn capture_target(handle: usize, resource: Option<&ID3D12Resource>) {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
         if !capture_draws() { return; }

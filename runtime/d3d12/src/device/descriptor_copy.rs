@@ -60,6 +60,17 @@ impl<'a> Ranges<'a> {
     }
 }
 
+/// Strips marker bits only the title sets above the descriptor address.
+fn ptr_norm(handle: D3D12_CPU_DESCRIPTOR_HANDLE) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: handle.ptr & 0x00ff_ffff_ffff_ffff,
+    }
+}
+
+fn plausible_handle(handle: usize) -> bool {
+    (0x1_0000..0x0000_8000_0000_0000).contains(&handle)
+}
+
 pub(super) unsafe extern "system" fn ranges(
     device: &Device,
     dst_count: u32,
@@ -97,18 +108,55 @@ pub(super) unsafe extern "system" fn ranges(
             return;
         }
     }
-    // Keep the native device's validation for malformed ranges.
-    unsafe {
-        device.native.CopyDescriptors(
-            dst_count,
-            dst,
-            Some(dst_sizes),
-            src_count,
-            src,
-            Some(src_sizes),
-            kind,
-        )
+    // Translate the range starts before any native forwarding. Arena-backed
+    // heaps start at a guest address, so forwarding it raw makes vkd3d decode a
+    // bogus heap pointer and fault. Untranslatable ranges are dropped.
+    let registry = &device.state.descriptor_arenas;
+    // The title may mark handles in bits above the address width.
+    let normalize = |handle: D3D12_CPU_DESCRIPTOR_HANDLE| -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr_norm(handle)
     };
+    let mut dst_starts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+    let mut src_starts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+    let mut usable = true;
+    if let Some(to) = unsafe { Ranges::read(dst_count, dst, dst_sizes) } {
+        for start in to.starts {
+            let handle = registry.copy_source(normalize(*start));
+            usable &= plausible_handle(handle.ptr) || registry.find(handle.ptr).is_some();
+            dst_starts.push(handle);
+        }
+    }
+    if let Some(from) = unsafe { Ranges::read(src_count, src, src_sizes) } {
+        for start in from.starts {
+            let handle = registry.copy_source(normalize(*start));
+            usable &= plausible_handle(handle.ptr) || registry.find(handle.ptr).is_some();
+            src_starts.push(handle);
+        }
+    }
+    if usable && dst_starts.len() == dst_count as usize && src_starts.len() == src_count as usize {
+        unsafe {
+            device.native.CopyDescriptors(
+                dst_count,
+                dst_starts.as_ptr(),
+                Some(dst_sizes),
+                src_count,
+                src_starts.as_ptr(),
+                Some(src_sizes),
+                kind,
+            );
+        }
+        return;
+    }
+    static SKIPS: std::sync::LazyLock<std::sync::Mutex<u32>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut skips = SKIPS.lock().unwrap_or_else(|error| error.into_inner());
+    *skips += 1;
+    if skips.is_power_of_two() {
+        crate::diagnostics::log(&format!(
+            "descriptor range copy skipped: kind={} dst_count={dst_count} src_count={src_count}",
+            kind.0
+        ));
+    }
 }
 
 pub(super) unsafe extern "system" fn simple(

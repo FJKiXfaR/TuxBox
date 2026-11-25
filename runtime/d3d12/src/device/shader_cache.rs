@@ -335,9 +335,11 @@ pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
     match shader_code(shader)? {
         (stage, ShaderCode::Xbox) => translate(shader, stage),
         (stage, ShaderCode::Portable) if is_console_dxil(shader) => {
-            // Console DXIL has no translator path. Use a pre-seeded host
-            // translation from the shared cache; never request one at run time
-            // (a request would stall the title behind a multi-minute compile).
+            // Console DXIL is translated by the same emitter as other Xbox
+            // programs; the shared cache holds the results. A miss is handed to
+            // the launcher's worker exactly like any other program, so the
+            // archive and the preparation pass can see it (a miss used to become
+            // a permanent stand-in and never reached preparation).
             let source = source_digest(shader)?;
             // Diagnostics: where console-DXIL translations are looked up and
             // whether each distinct container found one.
@@ -348,7 +350,26 @@ pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
                     std::env::temp_dir().join("tuxbox_shader_cache").join("by_source").display()
                 )
             });
-            let translation = read_portable("by_source", &source, stage);
+            let mut translation = read_portable("by_source", &source, stage);
+            if translation.is_none() {
+                translation = translate(shader, stage);
+                if let Some(bytes) = &translation
+                    && read_portable("by_source", &source, stage).is_none()
+                {
+                    // Publish the result for later runs that read the shared
+                    // cache without translating.
+                    let _ = std::fs::create_dir_all(
+                        std::env::temp_dir().join("tuxbox_shader_cache").join("by_source"),
+                    );
+                    let _ = std::fs::write(
+                        std::env::temp_dir()
+                            .join("tuxbox_shader_cache")
+                            .join("by_source")
+                            .join(format!("{source}.cso")),
+                        bytes,
+                    );
+                }
+            }
             static SIGHTINGS: Seen<String> = Seen::new(32);
             if let Sighting::New = SIGHTINGS.sight(&source) {
                 crate::diagnostics::log(&format!(
