@@ -12,8 +12,8 @@ using Signal = HRESULT(WINAPI*)(ID3D12CommandQueue*,ID3D12Fence*,UINT64);
 constexpr UINT page=65536;
 std::string run(const wchar_t* requested,bool) {
     DXGI_ADAPTER_DESC1 selected{};
-    constexpr std::array<UINT,18> profile{0x20004,0,UINT_MAX,0,0,0,UINT_MAX,UINT_MAX,0,1,0,0,0,0,0,0,0,0};
-    auto device=create_device(requested,selected,profile.data(),__uuidof(ID3D12Device11));
+    constexpr std::array<UINT,18> release_profile{0x20004,0,UINT_MAX,0,0,0,UINT_MAX,UINT_MAX,0,1,0,0,0,0,0,0,0,0};
+    auto device=create_device(requested,selected,release_profile.data(),__uuidof(ID3D12Device11));
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;

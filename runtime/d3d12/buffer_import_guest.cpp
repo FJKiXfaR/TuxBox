@@ -24,7 +24,8 @@ std::string run(const wchar_t* requested, bool negative) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width=page;
-    desc.Height=desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;
+    desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;
+    desc.SampleDesc.Count=1;
     desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     if(negative){
         // A no-access reservation is deliberately non-importable. The strict
@@ -122,7 +123,8 @@ std::string layout(const wchar_t* requested, bool) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width=words*4;
-    desc.Height=desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;
+    desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;
+    desc.SampleDesc.Count=1;
     desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     std::array<ComPtr<ID3D12Resource>,2> resources;
     std::array<UINT64,2> addresses{base,base+page+4};
@@ -214,7 +216,8 @@ std::string remap(const wchar_t* requested, bool) {
     using Layout=HRESULT(WINAPI*)(ID3D12Device*,UINT64,const D3D12_RESOURCE_DESC*,D3D12_BARRIER_LAYOUT,const D3D12_CLEAR_VALUE*,REFIID,void**);
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=page;
-    desc.Height=desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;
+    desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;
+    desc.SampleDesc.Count=1;
     desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     auto make=[&](){
         ComPtr<ID3D12Resource> out;

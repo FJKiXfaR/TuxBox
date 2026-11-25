@@ -165,7 +165,8 @@ ComPtr<ID3D12Resource> screen_resource(ID3D12Device* device, D3D12_HEAP_TYPE typ
     desc.Dimension = buffer ? D3D12_RESOURCE_DIMENSION_BUFFER : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = buffer ? upload_bytes : width;
     desc.Height = buffer ? 1 : height;
-    desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
     desc.Format = buffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     auto initial = D3D12_RESOURCE_STATE_COMMON;

@@ -1,10 +1,12 @@
 import unittest
 from unittest import mock
 
+from pathlib import Path
 import struct
 import tempfile
 
-from project_tuxbox.verify import lanes_imports, private_x_server, screen_capture_problem, xauthority_entry
+from project_tuxbox.verify import (
+    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
 
 
 class PrivateXServerTests(unittest.TestCase):
@@ -62,3 +64,44 @@ class LanesImportsTests(unittest.TestCase):
                     pe[table].append({"module": desktop})
                     with self.assertRaisesRegex(ValueError, "Xbox title profile"):
                         lanes_imports(pe)
+
+
+class ProviderImportTests(unittest.TestCase):
+    def test_named_and_ordinal_expectations_match_without_export_lookup(self):
+        modules = [
+            {"module": "xmem.dll", "symbols": ["XMemAllocDefault", "XMemFreeDefault"]},
+            {"module": "GameInput.dll", "symbols": ["#1"]},
+        ]
+        with mock.patch("project_tuxbox.verify.export_table") as exports:
+            self.assertEqual(
+                missing_provider_imports(modules, Path("xmem.dll"), ("XMemAllocDefault", "XMemFreeDefault")), [])
+            self.assertEqual(missing_provider_imports(modules, Path("GameInput.dll"), ("#1",)), [])
+        exports.assert_not_called()
+
+    def test_ordinal_imports_resolve_against_provider_export_table(self):
+        modules = [
+            {"module": "XMEM.DLL", "symbols": ["#2", "#7"]},
+            {"module": "d3d12_xs.dll", "symbols": ["#10", "#13"]},
+        ]
+        tables = {
+            "xmem.dll": ({1: {"XMemAlloc"}, 2: {"XMemAllocDefault"}, 7: {"XMemFreeDefault"}}, set()),
+            "d3d12_xs.dll": ({10: {"D3D12SerializeRootSignature"}, 13: {"D3D12XboxCreateDevice"}}, set()),
+        }
+        with mock.patch("project_tuxbox.verify.export_table", side_effect=lambda path: tables[path.name]):
+            self.assertEqual(
+                missing_provider_imports(modules, Path("xmem.dll"), ("XMemAllocDefault", "XMemFreeDefault")), [])
+            self.assertEqual(
+                missing_provider_imports(
+                    modules, Path("d3d12_xs.dll"), ("D3D12SerializeRootSignature", "D3D12XboxCreateDevice")),
+                [])
+
+    def test_wrong_or_unknown_ordinals_and_missing_explicit_ordinals_fail(self):
+        modules = [
+            {"module": "xmem.dll", "symbols": ["#1", "#99"]},
+            {"module": "GameInput.dll", "symbols": ["GameInputCreate"]},
+        ]
+        with mock.patch("project_tuxbox.verify.export_table", return_value=({1: {"XMemAlloc"}}, set())):
+            self.assertEqual(
+                missing_provider_imports(modules, Path("xmem.dll"), ("XMemAllocDefault", "XMemFreeDefault")),
+                ["XMemAllocDefault", "XMemFreeDefault"])
+        self.assertEqual(missing_provider_imports(modules, Path("GameInput.dll"), ("#1",)), ["#1"])

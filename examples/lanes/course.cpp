@@ -19,7 +19,8 @@ bool matches_adapter(IDXGIAdapter1* adapter, const wchar_t* requested, std::stri
     wchar_t id[16];
     std::swprintf(id, 16, L"%04x:%04x", desc.VendorId, desc.DeviceId);
     if (requested && _wcsicmp(id, requested)) return false;
-    pci.assign(id, id + std::wcslen(id));
+    pci.clear();
+    for (const wchar_t* p = id; *p; ++p) pci.push_back(static_cast<char>(*p));
     return true;
 }
 }
