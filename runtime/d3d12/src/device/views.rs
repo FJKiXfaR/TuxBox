@@ -42,15 +42,15 @@ unsafe fn view_resource<'a, D>(
 /// cannot be imported (the title can free or remap a constant buffer while a
 /// descriptor still names it). A menu that reads zero constants draws wrong
 /// colours, but the title keeps running instead of taking the process down.
-fn fallback_constant_buffer(device: &Device) -> Option<ID3D12Resource> {
+fn fallback_host_buffer(device: &Device, bytes: u64) -> Option<ID3D12Resource> {
     use std::sync::{Mutex, OnceLock};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
-    static FALLBACK: OnceLock<Mutex<Option<(usize, ID3D12Resource)>>> = OnceLock::new();
+    static FALLBACK: OnceLock<Mutex<Vec<(usize, u64, ID3D12Resource)>>> = OnceLock::new();
     let key = core::ptr::from_ref(device) as usize;
-    let mut slot = FALLBACK.get_or_init(|| Mutex::new(None)).lock().ok()?;
-    if let Some((owner, buffer)) = slot.as_ref()
-        && *owner == key
-    {
+    let want = bytes.max(65536).next_multiple_of(65536);
+    let mut slot = FALLBACK.get_or_init(|| Mutex::new(Vec::new())).lock().ok()?;
+    if let Some((_, width, buffer)) = slot.iter().find(|(owner, width, _)| *owner == key && *width >= want) {
+        let _ = width;
         return Some(buffer.clone());
     }
     let heap = D3D12_HEAP_PROPERTIES {
@@ -62,7 +62,7 @@ fn fallback_constant_buffer(device: &Device) -> Option<ID3D12Resource> {
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: 65536,
+        Width: want,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -88,10 +88,14 @@ fn fallback_constant_buffer(device: &Device) -> Option<ID3D12Resource> {
     created.ok()?;
     let buffer = buffer?;
     crate::diagnostics::log(
-        "substituting a zero-filled host buffer for an unimportable constant buffer",
+        "substituting a zero-filled host buffer for an unimportable guest range",
     );
-    *slot = Some((key, buffer.clone()));
+    slot.push((key, want, buffer.clone()));
     Some(buffer)
+}
+
+fn fallback_constant_buffer(device: &Device) -> Option<ID3D12Resource> {
+    fallback_host_buffer(device, 65536)
 }
 
 fn log_unimportable_cbv(address: u64, size: u32, error: windows::core::HRESULT) {
@@ -366,6 +370,7 @@ pub(super) unsafe extern "system" fn address_srv(
     let mut byte_view = None;
     let buffer_view = resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
         && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER;
+    let mut fallback_import: Option<ID3D12Resource> = None;
     let imported = if desc.address != 0 && buffer_view {
         let stride = buffer_stride(&view).unwrap_or_else(|| fail_call(format_args!("unsupported address SRV format {}", view.Format.0)));
         let buffer = unsafe { view.Anonymous.Buffer };
@@ -380,17 +385,33 @@ pub(super) unsafe extern "system" fn address_srv(
             unsafe { VirtualQuery(Some(desc.address as _), &mut r, size_of_val(&r)) };
             (r.AllocationBase.addr(), r.BaseAddress.addr(), r.RegionSize, r.State.0, r.Protect.0)
         };
-        let entry = buffer_at(device, desc.address, resource_desc.Width, placement_stride, true)
-            .unwrap_or_else(|e| fail_call(format_args!("import SRV at {:#x}, {} bytes stride={stride} fmt={} first={} count={} failed {:?} ({}; region {:#x?}, placement stride {})",
-                desc.address, resource_desc.Width, view.Format.0, buffer.FirstElement, buffer.NumElements, e.code(), mode.name(), region(), placement_stride)))
-            .expect("required buffer import");
-        let offset = entry.offset(desc.address);
-        if offset.is_multiple_of(u64::from(stride)) {
-            view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
-        } else {
-            byte_view = Some((mode, offset, stride));
+        match buffer_at(device, desc.address, resource_desc.Width, placement_stride, true) {
+            Ok(Some(entry)) => {
+                let offset = entry.offset(desc.address);
+                if offset.is_multiple_of(u64::from(stride)) {
+                    view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
+                } else {
+                    byte_view = Some((mode, offset, stride));
+                }
+                Some(entry)
+            }
+            other => {
+                // The title can release a staging range while an SRV still
+                // names its guest address. Bind a zero-filled host buffer so
+                // the next draw reads defined data instead of exiting.
+                let code = match &other {
+                    Ok(_) => windows::Win32::Foundation::E_INVALIDARG,
+                    Err(error) => error.code(),
+                };
+                crate::diagnostics::log(&format!(
+                    "import SRV at {:#x}, {} bytes stride={stride} fmt={} first={} count={} failed {:?} ({}; region {:#x?}, placement stride {}); using a zero-filled substitute",
+                    desc.address, resource_desc.Width, view.Format.0, buffer.FirstElement, buffer.NumElements, code, mode.name(), region(), placement_stride
+                ));
+                fallback_import = fallback_host_buffer(device, resource_desc.Width.max(u64::from(stride) * u64::from(buffer.NumElements)));
+                view.Anonymous.Buffer.FirstElement = 0;
+                None
+            }
         }
-        Some(entry)
     } else { None };
     let existing = if buffer_view { None } else {
         device.state.texture_addresses.preceding(desc.address as usize).filter(|entry| {
@@ -410,7 +431,7 @@ pub(super) unsafe extern "system" fn address_srv(
     device.state.imported_views.store(handle.ptr, owner);
     device.state.blas.views.store(handle.ptr, None);
     device.state.placements.views.set(handle.ptr, placed.as_ref(), false);
-    let native = existing.as_ref().map(|e| &e.native).or_else(|| placed.as_ref().map(|p| &p.native)).or_else(|| imported.as_ref().map(|e| &e.native));
+    let native = existing.as_ref().map(|e| &e.native).or_else(|| placed.as_ref().map(|p| &p.native)).or_else(|| imported.as_ref().map(|e| &e.native)).or(fallback_import.as_ref());
     crate::diagnostics::display::texture_view(handle.ptr, native, Some(view.Format.0));
     if let Some((mode, offset, stride)) = byte_view {
         mode.create_srv(device, native.expect("buffer import retained"), view, offset, stride, handle)

@@ -61,7 +61,11 @@ def prepare_scarlett(executable, host):
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 return "failed", f"{source.name}: {exc}"
 
-        workers = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
+        try:
+            requested = int(os.environ.get("TUXBOX_RUNTIME_SHADER_JOBS", "") or 8)
+        except ValueError:
+            requested = 8
+        workers = ThreadPoolExecutor(max_workers=max(1, min(requested, 32, os.cpu_count() or 1)))
         try:
             pending = [workers.submit(compile_one, source) for source in sources]
             for completed, result in enumerate(as_completed(pending), 1):

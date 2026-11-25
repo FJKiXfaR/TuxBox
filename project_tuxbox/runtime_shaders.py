@@ -142,6 +142,19 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
             os.replace(marker, refusal)
             raise ShaderRefused(str(error), cached=False) from error
         target = profile.read_text()
+        # Prep-time host-code limits: a program whose translated host code cannot
+        # fit the runtime's host-code cap is marked here (instead of consuming
+        # minutes of DXC and then being substituted at run time anyway). The
+        # d3d12 runtime reads the same marker and keeps the console-native stage.
+        def mark_oversized(reason):
+            marker = work / "oversized"
+            marker.write_text(f"{key}\n{reason}\n", encoding="ascii")
+            os.replace(marker, cache / (key + ".oversized"))
+            return False
+
+        hlsl_cap = int(os.environ.get("TUXBOX_PREP_HLSL_CAP", "0") or "0")
+        if hlsl_cap and hlsl.stat().st_size > hlsl_cap:
+            return mark_oversized(f"hlsl {hlsl.stat().st_size} over {hlsl_cap}")
         # Mesh and amplification stages start at shader model 6.5. Linked
         # requests currently repack the outputs of vertex and geometry shaders.
         profiles = r"(vs|gs)_6_[016]" if linked else r"((cs|ps|vs|gs)_6_[016]|cs_6_[45]|(ms|as)_6_[56]|lib_6_3)"
@@ -159,8 +172,18 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         large = not linked and source.stat().st_size >= 8192
         if large:
             # The huge kernels need an optimised compile to stay small enough for
-            # the host backend; -O0 produces multi-megabyte DXIL that stalls it.
-            run_tool([dxc, "-T", target, *entry, "-O1", "-Fo", output, hlsl], timeout=600)
+            # the host backend, but a few of them sit in -O1 optimisation for many
+            # minutes (the title blocks on the result). Bound that wait and fall
+            # back to -O0, which the driver optimises again when it builds the
+            # pipeline; a pathological -O0 result is refused by the backend far
+            # more cheaply than a ten minute stall.
+            try:
+                run_tool([dxc, "-T", target, *entry, "-O1", "-Fo", output, hlsl],
+                         timeout=int(os.environ.get("TUXBOX_DXC_O1_TIMEOUT_SECS", "90") or 90))
+            except subprocess.TimeoutExpired:
+                output.unlink(missing_ok=True)
+                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl],
+                         timeout=int(os.environ.get("TUXBOX_DXC_O0_TIMEOUT_SECS", "180") or 180))
         else:
             try:
                 run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
@@ -170,6 +193,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         run_tool([dxv, output], timeout=10)
         if not has_dxil_container(output.read_bytes()):
             raise ValueError("compiler returned an invalid DXIL container")
+        dxil_cap = int(os.environ.get("TUXBOX_PREP_DXIL_CAP", "0") or "0")
+        if dxil_cap and output.stat().st_size > dxil_cap:
+            return mark_oversized(f"dxil {output.stat().st_size} over {dxil_cap}")
         stamp = work / "sha256"
         stamp.write_text(digest(output))
         if session is not None:
@@ -319,7 +345,12 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
 
     # Shader translation is CPU bound and the driver compiler keeps the GPU idle;
     # a small worker pool keeps the title's pipeline requests moving.
-    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="shader-compile") as pool:
+    def worker_count(default):
+        try:
+            return max(1, min(int(os.environ.get("TUXBOX_RUNTIME_SHADER_JOBS", "") or default), 32))
+        except ValueError:
+            return default
+    with ThreadPoolExecutor(max_workers=worker_count(8), thread_name_prefix="shader-compile") as pool:
         while not stop.is_set():
             directory = session / "requests"
             requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]

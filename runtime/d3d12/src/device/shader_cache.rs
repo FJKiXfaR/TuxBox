@@ -285,7 +285,63 @@ pub(super) fn ray_library(bytes: &[u8], source: &str) -> Option<Vec<u8>> {
     library
 }
 
+
+/// The runtime cache directory of this session's compiler, where the launcher
+/// publishes translations and prep-time "oversized" markers.
+fn runtime_cache_dir() -> Option<std::path::PathBuf> {
+    let name = std::env::var("TUXBOX_SHADER_SESSION").ok()?;
+    if !name.starts_with("run-") || !name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+        return None;
+    }
+    let session = std::env::temp_dir().join("tuxbox_shader_cache").join(name);
+    let id = std::fs::read_to_string(session.join("compiler-id")).ok()?;
+    let id = id.trim();
+    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(session.parent()?.join("runtime").join(id))
+}
+
+/// Whether prep decided this program's host code cannot fit the runtime's
+/// host-code cap (the `.oversized` marker the launcher writes next to the
+/// compiled entries). Such a program keeps its console-native stage and the
+/// pipeline falls back instead of burning minutes of driver-compiler time.
+fn marked_oversized(source: &str) -> bool {
+    runtime_cache_dir().is_some_and(|dir| dir.join(format!("{source}.oversized")).is_file())
+}
+
+/// Programs prep has translated must be used even when they are large; only
+/// unprepared console programs above the safety limit are refused, so the title
+/// never blocks on a multi-minute translation at run time.
+fn skip_large_console(shader: &[u8]) -> bool {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let Some(source) = source_digest(shader) else { return false };
+    if marked_oversized(&source) && !compile::cached_exists(&source) {
+        LOGGED.call_once(|| {
+            crate::diagnostics::log(
+                "console program marked oversized by shader preparation; keeping the fallback pipeline",
+            );
+        });
+        return true;
+    }
+    let Some(limit) = std::env::var("TUXBOX_SKIP_CONSOLE_SHADER_KB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value != 0)
+    else { return false };
+    if shader.len() <= limit.saturating_mul(1024) || !is_xbox_native(shader) || compile::cached_exists(&source) {
+        return false;
+    }
+    LOGGED.call_once(|| {
+        crate::diagnostics::log(&format!(
+            "no prepared translation for a console program over {limit} KiB; keeping the fallback pipeline"
+        ));
+    });
+    true
+}
+
 pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
+    if skip_large_console(shader) { return None; }
     match shader_code(shader)? {
         (stage, ShaderCode::Xbox) => translate(shader, stage),
         (stage, ShaderCode::Portable) if is_console_dxil(shader) => {
@@ -384,6 +440,7 @@ pub(super) fn mesh_stage(
 }
 
 fn translate(shader: &[u8], stage: Stage) -> Option<Vec<u8>> {
+    if skip_large_console(shader) { return None; }
     let source = source_digest(shader)?;
     let cached = read_portable("by_source", &source, stage);
     // `TUXBOX_TRACE_SHADER_DIGEST=<prefix>`: trace one program's cache path.

@@ -65,6 +65,15 @@ fn cached_translation(cache: &Path, key: &str, stage: Stage) -> Option<Vec<u8>> 
     (source_digest(&bytes)?.as_bytes() == expected).then_some(bytes)
 }
 
+/// Whether the launcher has already published a translation for `key` in the
+/// runtime cache of this session's compiler.
+pub(super) fn cached_exists(key: &str) -> bool {
+    let Some(session) = session() else { return false };
+    let Some(cache) = compiler_cache(session) else { return false };
+    cache.join(format!("{key}.cso")).is_file()
+        && cache.join(format!("{key}.sha256")).is_file()
+}
+
 fn cached_refusal(cache: &Path, key: &str) -> bool {
     let Ok(file) = fs::File::open(cache.join(format!("{key}.unsupported"))) else {
         return false;
