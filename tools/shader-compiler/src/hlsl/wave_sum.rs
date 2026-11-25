@@ -889,8 +889,9 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         let lane_local = matches!(i.mnemonic.as_str(),
             "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32"
             | "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_lshlrev_b32"
-            | "v_lshrrev_b32" | "v_mul_lo_u32" | "v_add_f32" | "v_mul_f32"
+            | "v_lshrrev_b32" | "v_mul_lo_u32" | "v_add_f32" | "v_mul_f32" | "v_ldexp_f32"
             | "s_mov_b32" | "s_movk_i32" | "s_add_u32" | "s_sub_u32"
+            | "s_getpc_b64" | "s_lshl_b32" | "s_bitcmp0_b32" | "s_bitcmp1_b32" | "s_cselect_b32"
             | "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_gt_u32" | "s_cmp_ge_u32"
             | "s_cmp_lt_u32" | "s_cmp_le_u32" | "s_cmp_eq_i32" | "s_cmp_lg_i32"
             | "s_cmp_gt_i32" | "s_cmp_ge_i32" | "s_cmp_lt_i32" | "s_cmp_le_i32")
@@ -1208,6 +1209,30 @@ mod tests {
             let multi = super::super::translate(&shader).unwrap();
             assert_eq!(multi.required_wave_size, Some(64));
         }
+    }
+
+    #[test]
+    fn portable_wave_can_scale_its_result_from_an_embedded_table() {
+        let (mut shader, mut words, end) = fixture::shader(64);
+        words.truncate(end);
+        words.extend([
+            0xbe9a1f00, 0xbf0d8005, 0x851c8084, // GETPC; bit-test group ID; choose offset 4 or 0
+            0xf400074d, 0x38000028, 0xbf8cc07f, // load exponent into s29 and wait
+            0x7e0c0207, 0xd7620006, 0x00003b06, // move reduction result s7; LDEXP v6,v6,s29
+            0x8f1e8805, 0xbf810000,             // scale group ID for output addressing; endpgm
+        ]);
+        shader.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        shader.isa_data = shader.isa.clone();
+        shader.isa_data.extend([u32::MAX, 2].into_iter().flat_map(u32::to_le_bytes));
+        assert_eq!(super::super::translate(&shader).unwrap().required_wave_size, None);
+        shader.isa_preamble = [0, 128, 1, 1];
+        assert_eq!(super::super::translate(&shader).unwrap().required_wave_size, Some(64));
+
+        let mut ops = crate::rdna2::disassemble(&shader.isa);
+        super::super::lower_wave_reductions(&mut ops).unwrap();
+        let load = ops.iter_mut().find(|i| i.mnemonic == "s_load_dword").unwrap();
+        load.raw[1] &= 0x01ffffff; // SOFFSET s0 would expose the saved EXEC mask.
+        assert!(!portable_single_wave(&ops));
     }
 
     #[test]

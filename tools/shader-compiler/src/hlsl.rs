@@ -1433,10 +1433,18 @@ fn may_touch_sgpr(o: &Opnd, n: u8) -> bool {
 /// vector lane-mask sources, and descriptor or address bases of memory operations.
 fn reads_sgpr(ins: &Insn, n: u8) -> bool {
     let m = ins.mnemonic.as_str();
+    // GETPC has no source. Its unused SOP1 source field decodes as s0.
+    if m == "s_getpc_b64" { return false; }
+    // Scalar loads encode their offset register separately from the base operands.
+    if ins.enc == Enc::Smem && n <= 105 && ins.raw.get(1).is_some_and(|w| w >> 25 == u32::from(n)) {
+        return true;
+    }
     let memory = if m.starts_with("image_") { 8 }
         else if m.starts_with("s_buffer") || m.starts_with("buffer_") || m.starts_with("tbuffer_") { 4 }
         else if m.starts_with("s_load") || m.starts_with("global_") { 2 } else { 0 };
     ins.src.iter().enumerate().any(|(i, o)| {
+        // VOP3 decodes three source fields; LDEXP uses only the value and exponent.
+        if m == "v_ldexp_f32" && i == 2 { return false; }
         let Opnd::Sgpr(k) = *o else { return false };
         let width: u16 = if memory != 0 { memory } else if m.starts_with("s_") && (m.ends_with("64") || m.contains("saveexec_b64")) { 2 }
             else if m.starts_with("v_") && i >= 2 { 2 } else { 1 };
