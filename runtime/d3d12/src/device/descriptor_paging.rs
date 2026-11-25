@@ -311,10 +311,15 @@ impl Arena {
             index
         } else {
             let index = tables.used;
-            let end = index
-                .checked_add(length)
-                .filter(|&n| n <= self.limit)
-                .ok_or(E_OUTOFMEMORY)?;
+            let Some(end) = index.checked_add(length).filter(|&n| n <= self.limit) else {
+                // Slots are never reclaimed, so say how the heap filled.
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                crate::diagnostics::log_once(&FIRST, || format!(
+                    "descriptor arena full: {index} of {} shader-visible slots used by {} tables, {length} more needed",
+                    self.limit, tables.ranges.len()
+                ));
+                return Err(E_OUTOFMEMORY.into());
+            };
             if !self.inline {
                 self.copy(first, index, length);
             }

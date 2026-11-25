@@ -512,6 +512,8 @@ struct PendingWrite {
     texture: Weak<Texture>,
     range: Range<u64>,
     published: ID3D12Fence,
+    /// The writing queue's reader fence, which `published` follows.
+    reader: ID3D12Fence,
     tick: u64,
 }
 
@@ -524,6 +526,47 @@ impl Texture {
     fn range(&self) -> Range<u64> {
         // The entire range was checked during construction.
         self.address..self.address + self.size
+    }
+}
+
+/// Queue work that sits behind a title fence label wait. Another queue must not
+/// be made to wait for it: the label may be written by that other queue, so the
+/// two would wait on each other until the title's GPU watchdog fired. The title
+/// orders this work itself with its labels and fences.
+pub(crate) mod held {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
+    use windows::core::Interface;
+
+    /// The label waits of one batch that are not yet released.
+    pub(crate) type Waits = Arc<AtomicUsize>;
+
+    /// Reader fence, the first value behind the waits, and the waits.
+    static HELD: Mutex<Vec<(usize, u64, Waits)>> = Mutex::new(Vec::new());
+
+    pub(super) fn register(reader: &ID3D12Fence, tick: u64, waits: &Waits) {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((reader.as_raw().addr(), tick, waits.clone()));
+    }
+
+    /// Whether `reader` reaching `value` needs a label wait to be released.
+    pub(super) fn blocked(reader: &ID3D12Fence, value: u64) -> bool {
+        let key = reader.as_raw().addr();
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        held.retain(|(_, _, waits)| waits.load(Ordering::Acquire) != 0);
+        let blocked = held.iter().any(|(fence, tick, _)| *fence == key && value >= *tick);
+        if blocked {
+            static COUNT: AtomicUsize = AtomicUsize::new(0);
+            let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 8 || count.is_power_of_two() {
+                crate::diagnostics::log(&format!(
+                    "texture dependency on work behind a label wait left to the title (#{count})"
+                ));
+            }
+        }
+        blocked
     }
 }
 
@@ -555,6 +598,7 @@ pub(crate) unsafe fn submit(
     textures: &mut Vec<Arc<Texture>>,
     writes: &mut Vec<Arc<Texture>>,
     heaps: &[Range<usize>],
+    holds: Option<held::Waits>,
     execute: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let device = unsafe { &*device.cast::<Device>() };
@@ -565,7 +609,9 @@ pub(crate) unsafe fn submit(
         .try_reserve(writes.len())
         .map_err(|_| E_OUTOFMEMORY)?;
     textures.extend(writes.iter().cloned());
-    if textures.is_empty() {
+    // A batch with label waits is tracked even without textures, since this
+    // queue's later work sits behind it.
+    if textures.is_empty() && holds.is_none() {
         return execute();
     }
     unique(textures);
@@ -623,7 +669,10 @@ pub(crate) unsafe fn submit(
             }
             // CPU bytes still contain the old version. The native image contains
             // the ordered GPU write and can be read directly by the next batch.
-            unsafe { queue.Wait(&write.published, write.tick)? };
+            if !held::blocked(&write.reader, write.tick) {
+                unsafe { queue.Wait(&write.published, write.tick)? };
+                crate::commands::queue_trace::waited(queue, "wait for an earlier texture publication", &write.published, write.tick);
+            }
             pending = true;
         }
         if !pending {
@@ -640,11 +689,16 @@ pub(crate) unsafe fn submit(
         .unwrap_or(0);
     if unsafe { transfer.fence.GetCompletedValue() } < required {
         unsafe { queue.Wait(&transfer.fence, required)? };
+        crate::commands::queue_trace::waited(queue, "wait for texture uploads", &transfer.fence, required);
     }
     for texture in writes.iter() {
         for (fence, value) in &lock(&texture.contents).readers {
-            if fence != reader && unsafe { fence.GetCompletedValue() } < *value {
+            if fence != reader
+                && unsafe { fence.GetCompletedValue() } < *value
+                && !held::blocked(fence, *value)
+            {
                 unsafe { queue.Wait(fence, *value)? };
+                crate::commands::queue_trace::waited(queue, "wait for another queue's texture reads", fence, *value);
             }
         }
     }
@@ -661,6 +715,9 @@ pub(crate) unsafe fn submit(
             writeback::Readback::record(&device.native, unsafe { queue.GetDesc() }.Type, writes)?;
         Some((worker, readback))
     };
+    if let Some(waits) = &holds {
+        held::register(reader, tick, waits);
+    }
     execute()?;
     if let Some((_, readback)) = &publication {
         // Separate ExecuteCommandLists calls allow simultaneous-access textures
@@ -691,11 +748,13 @@ pub(crate) unsafe fn submit(
             transfer.failed = Some(error.code());
             return Err(error);
         }
+        crate::commands::queue_trace::waited(queue, "wait for this batch's texture publication", &worker.published, tick);
         for texture in writes.iter() {
             submission.writes.push(PendingWrite {
                 texture: Arc::downgrade(texture),
                 range: texture.range(),
                 published: worker.published.clone(),
+                reader: reader.clone(),
                 tick,
             });
         }

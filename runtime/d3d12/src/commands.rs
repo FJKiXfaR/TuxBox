@@ -24,6 +24,7 @@ mod descriptors;
 mod graphics;
 mod copy_memory;
 pub(crate) mod list_memory;
+pub(crate) mod queue_trace;
 mod media;
 mod memory_wait;
 pub(crate) mod page_mapping;
@@ -1449,6 +1450,8 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
     crate::device::snapshot_cbv_mirrors();
     let mut list_index = 0;
     let trace_samples = std::cell::RefCell::new(Vec::new());
+    // The lists in this batch that write or wait on fence labels.
+    let batch = std::cell::RefCell::new(String::new());
     let result = translate_batch(
         guest,
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), memory_wait::Splits::new()),
@@ -1480,6 +1483,10 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                 memory_wait::Fate::Submitted(queue.state.kind.0),
                 &state.labels,
             );
+            if !state.labels.is_empty() {
+                use std::fmt::Write;
+                let _ = write!(batch.borrow_mut(), " {:#x}", ptr::from_ref(list).addr());
+            }
             splits.try_reserve(state.prefix.segments.len()).map_err(|_| E_OUTOFMEMORY)?;
             splits.extend(state.prefix.segments.iter().map(|s| (list_index, s.clone())));
             list_index += 1;
@@ -1500,6 +1507,9 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
             Ok(list.native.as_raw())
         },
         |host, (mut textures, mut writes, shader_views, scene_lists, splits)| {
+            let holds = (!splits.is_empty())
+                .then(|| placement::held::Waits::new(splits.len().into()));
+            let waits = holds.clone();
             unsafe {
                 placement::submit(
                     parent(&queue.parent),
@@ -1508,6 +1518,7 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                     &mut textures,
                     &mut writes,
                     &shader_views,
+                    holds,
                     || {
                         // Placement dependencies are settled. Publish scene writes and
                         // snapshot each instance table in recorded order across lists.
@@ -1523,7 +1534,13 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                                 command.prepare(list)?;
                             }
                         }
-                        memory_wait::submit(queue, host, splits)?;
+                        memory_wait::submit(queue, host, splits, waits)?;
+                        queue_trace::note(
+                            &queue.native,
+                            queue.state.kind.0,
+                            format!("batch of {count} lists, with labels:{}", batch.borrow()),
+                            None,
+                        );
                         if !trace_samples.borrow().is_empty() {
                             let mut device: Option<ID3D12Device> = None;
                             queue.native.GetDevice(&mut device)?;
@@ -1590,6 +1607,14 @@ unsafe extern "system" fn queue_fence<const WAIT: bool>(
         queue.native.vtable().Signal
     };
     let status = unsafe { method(queue.native.as_raw(), fence.as_raw(), value) };
+    if status.is_ok() {
+        queue_trace::note(
+            &queue.native,
+            queue.state.kind.0,
+            if WAIT { "title wait".into() } else { "title signal".into() },
+            Some((fence.clone(), value)),
+        );
+    }
     if !WAIT && status.is_ok() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || format!(

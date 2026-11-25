@@ -262,10 +262,8 @@ pub(super) unsafe extern "system" fn single(
     postbuild: *const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC,
 ) {
     if desc.is_null() || (postbuild_count != 0 && postbuild.is_null()) {
-        let mut state = recording(list);
-        if state.can_record(&list.native) {
-            state.error = E_INVALIDARG;
-        }
+        // The BVH builder sends this for a build it cannot express.
+        super::Recording::skip("acceleration structure build: missing description", E_INVALIDARG);
         return;
     }
     let entry = Entry {
@@ -342,13 +340,24 @@ unsafe fn record_builds(
         state.error = E_INVALIDARG;
         return;
     }
-    if let Err(error) = outputs
+    // Build without any size report TuxBox cannot produce.
+    let outputs: Vec<_> = outputs
         .iter()
-        .try_for_each(super::raytracing::validate_size_output)
-    {
-        state.error = error.code();
-        return;
-    }
+        .filter(|output| match super::raytracing::validate_size_output(output) {
+            Ok(()) => true,
+            Err(error) => {
+                super::Recording::skip(
+                    &format!(
+                        "acceleration structure report type {} at {:#x}",
+                        output.InfoType.0, output.DestBuffer
+                    ),
+                    error.code(),
+                );
+                false
+            }
+        })
+        .copied()
+        .collect();
     let entries = unsafe { core::slice::from_raw_parts(entries, count as usize) };
     let Some(owner) = &list.parent else {
         state.error = E_INVALIDARG;
@@ -396,7 +405,7 @@ unsafe fn record_builds(
             });
         }
         unsafe {
-            host.BuildRaytracingAccelerationStructure(&build, Some(outputs));
+            host.BuildRaytracingAccelerationStructure(&build, (!outputs.is_empty()).then_some(outputs.as_slice()));
             let guest_va = entry.build.DestAccelerationStructureData;
             let native_va = build.DestAccelerationStructureData;
             let command =

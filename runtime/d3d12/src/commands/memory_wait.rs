@@ -359,10 +359,20 @@ pub(super) unsafe extern "system" fn wait_value64(
     }
 }
 
+/// Waits the queue workers are polling right now: queue type, label, target.
+static ACTIVE: std::sync::Mutex<Vec<(i32, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn active() -> std::sync::MutexGuard<'static, Vec<(i32, u64, u64)>> {
+    ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct Job {
+    kind: i32,
     fence: ID3D12Fence,
     segment: Arc<Segment>,
     device: ID3D12Device,
+    /// Unreleased label waits of the batch this one belongs to.
+    waits: Option<crate::device::placement::held::Waits>,
 }
 
 pub(super) struct Worker(mpsc::Sender<Job>);
@@ -377,6 +387,8 @@ impl Worker {
                     let result = (|| -> Result<()> {
                         unsafe { job.fence.SetEventOnCompletion(1, HANDLE::default())? };
                         let started = std::time::Instant::now();
+                        let held = (job.kind, job.segment.address, job.segment.target);
+                        active().push(held);
                         while !job.segment.word.reached(job.segment.target) {
                             unsafe {
                                 job.device.GetDeviceRemovedReason()?;
@@ -390,7 +402,15 @@ impl Worker {
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }
+                        let mut waiting = active();
+                        if let Some(at) = waiting.iter().position(|&w| w == held) {
+                            waiting.swap_remove(at);
+                        }
+                        drop(waiting);
                         unsafe { job.fence.Signal(2)?; }
+                        if let Some(waits) = &job.waits {
+                            waits.fetch_sub(1, Ordering::AcqRel);
+                        }
                         static FIRST: std::sync::Once = std::sync::Once::new();
                         crate::diagnostics::log_once(&FIRST, || format!(
                             "GPU memory wait completed target={:#x}", job.segment.target
@@ -427,14 +447,30 @@ fn report_stall(address: u64, target: u64, value: u64) {
             STALL.as_secs()
         ));
     }
-    if count <= 8 {
+    if count == 1 {
+        // The first stall shows the whole knot: every held queue and, for
+        // each, the lists that should release it.
+        super::queue_trace::report();
+        let held = active().clone();
+        for (kind, address, target) in held {
+            crate::diagnostics::log(&format!(
+                "held queue of type {kind}: waiting for {address:#x} >= {target:#x}"
+            ));
+            explain(address, target);
+        }
+    } else if count <= 8 {
         explain(address, target);
     }
 }
 
 pub(super) type Splits = Vec<(usize, Arc<Segment>)>;
 
-pub(super) unsafe fn submit(queue: &Queue, host: &[*mut c_void], splits: Splits) -> Result<()> {
+pub(super) unsafe fn submit(
+    queue: &Queue,
+    host: &[*mut c_void],
+    splits: Splits,
+    waits: Option<crate::device::placement::held::Waits>,
+) -> Result<()> {
     let run = |lists: &[*mut c_void]| {
         if !lists.is_empty() {
             unsafe {
@@ -474,13 +510,16 @@ pub(super) unsafe fn submit(queue: &Queue, host: &[*mut c_void], splits: Splits)
         worker
             .0
             .send(Job {
+                kind: queue.state.kind.0,
                 fence: fence.clone(),
                 segment,
                 device,
+                waits: waits.clone(),
             })
             .map_err(|_| E_FAIL)?;
         unsafe {
             queue.native.Wait(&fence, 2)?;
+            super::queue_trace::waited(&queue.native, "hold for a title fence label", &fence, 2);
         }
     }
     run(&host[start..]);

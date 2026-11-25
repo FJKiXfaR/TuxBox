@@ -93,9 +93,12 @@ impl Transfer {
             // replacement writes after every outstanding reader of this texture.
             let contents = lock(&mips[0].texture.contents);
             for (fence, value) in &contents.readers {
-                if unsafe { fence.GetCompletedValue() } < *value {
+                if unsafe { fence.GetCompletedValue() } < *value
+                    && !super::held::blocked(fence, *value)
+                {
                     unsafe {
                         self.queue.Wait(fence, *value)?;
+                        crate::commands::queue_trace::waited(&self.queue, "upload waits for texture reads", fence, *value);
                     }
                 }
             }

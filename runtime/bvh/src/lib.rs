@@ -99,20 +99,26 @@ unsafe extern "system" fn tuxbox_bvh_batch(
     count: u32,
     entries: *const Entry,
 ) {
-    if count == 0 {
+    if count == 0 || entries.is_null() {
         return;
     }
-    if !entries.is_null() {
-        let entries = unsafe { core::slice::from_raw_parts(entries, count as usize) };
-        if entries.iter().all(|entry| entry.extra == [0; 4]) {
-            for entry in entries {
-                unsafe { tuxbox_bvh_build(this, list, &entry.build, 0, core::ptr::null()) };
-            }
-            return;
+    let entries = unsafe { core::slice::from_raw_parts(entries, count as usize) };
+    for entry in entries {
+        // `extra` holds the postbuild count and array, then the size and
+        // address of an Xbox extension stream.
+        let [post_count, post, stream_bytes, stream] = entry.extra;
+        if stream_bytes != 0 && stream != 0 {
+            // Desktop DXR cannot express the stream. A missing description
+            // makes the provider skip and report this one build.
+            unsafe { tuxbox_bvh_build(this, list, core::ptr::null(), 0, core::ptr::null()) };
+            continue;
         }
+        let post_count = post_count as u32;
+        let post = if post_count == 0 { 0 } else { post };
+        unsafe {
+            tuxbox_bvh_build(this, list, &entry.build, post_count, post as usize as *const Post)
+        };
     }
-    // A void recording call reports unsupported inputs at Close.
-    unsafe { tuxbox_bvh_build(this, list, core::ptr::null(), 0, core::ptr::null()) };
 }
 
 #[unsafe(no_mangle)]
