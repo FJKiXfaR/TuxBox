@@ -37,6 +37,15 @@ class ScalarOracle(unittest.TestCase):
         self.assertEqual(self.state([encode("s_ff0_i32_b64",2,2)],[MASK,MASK]+[0]*6,1),
                          [MASK,MASK]+[0]*6+[1])
 
+    def test_trace_records_each_instruction_and_condition_code(self):
+        trace = []
+        words = initialize([MASK]+[0]*7,0)+[encode("s_add_u32",2,2,129),END]
+        result = execute(words, trace)
+        self.assertEqual(trace[-1]["instruction"],"s_add_u32")
+        self.assertEqual(trace[-1]["registers"],result[:-1])
+        self.assertEqual(trace[-1]["scc"],1)
+        self.assertIsNone(trace[0]["registers"][1])
+
     def test_unknown_and_uninitialized_fail_closed(self):
         for words in ([END,END],[0xbf820000,END],[0xbe82037e,END],[0xbe8203ff],
                       [0xbe820403,END],[0xbe820302,END],[0xffffffff,END]):

@@ -138,7 +138,7 @@ def decode(words):
     raise ValueError("missing endpgm")
 
 
-def execute(words):
+def execute(words, trace=None):
     """Return s2..s9 and SCC, using arbitrary precision integer arithmetic."""
     regs = {}
     scc = None
@@ -233,6 +233,35 @@ def execute(words):
             regs[ins.dst] = result & MASK
             if dw == 2:
                 regs[ins.dst+1] = (result >> 32) & MASK
+        if trace is not None:
+            trace.append({"instruction": ins.name, "dst": ins.dst, "src0": ins.a,
+                          "src1": ins.b, "literal": ins.literal,
+                          "registers": [regs.get(r) for r in REGS], "scc": scc})
     if set(regs) != set(REGS) or scc is None:
         raise ValueError("incomplete observable state")
     return [regs[r] for r in REGS] + [scc]
+
+def main():
+    import argparse
+    import json
+    from pathlib import Path
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("programs", type=Path, help="generated programs.txt")
+    parser.add_argument("--case", required=True, help="exact six-digit case identifier")
+    args = parser.parse_args()
+    if len(args.case) != 6 or not args.case.isascii() or not args.case.isdigit():
+        parser.error("invalid case ID")
+    with args.programs.open(encoding="utf-8") as stream:
+        matches = [line.split()[1:] for line in stream if line.split()[:1] == [args.case]]
+    if len(matches) != 1:
+        parser.error("case absent or duplicated")
+    words = [int(word,16) for word in matches[0]]
+    trace = []
+    result = execute(words, trace)
+    print(json.dumps({"case":args.case,"words":[f"{word:08x}" for word in words],
+                      "register_order":[f"s{reg}" for reg in REGS]+["scc"],
+                      "result":result,"trace":trace},indent=2))
+
+
+if __name__ == "__main__":
+    main()
