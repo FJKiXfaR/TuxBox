@@ -127,3 +127,26 @@ class DiagnosisTests(unittest.TestCase):
             STAMP+f"Xbox shader {k}_{'b'*64}_{'c'*64}: xshader failed (1): test"])["sessions"][0]
         self.assertEqual(s["unique_shader_requests"],3)
         self.assertEqual(s["last_observed_shader_status"],{"compiled":1,"refused":1,"failed":1})
+
+
+class BrunoLogRegressionTests(unittest.TestCase):
+    def test_compute_samples_and_last_repeated_milestone(self):
+        h = "a" * 32
+        k = "b" * 32
+        lines = [D3D+"recorded DrawIndexedInstanced list=0x12 indices=30 instances=1",
+                 D3D+"PresentX presented first frame (3840x2160)",
+                 D3D+f"compute pipeline creation failed (0x80070057, 100 bytes, DXBC {h}, chunks DXIL)",
+                 D3D+f"compute pipeline creation failed (0x80070057, 100 bytes, DXBC {h}, chunks DXIL)",
+                 D3D+f"compute pipeline creation failed (0x80070057, 100 bytes, DXBC {k}, chunks DXIL)",
+                 D3D+"recorded DrawIndexedInstanced list=0x13 indices=30 instances=1"]
+        with TemporaryDirectory() as tmp:
+            p=Path(tmp)/"run.log"
+            p.write_text("\n".join(lines)+"\n")
+            session=analyze(p)["sessions"][0]
+        self.assertEqual(session["last_milestone"],"first_present")
+        self.assertEqual(session["last_observed_milestone"]["kind"],"raster_draw")
+        self.assertEqual(session["last_observed_milestone"]["line"],6)
+        self.assertEqual(session["runtime_counters"]["sampled_compute_failures_by_hresult"],
+                         [{"hresult":"0x80070057","log_events":3,"distinct_dxbc_hashes":2}])
+        self.assertNotIn(h,json.dumps(session))
+        self.assertNotIn(k,json.dumps(session))

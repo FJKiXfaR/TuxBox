@@ -107,6 +107,9 @@ class Session:
         self.terminal = None
         self.null_pipeline_lower_bounds = {}
         self.cached_skip_lower_bound = 0
+        self.compute_failure_hashes = {}
+        self.compute_failure_samples = Counter()
+        self.last_observed_milestone = None
         self.stage_link_status = Counter()
         self.stage_pairs = set()
         self.allocation_sizes = Counter()
@@ -114,6 +117,7 @@ class Session:
 
     def mark(self, ev):
         self.milestones.setdefault(ev["kind"], ev)
+        self.last_observed_milestone = ev
 
     def finding(self, ev):
         key = (ev["kind"], ev.get("code"), ev.get("detail", {}).get("rva"), ev.get("detail", {}).get("slot"), ev.get("detail", {}).get("library"))
@@ -158,6 +162,11 @@ class Session:
                 found = re.match(pattern, detail)
                 if found:
                     self.finding(event(kind, number, time, code=found[1].lower() if found.lastindex else None))
+            # Sampled diagnostics, not complete failure totals. Never export shader hashes.
+            if m := re.match(r"compute pipeline creation failed \((0x[0-9a-fA-F]{8}), \d+ bytes, DXBC ([0-9a-fA-F]{32})(?:,|\))", detail):
+                code = m[1].lower()
+                self.compute_failure_samples[code] += 1
+                self.compute_failure_hashes.setdefault(code, set()).add(m[2].lower())
             if m := re.match(r"substituted null (compute|raster stream) pipeline for an untranslated shader \(\d+ so far\)", detail):
                 count = int(re.search(r"\d+", m[0])[0])
                 self.null_pipeline_lower_bounds[m[1]] = max(count, self.null_pipeline_lower_bounds.get(m[1], 0))
@@ -227,12 +236,16 @@ class Session:
                 "timestamp_order_reversed": self.clock_reversed, "outcome":outcome,
                 "terminal":last, "milestones":ordered,
                 "last_milestone":ordered[-1]["kind"] if ordered else None,
+                "last_observed_milestone":self.last_observed_milestone,
                 "findings":findings, "investigation_order":investigation, "shader_events":dict(self.shader_events),
                 "last_observed_shader_status":dict(Counter(self.shaders.values())),
                 "unique_shader_requests":len(self.shaders),
                 "runtime_counters": {
                     "null_pipeline_reported_lower_bounds": dict(self.null_pipeline_lower_bounds),
                     "cached_unsupported_skip_lower_bound": self.cached_skip_lower_bound,
+                    "sampled_compute_failures_by_hresult": [
+                        {"hresult": code, "log_events": count, "distinct_dxbc_hashes": len(self.compute_failure_hashes[code])}
+                        for code,count in sorted(self.compute_failure_samples.items())],
                     "sampled_stage_link_status": dict(self.stage_link_status),
                     "sampled_distinct_stage_pairs": len(self.stage_pairs),
                     "allocation_attempts_by_type_and_result": [
