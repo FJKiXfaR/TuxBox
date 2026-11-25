@@ -272,21 +272,24 @@ fn bounded_runtime_code_offset_uses_real_table_index_without_modulo() {
 }
 
 #[test]
-fn scalar_or_indexes_an_embedded_table_only_when_all_words_fit() {
-    // getpc s[8:9]; and s10,s12,12; or s10,s10,16;
-    // load s16 from PC + 20 + s10. The possible byte offsets are 16, 20, 24 and 28.
-    let mut words = [0xbe881f00, 0x870a8c0c, 0x880a900a, 0xf4000404, 0x14000014, 0xbf810000];
-    let translate = |words: &[u32], table_words: usize| {
-        let mut ex = compute_extract(words);
-        ex.isa_data.extend((0..table_words as u32).flat_map(u32::to_le_bytes));
+fn bounded_bitwise_offsets_index_only_complete_aligned_tables() {
+    // getpc s[8:9]; and s10,s12,12; combine s10 with a mask;
+    // load s16 from PC + 20 + s10. Both masks select bytes 16, 20, 24 and 28.
+    let translate = |combine: u32, table_words: u32| {
+        let words = [0xbe881f00, 0x870a8c0c, combine, 0xf4000404, 0x14000014, 0xbf810000];
+        let mut ex = compute_extract(&words);
+        ex.isa_data.extend((0..table_words).flat_map(u32::to_le_bytes));
         super::translate(&ex)
     };
-    assert!(translate(&words, 8).is_ok());
-    assert!(translate(&words, 7).is_err());
-    words[2] = 0x880a810a; // OR 1 makes the address unaligned.
-    assert!(translate(&words, 8).is_err());
-    words[2] = 0x880a0d0a; // OR s13 can set arbitrary bits.
-    assert!(translate(&words, 8).is_err());
+    // OR 16 sets the bank bit. XOR 20 also flips a bit that varies with the index.
+    for combine in [0x880a900a, 0x890a940a] {
+        assert!(translate(combine, 8).is_ok());
+        assert!(translate(combine, 7).is_err());
+    }
+    for combine in [0x880a810a, 0x890a810a, 0x880a0d0a, 0x890a0d0a] {
+        // An immediate 1 makes the offset unaligned. An unconstrained s13 can exceed the table.
+        assert!(translate(combine, 8).is_err());
+    }
 }
 
 fn bounded_cbv_fixture() -> ShaderExtract {
@@ -335,6 +338,20 @@ fn bounded_dynamic_cbv_descriptors_select_only_reflected_slots() {
     let mut bad = bounded_cbv_fixture();
     bad.isa[4..8].copy_from_slice(&0x8f0a840au32.to_le_bytes());
     assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+}
+
+#[test]
+fn xor_flips_the_dynamic_cbv_slot_within_the_reflected_range() {
+    let mut ex = bounded_cbv_fixture();
+    // The existing selector is 0 or 32. XOR 32 swaps the two descriptors.
+    ex.isa.splice(8..8, 0x890aa00au32.to_le_bytes());
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.resolve_resources().unwrap();
+    assert_eq!(em.dsel_runtime.get(&3), Some(&(16, 4, 10, 0)));
+    assert_eq!(em.bsel.get(&4).unwrap().1.len(), 2);
+
+    ex.resources[0].upper = 0;
+    assert!(Emitter::new(&ex, disassemble(&ex.isa)).resolve_resources().is_err());
 }
 
 #[test]
