@@ -952,7 +952,7 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Option<u32>, String> {
         let saved_extrema = matches!(red.as_str(), "v_min_f32" | "v_max_f32")
             && (first.checked_sub(3).is_some_and(|p| matches!(insns[p].mnemonic.as_str(), "s_or_saveexec_b32" | "s_or_saveexec_b64"))
                 || wave_sum::masked_floating(insns, first));
-        if matches!(red.as_str(), "v_add_nc_u32" | "v_min_u32" | "v_max_u32" | "v_add_f32" | "v_and_b32" | "v_or_b32") || saved_extrema {
+        if matches!(red.as_str(), "v_add_nc_u32" | "v_min_u32" | "v_max_u32" | "v_add_f32" | "v_and_b32" | "v_or_b32" | "v_xor_b32") || saved_extrema {
             let (required, next) = wave_sum::lower(insns, first).map_err(bad)?;
             if width.replace(required).is_some_and(|w| w != required) {
                 return Err(bad("conflicting integer sum wave widths"));
@@ -6740,6 +6740,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 "v_add_nc_u32" => format!("{partner} + {acc}"),
                 "v_and_b32" => format!("{partner} & {acc}"),
                 "v_or_b32" => format!("{partner} | {acc}"),
+                "v_xor_b32" => format!("{partner} ^ {acc}"),
                 "v_min_u32" => format!("min({partner}, {acc})"),
                 "v_max_u32" => format!("max({partner}, {acc})"),
                 "v_add_f32" => format!("asuint(asfloat({partner}) + asfloat({acc}))"),
