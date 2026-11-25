@@ -42,6 +42,13 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def imports(records):
+    """Drop the records of the page cache (`page_open`, `span_hit` and so on),
+    which say how an import was found. What was imported, retried or replaced
+    by a stand-in stays."""
+    return [record for record in records if not record[0].startswith(("page_", "span_"))]
+
+
 def validate(case, adapter, status, output):
     _, _, name, markers = CASES[case]
     prefix = f"{name} PASS pci={adapter.lower()} "
@@ -82,12 +89,12 @@ def validate(case, adapter, status, output):
                              r"([a-z_]+) count=([0-9]+) source=place_virtual_layout bytes=([0-9]+)$", output)
         # The host may expose different tight alignment. Require both
         # successful imports/retries and no stand-in, regardless of padding.
-        if sorted((path, count) for path,count,_ in records) != [
+        if sorted((path, count) for path,count,_ in imports(records)) != [
             ("commit_retry","1"), ("commit_retry","2"), ("imported","1"), ("imported","2")]:
             return False, passes[0]
     if case == "root-cbv-window":
         records = re.findall(r"(?m)^(?:TuxBox d3d12_xs: )?buffer backing path=([a-z_]+) count=([0-9]+) source=view bytes=([0-9]+)$", output)
-        if sorted(records) != [("imported","1","65536"),("imported","2","131072"),("imported","3","131072"),("imported","4","65536"),("imported","5","131072")]:
+        if sorted(imports(records)) != [("imported","1","65536"),("imported","2","131072"),("imported","3","131072"),("imported","4","65536"),("imported","5","131072")]:
             return False, passes[0]
         if "bound with a short range" in output or "substituted null " in output:
             return False, passes[0]

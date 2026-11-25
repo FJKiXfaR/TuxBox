@@ -46,6 +46,11 @@ class D3D12RegressionTests(unittest.TestCase):
         logs=[line]+[f"TuxBox d3d12_xs: buffer backing path={p} count={i} source=place_virtual_layout bytes={1024+4*(i-1)}"
                      for p in ("imported","commit_retry") for i in (1,2)]
         self.assertTrue(validate("buffer-layout","10de:2704",0,"\n".join(logs))[0])
+        reuse=[f"TuxBox d3d12_xs: buffer backing path={p} count=1 source=place_virtual_layout bytes=65536"
+               for p in ("page_open","page_hit","span_open","span_hit")]
+        self.assertTrue(validate("buffer-layout","10de:2704",0,"\n".join(logs+reuse))[0])
+        standin="TuxBox d3d12_xs: buffer backing path=device_standin count=1 source=place_virtual_layout bytes=1024"
+        self.assertFalse(validate("buffer-layout","10de:2704",0,"\n".join(logs+reuse+[standin]))[0])
         self.assertFalse(validate("buffer-layout","10de:2704",0,"\n".join(logs[:-1]))[0])
         self.assertFalse(validate("buffer-layout","10de:2704",0,"\n".join(logs).replace("commit_retry","device_standin"))[0])
         negative="d3d12-buffer-import-reject PASS pci=10de:2704 rejected=1"
