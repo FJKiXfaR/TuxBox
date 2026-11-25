@@ -335,7 +335,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
                    d3d / "d3d12_xs.lib",
                    gameinput / "guest-gameinput.lib", "onecore_apiset.lib", "/nodefaultlib:kernel32.lib")
         for source in (objects / "lanes.exe", xmem / "xmem.dll", xmem / "tuxbox_xhttp.dll", d3d / "d3d12_xs.dll",
-                       gameinput / "GameInput.dll", src / "MicrosoftGame.config"):
+                       OUTPUT / "bvh/XboxBvhBuilder.dll", gameinput / "GameInput.dll", src / "MicrosoftGame.config"):
             shutil.copyfile(source, package / source.name)
         print(package / "MicrosoftGame.config", flush=True)
 

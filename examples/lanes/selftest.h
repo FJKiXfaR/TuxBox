@@ -13,3 +13,7 @@ extern const unsigned selftest_scenario_count;
 // Run one scenario by name, or every one for L"all". Returns the receipt line;
 // throws with the failing scenario and step.
 std::string run_selftest(const wchar_t* scenario, const wchar_t* adapter);
+
+// Time a fixed set of operations on the same device layout. Returns the receipt
+// line with one `name=value` reading per operation.
+std::string run_benchmark(const wchar_t* adapter);

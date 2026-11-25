@@ -1,10 +1,13 @@
 #include "selftest.h"
+#include "game.h"
 #include "../../runtime/d3d12/compute_fixture.h"
 #include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <vector>
 #include "xbox_shader.h"
+#include "course_shader.h"
+#include <algorithm>
 
 namespace {
 using compute_fixture::buffer;
@@ -23,8 +26,9 @@ constexpr DWORD deadline_ms = 2000;
 
 // Xbox command-list and queue slots (GDK gen9/d3d12_xs.h).
 constexpr size_t slot_copy_memory = 62, slot_write32 = 71, slot_write64 = 72, slot_wait64 = 74,
-                 slot_copy_texture = 83, slot_build = 119, slot_sync_top = 131, slot_sync_bottom = 132;
+                 slot_copy_texture = 83, slot_build = 119, slot_emit_sizes = 120, slot_sync_top = 131, slot_sync_bottom = 132;
 constexpr size_t slot_compute_root = 33, device_create_compute = 62;
+constexpr size_t slot_execute_indirect = 61, slot_root_constants = 39, slot_root_uav = 45;
 constexpr size_t queue_signal = 16, queue_execute_frame = 35, device_place = 44, device_create_list = 73;
 
 using CopyMemory_ = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT64, UINT64, UINT);
@@ -38,6 +42,13 @@ using ExecuteFrame = void (WINAPI*)(ID3D12CommandQueue*, UINT, ID3D12CommandList
 using CreateComputePipeline = HRESULT (WINAPI*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
                                                 UINT, const void*, REFIID, void**);
 using SetRoot = void (WINAPI*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+using ExecuteIndirect_ = void (WINAPI*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT,
+                                         ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
+using SetConstants = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
+using SetUav = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+using EmitSizes = void (WINAPI*)(ID3D12GraphicsCommandList*,
+                                 const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*, UINT,
+                                 const D3D12_GPU_VIRTUAL_ADDRESS*);
 using Place = HRESULT (WINAPI*)(ID3D12Device*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
                                 const D3D12_CLEAR_VALUE*, REFIID, void**);
 
@@ -83,6 +94,11 @@ struct Queue {
         method<Wait64>(list.Get(), slot_wait64)(list.Get(), address, D3D12_COMPARISON_FUNC_GREATER_EQUAL, value, 0);
     }
     void close() { check(list->Close(), "close list"); }
+    // Reuse the allocator and list once everything submitted has finished.
+    void reopen() {
+        check(allocator->Reset(), "reset allocator");
+        check(list->Reset(allocator.Get(), nullptr), "reopen list");
+    }
     void signal() {
         check(method<SignalQueue>(queue.Get(), queue_signal)(queue.Get(), fence.Get(), ++submitted), "signal queue");
     }
@@ -280,6 +296,351 @@ void xbox_shader_scenario(ID3D12Device* device) {
     expect_value(memory, 0, 3, "write after the dispatch");
 }
 
+// ExecuteIndirect on its Series X|S slot runs the course shader from an
+// argument buffer, and matches the same course dispatched directly.
+void indirect_dispatch(ID3D12Device* device) {
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {1, 2, 2};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[1].Descriptor = {2, 1};
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 2;
+    signature.pParameters = params;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize course root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create course root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {course_dxil, sizeof(course_dxil)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create course pipeline");
+
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC indirect{};
+    indirect.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    indirect.NumArgumentDescs = 1;
+    indirect.pArgumentDescs = &argument;
+    ComPtr<ID3D12CommandSignature> command;
+    check(device->CreateCommandSignature(&indirect, nullptr, IID_PPV_ARGS(&command)), "create command signature");
+    const D3D12_DISPATCH_ARGUMENTS groups{(course_length + 7) / 8, 1, 1};
+    auto arguments = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(groups), D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(arguments.Get(), &groups, sizeof(groups));
+
+    constexpr UINT64 bytes = sizeof(Course);
+    ComPtr<ID3D12Resource> output[2], readback[2];
+    Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    auto* list = compute.list.Get();
+    const UINT constants[] = {0x5194c0d1u, course_length};
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    list->SetPipelineState(pipeline.Get());
+    method<SetConstants>(list, slot_root_constants)(list, 0, 2, constants, 0);
+    for (int pass = 0; pass < 2; ++pass) {
+        output[pass] = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        readback[pass] = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+        method<SetUav>(list, slot_root_uav)(list, 1, output[pass]->GetGPUVirtualAddress());
+        if (pass == 0)
+            list->Dispatch(groups.ThreadGroupCountX, 1, 1);
+        else
+            method<ExecuteIndirect_>(list, slot_execute_indirect)(list, command.Get(), 1, arguments.Get(), 0,
+                                                                  nullptr, 0);
+        compute_fixture::transition(list, output[pass].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback[pass].Get(), 0, output[pass].Get(), 0, bytes);
+    }
+    compute.submit();
+    compute.finish("direct and indirect course dispatches");
+
+    Course rows[2]{};
+    for (int pass = 0; pass < 2; ++pass) {
+        D3D12_RANGE range{0, bytes}, empty{};
+        void* mapped{};
+        check(readback[pass]->Map(0, &range, &mapped), "map course readback");
+        std::memcpy(rows[pass].data(), mapped, bytes);
+        readback[pass]->Unmap(0, &empty);
+    }
+    if (rows[0].front() != 0x0001) throw std::runtime_error("direct course dispatch wrote an unexpected course");
+    if (rows[0] != rows[1]) throw std::runtime_error("indirect dispatch differs from the direct dispatch");
+}
+
+// CopyMemoryToMemoryX reads a guest texture back into title memory, as linear
+// rows at the copyable footprint's pitch.
+void texture_readback(ID3D12Device* device) {
+    constexpr UINT width = 256, height = 256, pitch = 256;
+    constexpr UINT64 bytes = UINT64(pitch) * height;
+    Memory image(4 * 65536);
+    Memory result(2 * 65536);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    ComPtr<ID3D12Resource> texture;
+    check(method<Place>(device, device_place)(device, image.address(), &desc, D3D12_RESOURCE_STATE_COMMON,
+                                              nullptr, IID_PPV_ARGS(&texture)), "place guest texture");
+    auto upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    std::vector<BYTE> expected(bytes);
+    for (size_t i = 0; i < bytes; ++i) expected[i] = static_cast<BYTE>(i * 7 + i / pitch * 3);
+    compute_fixture::upload(upload.Get(), expected.data(), bytes);
+
+    D3D12_TEXTURE_COPY_LOCATION target{}, source{};
+    target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    target.pResource = texture.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.pResource = upload.Get();
+    source.PlacedFootprint.Footprint = {DXGI_FORMAT_R8_UNORM, width, height, 1, pitch};
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    method<frame_abi::Copy>(direct.list.Get(), slot_copy_texture)(direct.list.Get(), &target, 0, 0, 0, &source,
+                                                                  nullptr, 0);
+    // The write promoted the texture to a copy destination. It must leave that
+    // state before it can be read.
+    compute_fixture::transition(direct.list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    method<CopyMemory_>(direct.list.Get(), slot_copy_memory)(direct.list.Get(), result.address(),
+                                                             image.address(), bytes, 0);
+    direct.submit();
+    direct.finish("texture readback");
+    if (std::memcmp(result.base, expected.data(), bytes))
+        throw std::runtime_error("texture readback differs from the uploaded texels");
+}
+
+// The middle reading, in microseconds, of `count` timed calls.
+template<class Timed>
+double median_us(unsigned count, Timed timed) {
+    LARGE_INTEGER frequency{}, before{}, after{};
+    QueryPerformanceFrequency(&frequency);
+    std::vector<double> readings(count);
+    for (auto& reading : readings) {
+        QueryPerformanceCounter(&before);
+        timed();
+        QueryPerformanceCounter(&after);
+        reading = double(after.QuadPart - before.QuadPart) * 1e6 / double(frequency.QuadPart);
+    }
+    std::sort(readings.begin(), readings.end());
+    return readings[readings.size() / 2];
+}
+
+struct Readings {
+    double submit_us, roundtrip_us, copy_us, shader_us;
+};
+
+Readings measure(ID3D12Device* device) {
+    Readings result{};
+    Memory memory(4 * 65536);
+    {
+        // One list holding a fence write: record, submit and wait.
+        Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        UINT64 value = 0;
+        result.submit_us = median_us(300, [&] {
+            if (value) direct.reopen();
+            direct.write64(memory.address(0), ++value);
+            direct.submit();
+            direct.finish("benchmark submission");
+        });
+    }
+    {
+        // A label handed from the direct queue to a waiting compute queue.
+        Queue compute(device, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+        Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        UINT64 value = 0;
+        result.roundtrip_us = median_us(200, [&] {
+            if (value) {
+                compute.reopen();
+                direct.reopen();
+            }
+            ++value;
+            compute.wait64(memory.address(8), value);
+            compute.write64(memory.address(16), value);
+            compute.submit();
+            direct.write64(memory.address(8), value);
+            direct.submit();
+            direct.finish("benchmark label writer");
+            compute.finish("benchmark label waiter");
+        });
+    }
+    {
+        Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        bool used = false;
+        result.copy_us = median_us(200, [&] {
+            if (used) direct.reopen();
+            used = true;
+            method<CopyMemory_>(direct.list.Get(), slot_copy_memory)(
+                direct.list.Get(), memory.address(2 * 65536), memory.address(65536), 65536, 0);
+            direct.submit();
+            direct.finish("benchmark memory copy");
+        });
+    }
+    {
+        // Pipelines from a console shader: the translation cache lookup and
+        // the driver's pipeline creation.
+        D3D12_ROOT_SIGNATURE_DESC signature{};
+        ComPtr<ID3DBlob> serialized;
+        check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+              "serialize empty root signature");
+        ComPtr<ID3D12RootSignature> root;
+        check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                          IID_PPV_ARGS(&root)), "create empty root signature");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+        shader.pRootSignature = root.Get();
+        shader.CS = {xbox_shader, sizeof(xbox_shader)};
+        result.shader_us = median_us(100, [&] {
+            ComPtr<ID3D12PipelineState> pipeline;
+            check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                               IID_PPV_ARGS(&pipeline)),
+                  "benchmark pipeline");
+        });
+    }
+    return result;
+}
+
+// TuxBox's XboxBvhBuilder, loaded by name as a title's builder calls reach it.
+struct Builder {
+    using Construct = void* (WINAPI*)(void*, ID3D12Device*, bool);
+    using Destroy = void (WINAPI*)(void*);
+    using Build = void (WINAPI*)(void*, ID3D12GraphicsCommandList*,
+                                 const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*, UINT,
+                                 const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*);
+    // D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2.
+    struct Entry {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc;
+        UINT64 report_count;
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* reports;
+        UINT64 stream_bytes;
+        const void* stream;
+    };
+    using Batch = void (WINAPI*)(void*, ID3D12GraphicsCommandList*, UINT, const Entry*);
+    using CopyStructure = void (WINAPI*)(void*, ID3D12GraphicsCommandList*, D3D12_GPU_VIRTUAL_ADDRESS,
+                                         D3D12_GPU_VIRTUAL_ADDRESS,
+                                         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE);
+    using Prebuild = void (WINAPI*)(void*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS*,
+                                    const UINT64*,
+                                    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO*);
+
+    HMODULE library;
+    alignas(8) BYTE object[24]{};
+    explicit Builder(ID3D12Device* device)
+        : library(LoadLibraryExW(L"XboxBvhBuilder.dll", nullptr, 0)) {
+        if (!library) throw std::runtime_error("load XboxBvhBuilder.dll");
+        entry<Construct>(1)(object, device, false);
+    }
+    ~Builder() {
+        entry<Destroy>(2)(object);
+        FreeLibrary(library);
+    }
+    Builder(const Builder&) = delete;
+    Builder& operator=(const Builder&) = delete;
+    template<class Function> Function entry(WORD ordinal) const {
+        auto address = GetProcAddress(library, MAKEINTRESOURCEA(ordinal));
+        if (!address) throw std::runtime_error("missing XboxBvhBuilder export");
+        return reinterpret_cast<Function>(address);
+    }
+};
+
+void unordered_barrier(ID3D12GraphicsCommandList* list) {
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &barrier);
+}
+
+// A bottom-level structure built singly with a size report, copied, and built
+// again through the batched call, all by way of the console's builder library.
+void ray_tracing_builder(ID3D12Device* device) {
+    Builder builder(device);
+    const float triangle[] = {0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+    auto vertices = buffer(device, D3D12_HEAP_TYPE_UPLOAD, sizeof(triangle), D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(vertices.Get(), triangle, sizeof(triangle));
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    geometry.Triangles.VertexCount = 3;
+    geometry.Triangles.VertexBuffer = {vertices->GetGPUVirtualAddress(), 3 * sizeof(float)};
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+    inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
+    inputs.NumDescs = 1;
+    inputs.pGeometryDescs = &geometry;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO size{};
+    builder.entry<Builder::Prebuild>(7)(builder.object, &inputs, nullptr, &size);
+    if (!size.ResultDataMaxSizeInBytes || !size.ScratchDataSizeInBytes)
+        throw std::runtime_error("no prebuild sizes; ray tracing is unavailable");
+
+    auto gpu_buffer = [&](UINT64 bytes, D3D12_RESOURCE_STATES state) {
+        return buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, state,
+                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    };
+    ComPtr<ID3D12Resource> structure[3];
+    for (auto& item : structure)
+        item = gpu_buffer(size.ResultDataMaxSizeInBytes,
+                          D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    auto scratch = gpu_buffer(size.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto reports = gpu_buffer(32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, 32, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
+    build.Inputs = inputs;
+    build.DestAccelerationStructureData = structure[0]->GetGPUVirtualAddress();
+    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC report[2]{};
+    for (int i = 0; i < 2; ++i) {
+        report[i].DestBuffer = reports->GetGPUVirtualAddress() + 8 * i;
+        report[i].InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+    }
+    Memory label(65536);
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto* list = direct.list.Get();
+    builder.entry<Builder::Build>(3)(builder.object, list, &build, 1, &report[0]);
+    unordered_barrier(list);
+    builder.entry<Builder::CopyStructure>(5)(builder.object, list, structure[1]->GetGPUVirtualAddress(),
+                                             structure[0]->GetGPUVirtualAddress(),
+                                             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+    unordered_barrier(list);
+    // The size of the built structure and of its copy, which a missing copy
+    // leaves empty.
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC current{};
+    current.DestBuffer = reports->GetGPUVirtualAddress() + 16;
+    current.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE;
+    const D3D12_GPU_VIRTUAL_ADDRESS measured[] = {structure[0]->GetGPUVirtualAddress(),
+                                                  structure[1]->GetGPUVirtualAddress()};
+    method<EmitSizes>(list, slot_emit_sizes)(list, &current, 2, measured);
+    unordered_barrier(list);
+    Builder::Entry entry{};
+    entry.desc = build;
+    entry.desc.DestAccelerationStructureData = structure[2]->GetGPUVirtualAddress();
+    entry.report_count = 1;
+    entry.reports = &report[1];
+    builder.entry<Builder::Batch>(4)(builder.object, list, 1, &entry);
+    unordered_barrier(list);
+    compute_fixture::transition(list, reports.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, reports.Get(), 0, 32);
+    direct.write64(label.address(), 21);
+    direct.submit();
+    direct.finish("acceleration structure builds and copy");
+    expect_value(label, 0, 21, "write after the builds");
+
+    D3D12_RANGE range{0, 32}, empty{};
+    UINT64* mapped{};
+    check(readback->Map(0, &range, reinterpret_cast<void**>(&mapped)), "map size reports");
+    const UINT64 single = mapped[0], batched = mapped[1], original = mapped[2], copied = mapped[3];
+    readback->Unmap(0, &empty);
+    if (!single || single > size.ResultDataMaxSizeInBytes)
+        throw std::runtime_error("the single build reported no compacted size");
+    if (batched != single) throw std::runtime_error("the batched build was not recorded like the single one");
+    if (!original || copied != original) throw std::runtime_error("the acceleration structure was not copied");
+}
+
 struct Scenario {
     const wchar_t* name;
     void (*run)(ID3D12Device*);
@@ -291,6 +652,9 @@ constexpr Scenario scenarios[] = {
     {L"skipped-command", skipped_command},
     {L"copy-memory", copy_memory},
     {L"shared-texture", shared_texture},
+    {L"indirect-dispatch", indirect_dispatch},
+    {L"texture-readback", texture_readback},
+    {L"ray-tracing-builder", ray_tracing_builder},
     {L"xbox-shader", xbox_shader_scenario},
 };
 
@@ -340,7 +704,8 @@ std::string narrow(const wchar_t* text) {
 
 const wchar_t* const selftest_scenarios[] = {L"labels",          L"cross-queue", L"compute-frame",
                                              L"skipped-command", L"copy-memory", L"shared-texture",
-                                             L"xbox-shader"};
+                                             L"indirect-dispatch", L"texture-readback",
+                                             L"ray-tracing-builder", L"xbox-shader"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -364,4 +729,15 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
     if (!passed) throw std::runtime_error("unknown scenario " + narrow(requested));
     return "lanes-selftest PASS pci=" + std::string(pci) + " scenario=" + narrow(requested) +
            " passed=" + std::to_string(passed);
+}
+
+std::string run_benchmark(const wchar_t* adapter) {
+    char pci[16]{};
+    auto device = create_scarlett_device(adapter, pci);
+    const Readings readings = measure(device.Get());
+    char line[240];
+    std::snprintf(line, sizeof(line),
+                  "lanes-benchmark PASS pci=%s submit_us=%.1f roundtrip_us=%.1f copy64k_us=%.1f shader_pipeline_us=%.1f",
+                  pci, readings.submit_us, readings.roundtrip_us, readings.copy_us, readings.shader_us);
+    return line;
 }

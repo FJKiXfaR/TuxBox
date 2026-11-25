@@ -23,15 +23,16 @@ A change is merged only after [Lanes](examples/lanes/README.md), the project's o
 python tuxbox.py check
 ```
 
-It runs the checks below, builds Lanes and its providers, and then runs Lanes on your GPU:
+It runs the code checks below, builds every provider and guest, and then runs Lanes and the other guest fixtures on your GPU. The Lanes part covers:
 
 | Group | What runs |
 | --- | --- |
 | Replay | The game itself: course generation, input, presentation and board readback |
 | [Self-test](examples/lanes/README.md#self-test) | Xbox graphics behaviour retail titles depend on, each scenario failing if the GPU does not finish in time |
 | Shader cache | A console shader loaded from a cache prepared before launch, translated while running, then reused without compiling again |
+| [Benchmark](examples/lanes/README.md#benchmark) | Submission, fence handover, copy and pipeline timings. Add `--baseline` with an earlier result to compare. |
 
-Put the printed summary, your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/lanes.json`.
+Put the printed summary, your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/results.json`.
 
 If your change adds or fixes behaviour, add or extend a Lanes scenario that fails without it. If it cannot be exercised from Lanes, say why in the pull request.
 

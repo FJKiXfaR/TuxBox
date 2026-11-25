@@ -1,9 +1,12 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from project_tuxbox import check
-from project_tuxbox.verify import LANES_SCENARIOS, SUITES
+from project_tuxbox.verify import BASE_SUITES, LANES_SCENARIOS
 
 
 class CheckCommandTests(unittest.TestCase):
@@ -18,16 +21,15 @@ class CheckCommandTests(unittest.TestCase):
             code = check.run_checks(run=run, report=lines.append, **options)
         return code, commands, "\n".join(lines)
 
-    def test_runs_code_checks_then_lanes_on_the_gpu(self):
+    def test_runs_code_checks_then_every_suite_on_the_gpu(self):
         code, commands, report = self.run_checks(host_options=["--backend", "proton"])
         self.assertEqual(code, 0)
+        self.assertEqual(commands[-2][1:], ["build.py"])
         verify = commands[-1]
         self.assertIn("verify", verify)
-        for suite in check.LANES_SUITES:
-            self.assertIn(suite, verify)
-            self.assertIn(suite, SUITES)
+        self.assertNotIn("--only", verify)
         self.assertEqual(verify[verify.index("--backend") + 1], "proton")
-        self.assertIn("Attach the Lanes results", report)
+        self.assertIn("Attach the GPU results", report)
 
     def test_a_failure_still_runs_the_remaining_checks(self):
         code, commands, report = self.run_checks(failing=("unittest",))
@@ -36,7 +38,7 @@ class CheckCommandTests(unittest.TestCase):
         self.assertIn("FAILED   Python tests", report)
 
     def test_a_failed_build_skips_the_gpu_run(self):
-        code, commands, report = self.run_checks(failing=("d3d12",))
+        code, commands, report = self.run_checks(failing=("build.py",))
         self.assertEqual(code, 1)
         self.assertFalse(any("verify" in command for command in commands))
         self.assertIn("skipped: a build failed", report)
@@ -47,9 +49,27 @@ class CheckCommandTests(unittest.TestCase):
         self.assertFalse(any("verify" in command for command in commands))
         self.assertIn("cannot be merged until Lanes passes", report)
 
-    def test_the_cache_scenario_is_checked_by_its_own_suite(self):
+    def test_compares_benchmark_timings_with_a_baseline(self):
+        with TemporaryDirectory() as directory:
+            def results(name, submit):
+                path = Path(directory) / name
+                receipt = f"lanes-benchmark PASS pci=10de:0001 submit_us={submit} copy64k_us=10.0"
+                path.write_text(json.dumps({"checks": [
+                    {"gate": "lanes-benchmark", "passed": True, "receipt": receipt}]}))
+                return path
+
+            lines = check.compare_benchmarks(results("old.json", "100.0"), results("new.json", "150.0"))
+            self.assertEqual(len(lines), 2)
+            self.assertIn("+50%", lines[0])
+            self.assertIn("+0%", lines[1])
+            empty = Path(directory) / "empty.json"
+            empty.write_text("{}")
+            self.assertEqual(check.compare_benchmarks(empty, empty), ["No benchmark readings to compare."])
+
+    def test_every_lanes_suite_is_part_of_a_default_run(self):
         self.assertNotIn("xbox-shader", LANES_SCENARIOS)
-        self.assertIn("lanes-shader-cache", check.LANES_SUITES)
+        for suite in ("lanes", "lanes-selftest", "lanes-shader-cache", "lanes-benchmark"):
+            self.assertIn(suite, BASE_SUITES)
 
 
 if __name__ == "__main__":

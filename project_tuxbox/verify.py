@@ -21,14 +21,16 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
 OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.dll"}
 SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
-LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture")
+LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
+                   "indirect-dispatch", "texture-readback",
+                   "ray-tracing-builder")
 
 
 def lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work):
@@ -565,7 +567,14 @@ def verify(host, output, adapter, selected=None, samples=1):
                       rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
                       providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
-                      config="lanes/MicrosoftGame.config", device_factory="xbox")
+                      config="lanes/MicrosoftGame.config", device_factory="xbox",
+                      dependencies=("lanes/XboxBvhBuilder.dll",) if scenario == "ray-tracing-builder" else ())
+        if "lanes-benchmark" in selected:
+            check("lanes-benchmark", "lanes/lanes.exe", ["--benchmark", *gpu_args, "--report"],
+                  rf"lanes-benchmark PASS pci={pci}(?: [a-z0-9_]+=[0-9]+\.[0-9])+",
+                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                  config="lanes/MicrosoftGame.config", device_factory="xbox")
         if "lanes-shader-cache" in selected and host.backend == "proton":
             lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work)
         if "cpu-benchmark" in selected:
@@ -664,6 +673,10 @@ GATE_LABELS = {
     "lanes-selftest-skipped-command": "A skipped command leaving its list and fence write intact",
     "lanes-selftest-copy-memory": "CopyMemoryToMemoryX direction and contents",
     "lanes-selftest-shared-texture": "A waiting queue reading a texture another queue writes",
+    "lanes-selftest-indirect-dispatch": "ExecuteIndirect matching a direct dispatch",
+    "lanes-selftest-texture-readback": "A guest texture copied back to title memory",
+    "lanes-benchmark": "Lanes submission, fence handover, copy and pipeline timings",
+    "lanes-selftest-ray-tracing-builder": "Single, copied and batched builds through XboxBvhBuilder",
     "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
     "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",
     "lanes-shader-cache-reused": "The worker's translation reused on the next launch without compiling",

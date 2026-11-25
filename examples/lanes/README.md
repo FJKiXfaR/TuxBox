@@ -43,6 +43,9 @@ The game also imports Windows core API sets for services such as files, timing a
 | `skipped-command` | A command that cannot be recorded leaves its list, and the list's fence write, intact |
 | `copy-memory` | `CopyMemoryToMemoryX` copies from the source to the destination |
 | `shared-texture` | A queue waiting on a label reads a guest texture that the queue setting the label writes |
+| `indirect-dispatch` | `ExecuteIndirect` on its Series X\|S slot matches a direct dispatch |
+| `texture-readback` | `CopyMemoryToMemoryX` reads a guest texture into title memory |
+| `ray-tracing-builder` | `XboxBvhBuilder` builds a structure with a size report, copies it and builds it again in a batch (needs ray tracing) |
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
 
 ```sh
@@ -54,6 +57,26 @@ To run one scenario, or all of them in one process:
 ```sh
 python tuxbox.py run --app-id Lanes build/lanes --selftest all --report selftest.txt
 ```
+
+## Benchmark
+
+`lanes.exe --benchmark` times fixed operations on the Series X|S device layout and reports the median of each in microseconds. Lower is better.
+
+| Reading | Operation |
+| --- | --- |
+| `submit_us` | Record, submit and wait for a list holding one fence write |
+| `roundtrip_us` | Hand a fence label from the direct queue to a waiting compute queue |
+| `copy64k_us` | Copy 64 KiB of title memory with `CopyMemoryToMemoryX` |
+| `shader_pipeline_us` | Create a compute pipeline from the cached console shader |
+
+`python tuxbox.py check` runs it. Compare with an earlier run on the same machine:
+
+```sh
+cp build/check/results.json build/baseline.json
+python tuxbox.py check --baseline build/baseline.json
+```
+
+The comparison reports changes and does not fail the check. Timings vary with other load on the machine, so close other GPU work before drawing conclusions.
 
 ## Shader cache
 

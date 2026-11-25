@@ -73,7 +73,7 @@ Every change is verified on Lanes before it is merged. From the repository root:
 python tuxbox.py check
 ```
 
-It runs the automated checks, builds Lanes and runs its replay, self-test and shader cache checks on your GPU. [Contributing](CONTRIBUTING.md#every-change-is-verified-on-lanes)
+It runs the automated checks, builds everything, and runs Lanes and the other guest fixtures on your GPU. [Contributing](CONTRIBUTING.md#every-change-is-verified-on-lanes)
 
 ## Automated checks
 

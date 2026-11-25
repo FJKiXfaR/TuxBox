@@ -92,25 +92,28 @@ int wmain(int argc, wchar_t** argv) {
     const wchar_t* report = nullptr;
     const wchar_t* adapter = nullptr;
     const wchar_t* selftest = nullptr;
+    bool benchmark = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::wcscmp(argv[i], L"--replay") && !scripted) scripted = true;
         else if (!std::wcscmp(argv[i], L"--report") && !report && i + 1 < argc) report = argv[++i];
         else if (!std::wcscmp(argv[i], L"--adapter") && !adapter && i + 1 < argc) adapter = argv[++i];
+        else if (!std::wcscmp(argv[i], L"--benchmark") && !benchmark) benchmark = true;
         else if (!std::wcscmp(argv[i], L"--selftest") && !selftest && i + 1 < argc) selftest = argv[++i];
         else {
-            std::fputs("usage: lanes.exe [--adapter VVVV:DDDD] [--replay | --selftest NAME|all] [--report FILE]\n",
+            std::fputs("usage: lanes.exe [--adapter VVVV:DDDD] [--replay | --selftest NAME|all | --benchmark] [--report FILE]\n",
                        stderr);
             return 2;
         }
     }
-    if ((report && !scripted && !selftest) || (scripted && selftest)) return 2;
-    if (selftest) {
+    if (int(scripted) + int(selftest != nullptr) + int(benchmark) > 1) return 2;
+    if (report && !scripted && !selftest && !benchmark) return 2;
+    if (selftest || benchmark) {
         std::string line;
         int status = 0;
         try {
-            line = run_selftest(selftest, adapter);
+            line = benchmark ? run_benchmark(adapter) : run_selftest(selftest, adapter);
         } catch (const std::exception& error) {
-            line = std::string("lanes-selftest FAIL ") + error.what();
+            line = std::string(benchmark ? "lanes-benchmark FAIL " : "lanes-selftest FAIL ") + error.what();
             status = 1;
         }
         std::puts(line.c_str());
