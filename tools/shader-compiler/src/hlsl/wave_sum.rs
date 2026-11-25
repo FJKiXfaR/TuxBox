@@ -814,7 +814,7 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         // A floating identity move belongs to the protected region too.
         let operation = i.mnemonic.as_str();
         if !matches!(operation, "v_add_nc_u32" | "v_min_u32" | "v_max_u32" |
-            "v_min_f32" | "v_max_f32") { return false; }
+            "v_and_b32" | "v_or_b32" | "v_min_f32" | "v_max_f32") { return false; }
         let floating = matches!(operation, "v_min_f32" | "v_max_f32");
         let Some(covered_start) = start.checked_sub(usize::from(floating)) else { return false };
         let save = &insns[covered_start];
@@ -1180,6 +1180,28 @@ mod tests {
             ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
             ex.isa_data = ex.isa.clone();
             assert!(super::super::translate(&ex).is_ok());
+        }
+    }
+
+    #[test]
+    fn bitwise_reductions_use_shared_memory_only_for_a_single_wave64() {
+        for (opcode, neutral) in [(0x36, 0xc1), (0x38, 0x80)] { // AND -1, OR 0
+            let (mut shader, mut words, end) = fixture::shader(64);
+            words.truncate(end);
+            words[2] = (words[2] & !0xff) | neutral;
+            for word in &mut words {
+                if *word >> 24 == 0x4a { *word = (opcode << 24) | (*word & 0xffffff); }
+            }
+            words.push(0xbf81_0000);
+            shader.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            shader.isa_data = shader.isa.clone();
+            let single = super::super::translate(&shader).unwrap();
+            assert_eq!(single.required_wave_size, None);
+            assert!(single.hlsl.contains("tb_reduction_read(gtid.x"));
+
+            shader.isa_preamble = [0, 128, 1, 1];
+            let multi = super::super::translate(&shader).unwrap();
+            assert_eq!(multi.required_wave_size, Some(64));
         }
     }
 
