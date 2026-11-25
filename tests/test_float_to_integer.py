@@ -91,6 +91,45 @@ class FloatToIntegerTests(unittest.TestCase):
             0xbfa40002, 0x7e080d01, 0x3a080902,
         ], 1)])
 
+    def test_ldexp_rounding_and_denormal_modes(self):
+        # RX 6800 measurements of input/output flushing: github.com/boykopovar/AnyPS5/pull/6008
+        # Input bits, signed exponent, denormal mode, rounding, IEEE, output bits.
+        cases = [
+            (1, 23, 1, 0, 0, 0x00800000), (1, 23, 2, 0, 0, 0),
+            (0x3fffffff, -127, 1, 0, 0, 0), (0x3fffffff, -127, 3, 0, 0, 0x00800000),
+            (0x3f800000, -150, 3, 0, 0, 0), (0x3f800000, -150, 3, 1, 0, 1),
+            (0xbf800000, -150, 3, 2, 0, 0x80000001), (3, -1, 3, 0, 0, 2),
+            (0x7f7fffff, 0x7fffffff, 0, 3, 0, 0x7f7fffff),
+            (0xff7fffff, 1, 0, 1, 0, 0xff7fffff),
+            (0xff7fffff, 1, 0, 2, 0, 0xff800000),
+            (0x80800000, -0x80000000, 2, 2, 0, 0x80000001),
+            (0x7f812345, 9, 3, 0, 0, 0x7f812345),
+            (0x7f812345, 9, 3, 0, 1, 0x7fc12345),
+        ]
+        self.check_programs(
+            ([0xbfa50000 | denorm, 0xbfa40000 | rounding, 0xba800241, ieee,
+              0x7e0202ff, bits, 0x7e0602ff, exponent & 0xffffffff,
+              0xd7620004, 0x00020701], expected)  # v_ldexp_f32 v4, v1, v3
+            for bits, exponent, denorm, rounding, ieee, expected in cases
+        )
+
+    def test_ldexp_output_modifiers(self):
+        cases = [
+            # MODE, source bits, signed exponent, clamp, OMOD, result bits.
+            (0x120, 0x00800000, -1, True, 0, 0x00400000),
+            (0x120, 0x80800000, -1, True, 0, 0),
+            (0x100, 0x7fc12345, 0, True, 0, 0),
+            (0x200, 0x7f812345, 0, True, 0, 0x7fc12345),
+            (0, 0x3e800000, 1, False, 1, 0x3f800000),
+            (0x020, 0x3e800000, 1, False, 1, 0x3f000000),
+            (0x200, 0x3e800000, 1, False, 1, 0x3f000000),
+        ]
+        self.check_programs(
+            ([0xba804801, mode, 0x7e0202ff, bits, 0x7e0602ff, exponent & 0xffffffff,
+              0xd7620004 | (clamp << 15), 0x00020701 | (omod << 27)], expected)
+            for mode, bits, exponent, clamp, omod, expected in cases
+        )
+
     def check_programs(self, cases):
         xshader = os.environ.get("TUXBOX_XSHADER") or shutil.which("xshader")
         dxc = os.environ.get("DXC") or shutil.which("dxc")

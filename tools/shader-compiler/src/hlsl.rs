@@ -293,7 +293,6 @@ bool tb_isnan(float x) { return (asuint(x) & 0x7fffffffu) > 0x7f800000u; }
 float tb_min(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a < b ? a : b)); }
 float tb_max(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a > b ? a : b)); }
 float tb_med3(float a, float b, float c) { if (tb_isnan(a) || tb_isnan(b) || tb_isnan(c)) return tb_min(tb_min(a, b), c); float mx = tb_max(tb_max(a, b), c); if (mx == a) return tb_max(b, c); if (mx == b) return tb_max(a, c); return tb_max(a, b); }
-float tb_ldexp(float x, int n) { n = clamp(n, -320, 320); int k1 = clamp(n, -126, 127); n -= k1; int k2 = clamp(n, -126, 127); n -= k2; int k3 = clamp(n, -126, 127); precise float r = x * asfloat((uint)(k1 + 127) << 23); r = r * asfloat((uint)(k2 + 127) << 23); r = r * asfloat((uint)(k3 + 127) << 23); return r; }
 "#;
 
 /// Prove the non-returning 2D, DMASK=3 UMAX encoding and return its X/Y VGPRs.
@@ -4527,6 +4526,9 @@ impl<'a> Emitter<'a> {
         if self.insns.iter().any(|ins| ins.mnemonic == "v_fract_f32") {
             h.push_str(include_str!("fract_f32.hlsl"));
         }
+        if self.insns.iter().any(|ins| ins.mnemonic == "v_ldexp_f32") {
+            h.push_str(include_str!("ldexp_f32.hlsl"));
+        }
         if self.insns.iter().any(|i| i.op == OP_DPP_BINARY && matches!(i.mnemonic.as_str(), "v_min_f32" | "v_max_f32")) {
             h.push_str(r#"
 uint tb_quad_extrema(uint a, uint b, bool maximum, uint mode) {
@@ -7604,6 +7606,13 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         let a = self.numeric_input(&s[0])?;
         let b = s.get(1).map(|operand| self.numeric_input(operand)).transpose()?.unwrap_or_default();
         let c = s.get(2).map(|o| r(o)).transpose().unwrap_or(None).unwrap_or_default();
+        if m == "v_ldexp_f32" {
+            let mode = if self.regs.contains("tb_fp_mode") { "tb_fp_mode" } else { "0u" };
+            let bits = Self::select_source(ins, a, 0);
+            let scale = [0, 1, 2, -1][ins.aux.imm2 as usize];
+            let clamp = ins.aux.imm != 0;
+            return self.wv(&d, &format!("tb_ldexp_f32({bits}, asint({b}), {mode}, {scale}, {clamp})"));
+        }
         if clamped_product24(ins) {
             if vop3 && (ins.raw[0] & 0x7800 != 0 || ins.aux.mask != 0 || ins.aux.imm2 != 0) {
                 return Err("unsupported modifiers for clamped 24-bit multiply".into());
@@ -7640,7 +7649,6 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             "v_max3_f32" => Some(format!("max(max({}, {}), {})", fa()?, fb()?, fc()?)),
             // ISA: any NaN operand -> V_MIN3_F32 of the three; otherwise the median.
             "v_med3_f32" => Some(format!("tb_med3({}, {}, {})", fa()?, fb()?, fc()?)),
-            "v_ldexp_f32" => Some(format!("tb_ldexp({}, asint({b}))", fa()?)),
             "v_cvt_f32_i32" | "v_cvt_f32_u32" if self.regs.contains("tb_fp_mode") => {
                 let signed = m == "v_cvt_f32_i32";
                 Some(format!("tb_integer_to_f32({a}, {signed}, tb_fp_mode)"))
