@@ -283,6 +283,27 @@ fn bitwise_and_float_sum_reductions_use_shared_memory_only_for_a_single_wave64()
 }
 
 #[test]
+fn partial_wave64_group_reads_the_neutral_element_from_absent_lanes() {
+    // 36 threads are one guest wave64 with 28 lanes that have no thread: the
+    // host runs two wave32 waves, so every exchange must rendezvous through
+    // group memory and the absent source lanes contribute the neutral element.
+    let (mut ex, _, _) = fixture::shader(64);
+    ex.isa_preamble = [0, 36, 1, 1];
+    let translated = super::super::translate(&ex).unwrap();
+    assert_eq!(translated.required_wave_size, None);
+    assert!(translated.hlsl.contains("uint tb_lane = gtid.x + 1u * (gtid.y + 1u * gtid.z);"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("tb_reduction_read(tb_lane, v0, tb_lane ^ 1u, 36u, 0x0u)"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("WaveReadLaneAt("));
+    assert!(!translated.hlsl.contains("[WaveSize("));
+    // A group that already fits one host wave keeps the 32-lane lowering.
+    ex.isa_preamble = [0, 32, 1, 1];
+    assert_eq!(super::super::translate(&ex).unwrap().required_wave_size, Some(32));
+    // More than one guest wave still needs the native wave64 program.
+    ex.isa_preamble = [0, 128, 1, 1];
+    assert_eq!(super::super::translate(&ex).unwrap().required_wave_size, Some(64));
+}
+
+#[test]
 fn portable_wave_can_scale_its_result_from_an_embedded_table() {
     let (mut shader, mut words, end) = fixture::shader(64);
     words.truncate(end);

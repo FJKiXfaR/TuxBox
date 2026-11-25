@@ -938,16 +938,34 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
 // A second barrier prevents a fast host subgroup from overwriting a slot
 // before the other subgroup has consumed it. The verifier above ensures
 // that every invocation reaches these barriers in the same order.
+//
+// `count` is the number of guest threads in the group and `identity` the
+// neutral element of the reduction. A partial guest wave64 has no invocation
+// for lanes `count..63`; the guest's own masked prologue (`s_or_saveexec_b64
+// -1` then `v_cndmask` on the saved EXEC) writes the neutral element for every
+// lane EXEC excludes, so the neutral element is exactly the value those lanes
+// would contribute. RDNA2 §V_PERMLANEX16/V_READLANE and VOP3 CNDMASK: a
+// cross-lane source is defined for every lane of the wave, not only for lanes
+// that EXEC enables.
 pub(super) const PORTABLE_DECLARATIONS: &str = r#"
 groupshared uint tb_reduction_lanes[64];
-uint tb_reduction_read(uint lane, uint value, uint source) {
+uint tb_reduction_read(uint lane, uint value, uint source, uint count, uint identity) {
     tb_reduction_lanes[lane] = value;
     GroupMemoryBarrierWithGroupSync();
-    uint result = tb_reduction_lanes[source];
+    uint result = (source < count) ? tb_reduction_lanes[source] : identity;
     GroupMemoryBarrierWithGroupSync();
     return result;
 }
 "#;
+
+/// The bits `masked_identity` proves the guest wrote into the lanes its
+/// reduction prologue excludes.
+pub(super) fn neutral_bits(operation: &str) -> Option<u32> {
+    Some(match masked_identity(operation)? {
+        NeutralIdentity::Immediate(v) => v as u32,
+        NeutralIdentity::LiteralBits(b) => b,
+    })
+}
 
 #[cfg(test)]
 #[path = "../tests/hlsl/wave_sum.rs"]

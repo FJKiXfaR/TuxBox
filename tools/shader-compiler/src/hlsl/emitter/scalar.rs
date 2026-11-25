@@ -226,6 +226,23 @@ impl<'a> Emitter<'a> {
         let a = r(&s[0])?;
         match m {
             "s_mov_b32" => self.ws(&d, &a),
+            LANE_STORE => {
+                let ord = match (self.lane_area.as_ref(), ins.dst.first()) {
+                    (Some(area), Some(Opnd::Vgpr(v))) => area.get(v).copied(),
+                    _ => None,
+                };
+                let Some(ord) = ord else { return Err("lane-area store outside a lane-spill area".into()) };
+                let lane = r(&s[1])?;
+                let index = self.lane_area_index(ord, &lane);
+                // The source is a wave-uniform scalar, so a store from any active
+                // lane lands the value the guest's wave-level VGPR file receives.
+                self.line(&format!("if (exec_lo & 1u) tb_lane_area[{index}] = {a};"));
+                Ok(())
+            }
+            LANE_READ => {
+                if self.hoisted_swizzle != Some(idx) { self.emit_compute_swizzle(idx, ins, &[])?; }
+                self.ws(&d, &format!("swizzle{idx}"))
+            }
             GROUP_READ => {
                 if self.hoisted_swizzle != Some(idx) { self.emit_compute_swizzle(idx, ins, &[])?; }
                 self.ws(&d, &format!("swizzle{idx}"))

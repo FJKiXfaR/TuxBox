@@ -4,6 +4,22 @@ use super::*;
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
         self.emit_insn_body(idx, ins, is_ps, br)?;
+        // An ordinary VALU write to a lane-spill VGPR updates that lane's slot of
+        // the group-memory area, so a later run-time-selector read sees the value
+        // the guest's per-lane VGPR file holds (the console compiler parks scalars
+        // in some lanes and reuses the register as a vector).
+        if let Some(area) = self.lane_area.clone() {
+            if ins.mnemonic.starts_with("v_") && ins.mnemonic != "v_nop" {
+                for o in ins.dst.clone() {
+                    if let Opnd::Vgpr(v) = o {
+                        if let Some(ord) = area.get(&v).copied() {
+                            let index = self.lane_area_own(ord);
+                            self.line(&format!("if (exec_lo & 1u) tb_lane_area[{index}] = v{v};"));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
             let not = if vote.none { "!" } else { "" };

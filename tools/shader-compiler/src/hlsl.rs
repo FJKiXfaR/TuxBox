@@ -100,6 +100,7 @@ mod lone_lane;
 mod page_waves;
 mod wave_cull;
 mod ray_resolve;
+mod exec_mask32;
 mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
@@ -315,6 +316,12 @@ struct Emitter<'a> {
     /// Structured loop latches with a verified guest trip bound.
     wave_bounded_latches: BTreeSet<usize>,
     portable_wave64: bool,
+    /// Guest compute threads in the group when `portable_wave64` emulates a
+    /// *partial* guest wave64 (fewer than 64 threads): host lanes at and above
+    /// this index have no guest thread and hold the reduction's neutral element.
+    portable_threads: Option<u32>,
+    /// Neutral element of the reduction whose exchanges are being emitted.
+    portable_identity: Option<u32>,
     msel: HashMap<usize, MSel>,
     /// Buffer ops (MUBUF, s_buffer_load) whose descriptor register holds one of several
     /// descriptors: (register key, candidates as (descriptor id, resource)).
@@ -335,6 +342,9 @@ struct Emitter<'a> {
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
     indexed_lane: bool,
+    /// Lane-spill areas read with a run-time selector: VGPR -> group-memory ordinal.
+    /// One `groupshared` word per (VGPR, 64-lane block); see `lower_dynamic_spill_areas`.
+    lane_area: Option<BTreeMap<u8, u32>>,
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,
     resolve_wave32: bool,
@@ -466,3 +476,7 @@ mod election_order_regression;
 #[cfg(test)]
 #[path = "tests/hlsl/reduction_execz_regression.rs"]
 mod reduction_execz_regression;
+
+#[cfg(test)]
+#[path = "tests/hlsl/exec_mask32.rs"]
+mod exec_mask32_test;

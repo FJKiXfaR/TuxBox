@@ -12,7 +12,45 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Words per lane-spill area ordinal: one 64-lane block per launched row of the
+    /// group, rounded up so every guest lane of every block has a slot.
+    pub(in crate::hlsl) fn lane_area_stride(&self) -> u32 {
+        let count = compute_group(self.ex).into_iter().fold(1u32, u32::saturating_mul);
+        count.div_ceil(64).max(1) * 64
+    }
+
+    /// Index of one lane of one area ordinal inside `tb_lane_area`.
+    pub(in crate::hlsl) fn lane_area_index(&self, ord: u32, lane: &str) -> String {
+        format!("{}u + ((tb_lane & ~63u) | (({lane}) & 63u))", ord * self.lane_area_stride())
+    }
+
+    /// Index of the calling lane's own slot, for publishing an ordinary VALU write.
+    pub(in crate::hlsl) fn lane_area_own(&self, ord: u32) -> String {
+        format!("{}u + tb_lane", ord * self.lane_area_stride())
+    }
+
     pub(in crate::hlsl) fn emit_compute_swizzle(&mut self, idx: usize, ins: &Insn, active: &[usize]) -> Result<(), String> {
+        if ins.mnemonic == LANE_READ {
+            // A run-time selector indexes the per-(VGPR, 64-lane block) area of the
+            // guest's lane-spill VGPR. Publishing lanes wrote their own slot (or a
+            // `v_writelane` stored a parked scalar), so the barrier makes the whole
+            // guest wave's lane file visible before the indexed read. Like a lane
+            // read it ignores EXEC, so the barrier is hoisted out of guest branches.
+            let Some(area) = self.lane_area.as_ref() else {
+                return Err("lane-area read without a lane-spill area".into());
+            };
+            let Some(Opnd::Vgpr(v)) = ins.src.first() else {
+                return Err("lane-area read without a source VGPR".into());
+            };
+            let Some(ord) = area.get(v).copied() else {
+                return Err(format!("v{v} is not a lane-spill area"));
+            };
+            let index = self.lane_area_index(ord, &r(&ins.src[1])?);
+            self.line("GroupMemoryBarrierWithGroupSync();");
+            self.line(&format!("uint swizzle{idx} = tb_lane_area[{index}];"));
+            self.line("GroupMemoryBarrierWithGroupSync();");
+            return Ok(());
+        }
         if ins.mnemonic == GROUP_READ {
             // A lane read ignores EXEC.
             let guard: Vec<_> = active.iter().map(|label| format!("!j{label}")).collect();

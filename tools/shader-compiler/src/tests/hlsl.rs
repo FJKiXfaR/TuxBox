@@ -743,11 +743,57 @@ fn sgpr_lane_readlane_refused_without_group_reads() {
 
 #[test]
 fn sgpr_lane_readlane_refused_on_spill_area() {
-    // A vreg written by v_writelane is slotted per constant lane; a dynamic
-    // lane cannot address that slot, so it must stay refused.
+    // The slot model alone cannot address a run-time lane: a vreg written by
+    // v_writelane is slotted per constant lane, so the direct lowering refuses.
+    // `lower_dynamic_spill_areas` is the pass that turns this into an indexed
+    // group-memory area first (see the tests below).
     let mut insns = vec![spill_writelane(4, 0, 2), sgpr_lane_readlane(4, 2, 7)];
     let err = lower_lane_spills(&mut insns, false, true).expect_err("refused");
     assert!(err.contains("non-constant lane operand"));
+}
+
+#[test]
+fn dynamic_spill_area_becomes_group_memory_store_and_read() {
+    // The console compiler parks scalars in lanes 0..7/12..14 and rotates a
+    // run-time selector over them (50d4da5b:0x838). Under the group-read proof
+    // the area moves to group memory: a store per writelane and an indexed read.
+    let mut insns = vec![
+        spill_writelane(4, 12, 2),
+        sgpr_lane_readlane(4, 3, 7),
+        const_lane_readlane(4, 12, 8),
+    ];
+    let area = lower_dynamic_spill_areas(&mut insns, true).expect("pass").expect("area");
+    assert_eq!(area.get(&4), Some(&0));
+    assert_eq!(insns[0].mnemonic, "tb_lane_area_store");
+    assert_eq!(insns[0].src, vec![Opnd::Sgpr(2), Opnd::ConstInt(12)]);
+    assert_eq!(insns[1].mnemonic, "tb_lane_area_read");
+    assert_eq!(insns[1].dst, vec![Opnd::Sgpr(7)]);
+    assert_eq!(insns[1].src, vec![Opnd::Vgpr(4), Opnd::Sgpr(3)]);
+    // Constant lanes of the same area share the indexed model.
+    assert_eq!(insns[2].mnemonic, "tb_lane_area_read");
+    assert_eq!(insns[2].dst, vec![Opnd::Sgpr(8)]);
+    assert_eq!(insns[2].src, vec![Opnd::Vgpr(4), Opnd::ConstInt(12)]);
+    // No lane op is left for the slot lowering to refuse.
+    lower_lane_spills(&mut insns, false, true).expect("no lane ops left");
+}
+
+#[test]
+fn dynamic_spill_area_needs_the_group_read_proof() {
+    // Without the exchange proof the area is unsound: keep the old refusal.
+    let mut insns = vec![spill_writelane(4, 12, 2), sgpr_lane_readlane(4, 3, 7)];
+    assert!(lower_dynamic_spill_areas(&mut insns, false).expect("pass").is_none());
+    let err = lower_lane_spills(&mut insns, false, false).expect_err("refused");
+    assert!(err.contains("non-constant lane operand"));
+}
+
+#[test]
+fn constant_spill_area_without_a_dynamic_selector_keeps_its_slots() {
+    // A purely constant spill keeps the existing per-(VGPR, lane) temporaries.
+    let mut insns = vec![spill_writelane(4, 3, 2), const_lane_readlane(4, 3, 7)];
+    assert!(lower_dynamic_spill_areas(&mut insns, true).expect("pass").is_none());
+    lower_lane_spills(&mut insns, false, true).expect("slots");
+    assert_eq!(insns[0].mnemonic, "s_mov_b32");
+    assert_eq!(insns[1].mnemonic, "s_mov_b32");
 }
 
 #[test]

@@ -28,8 +28,21 @@ pub(in crate::hlsl) const LANE_TEMP_BASE: u16 = 10_000;
 /// (`50d4da5b:0x838`), so which slot a selector names depends on an earlier iteration.
 pub(in crate::hlsl) const GROUP_READ: &str = "tb_group_readlane";
 
+/// Store one scalar into one lane of a lane-spill area held in group memory
+/// (`v_writelane_b32 vN, sX, <lane>`); the lane may be an SGPR.
+pub(in crate::hlsl) const LANE_STORE: &str = "tb_lane_area_store";
+
+/// Read one lane of a lane-spill area from group memory (`v_readlane_b32 sX, vN, <lane>`);
+/// the lane may be an SGPR. A read takes part in the exchange rendezvous, a store does not.
+pub(in crate::hlsl) const LANE_READ: &str = "tb_lane_area_read";
+
 /// A read of one lane of the caller's 64-lane block, exchanged like `ds_swizzle_b32`.
-pub(in crate::hlsl) fn exchanges(i: &Insn) -> bool { i.mnemonic == "ds_swizzle_b32" || i.mnemonic == GROUP_READ }
+/// A lane-area read publishes the whole per-lane area before it, so it needs the same
+/// barrier hoisting and control-flow validation as a swizzle. A lane-area store is a
+/// plain per-thread group-memory write and deliberately is not an exchange.
+pub(in crate::hlsl) fn exchanges(i: &Insn) -> bool {
+    i.mnemonic == "ds_swizzle_b32" || i.mnemonic == GROUP_READ || i.mnemonic == LANE_READ
+}
 
 /// The highest lane any `v_readlane_b32` takes from a VGPR that no
 /// `v_writelane_b32` writes.
@@ -90,6 +103,95 @@ pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
         ins.dst = vec![Opnd::Sgpr(result)];
         ins.src.truncate(1);
     }
+}
+
+/// Lower a lane-spill area read with a run-time selector to a per-(VGPR, lane) area in
+/// group memory.
+///
+/// The console compiler reuses one VGPR as a table of scalars parked in lanes 0..7 and
+/// 12..14 and rotates a selector (`v_and 7`, `v_min3_u32`) over it inside a loop, so a
+/// constant-lane temporary cannot name the lane a selector picks. When the whole program
+/// is one complete 32-multiple guest wave (the pipeline's `group_reads` proof covers this),
+/// each scrutable lane op of a spill VGPR becomes a group-memory access:
+///
+/// * `v_writelane vN, sX, L` stores `sX` at `tb_lane_area[ord*stride + (base|L)]`,
+/// * `v_readlane sD, vN, L` reads that slot back after the exchange rendezvous
+///   (the [`LANE_READ`] pseudo-instruction is an exchange, so the emitter hoists the
+///   barrier out of forward branches exactly as [`GROUP_READ`] does),
+/// * an ordinary vector write to `vN` publishes its own lane's value to `tb_lane_area[..+tb_lane]`
+///   (done by the emitter, which sees every VALU write).
+///
+/// Stores are ordinary shared-memory writes: their sources are wave-uniform scalars, so a
+/// store from any active lane writes the value the guest's wave-level VGPR file gets. They do
+/// not need a rendezvous, so a store may live inside a guest branch; only the read's barrier
+/// is hoisted. The pipeline's existing exchange proof (complete blocks of 32, no exchange
+/// after an early exit, and the single-guest-wave scalar-loop rule) then applies unchanged,
+/// and the group-shared budget grows by one word per (VGPR, 64-lane block).
+pub(in crate::hlsl) fn lower_dynamic_spill_areas(
+    insns: &mut [Insn],
+    group_reads: bool,
+) -> Result<Option<BTreeMap<u8, u32>>, String> {
+    const READLANE: u32 = 0x360;
+    const WRITELANE: u32 = 0x361;
+    if !group_reads {
+        return Ok(None);
+    }
+    let written: BTreeSet<u8> = insns.iter()
+        .filter(|i| i.enc == Enc::Vop3 && i.op == WRITELANE)
+        .filter_map(|i| match i.dst.first() {
+            Some(Opnd::Vgpr(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    if written.is_empty() { return Ok(None); }
+    let dynamic = insns.iter().any(|i| {
+        i.enc == Enc::Vop3
+            && i.op == READLANE
+            && matches!(i.src.first(), Some(Opnd::Vgpr(v)) if written.contains(v))
+            && !matches!(i.src.get(1), Some(Opnd::ConstInt(_)))
+    });
+    if !dynamic { return Ok(None); }
+    let mut area: BTreeMap<u8, u32> = BTreeMap::new();
+    for ins in insns.iter() {
+        if ins.enc != Enc::Vop3 || ins.op != WRITELANE { continue; }
+        let Some(Opnd::Vgpr(v)) = ins.dst.first() else { continue };
+        if !matches!(ins.src.first(), Some(Opnd::Sgpr(_) | Opnd::ConstInt(_) | Opnd::Literal(_))) {
+            return Err(format!(
+                "v_writelane at {:#x}: a lane-spill area needs a wave-uniform source",
+                ins.offset
+            ));
+        }
+        let next = area.len() as u32;
+        area.entry(*v).or_insert(next);
+    }
+    for ins in insns.iter_mut() {
+        if ins.enc != Enc::Vop3 { continue; }
+        match ins.op {
+            WRITELANE => {
+                let Some(Opnd::Vgpr(v)) = ins.dst.first().cloned() else { continue };
+                if !area.contains_key(&v) { continue; }
+                ins.enc = Enc::Sop1;
+                ins.mnemonic = LANE_STORE.into();
+                ins.src.truncate(2);
+                ins.op = 3;
+            }
+            READLANE => {
+                let Some(Opnd::Vgpr(v)) = ins.src.first().cloned() else { continue };
+                if !area.contains_key(&v) { continue; }
+                let d = match ins.dst.first() {
+                    Some(Opnd::Vgpr(d) | Opnd::Sgpr(d)) => *d,
+                    _ => return Err(format!("v_readlane at {:#x}: unexpected destination", ins.offset)),
+                };
+                ins.mnemonic = LANE_READ.into();
+                ins.enc = Enc::Sop1;
+                ins.dst = vec![Opnd::Sgpr(d)];
+                ins.src.truncate(2);
+                ins.op = 3;
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(area))
 }
 
 pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group_reads: bool) -> Result<(), String> {

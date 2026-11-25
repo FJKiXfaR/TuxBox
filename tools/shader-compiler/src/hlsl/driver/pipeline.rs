@@ -55,6 +55,15 @@ pub(in crate::hlsl) fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&I
         && wave_sum::straight_exchange(&mut original, compute_group(ex)) {
         return first;
     }
+    // The exact wave mask: EXEC is the real 32-bit mask of one full host wave, so ballots,
+    // `v_cmpx`, saveexec, `s_ff1`/`s_bcnt1` and `v_mbcnt` on the mask are exact. Tried before
+    // the per-lane fallback because it does not approximate the wave; a program it cannot
+    // express is refused by `exec_mask32::select` and still reaches the fallbacks.
+    if exec_mask32::eligible(ex) {
+        let masked = exec_mask32::retry(|| translate_outputs_once(ex, feeds_ps, output_order, stencil_target))
+            .and_then(|t| exec_mask32::check(&t.hlsl).map(|()| t));
+        if let Ok(translated) = masked { return Ok(translated); }
+    }
     // Appends only: each lane may allocate for itself.
     let alone = lone_lane::retry(|| translate_outputs_once(ex, feeds_ps, output_order, stencil_target))
         .and_then(|t| lone_lane::check(&t.hlsl).map(|()| t));
@@ -95,7 +104,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     };
     let mut insns = disassemble(&ex.isa);
     if lone_lane::on() { lone_lane::prepare(&mut insns)?; }
-    let resolve_wave32 = !lone_lane::on() && ray_resolve::wave32(ex, &insns)?;
+    let resolve_wave32 = !lone_lane::on() && exec_mask32::select(ex, &insns)?;
     let probe = radiance_probe::identify(ex);
     let probe_trace = probe.is_some();
     if let Some(probe) = probe { radiance_probe::prepare(probe, &mut insns); }
@@ -186,7 +195,8 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         count != 0 && count % 32 == 0 && count <= 1024 && max_lane < 64
             && (tail == 0 || max_lane < i64::from(tail))
     });
-    if !wave_cull && !page_waves { {
+    let mut lane_area = None;
+    if !wave_cull && !page_waves {
         // Swizzles already exchange values through group memory; so can a lane read.
         let [x, y, z] = compute_group(ex);
         // Swizzle shaders already handle EXEC; a fully uniform shader (no EXEC
@@ -198,9 +208,14 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             && (swizzle_group_reads || has_dynamic_lane_read || lane_broadcast && scan_width.is_none())
             && !insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32" && i.mnemonic.starts_with("ds_ordered"));
         if ex.stage == Stage::Pixel && pixel_heap_base(ex, 5).is_some() { lower_first_lane_reads(&mut insns); }
+        // A run-time selector over a lane-spill area needs the whole per-lane area in
+        // group memory. Only engage it under the same proof that makes the group read
+        // sound (complete 32-blocks, one guest wave or a validated in-loop rendezvous).
+        lane_area = lower_dynamic_spill_areas(&mut insns, group_reads)?;
         lower_lane_spills(&mut insns, resolve_wave32, group_reads)?;
-    } }
+    }
     let mut em = Emitter::new(ex, insns);
+    em.lane_area = lane_area;
     if let Some(mode) = election {
         if compute_group(ex).into_iter().product::<u32>() <= 32 || em.insns.iter().any(|i| matches!(i.mnemonic.as_str(), "tb_first_exec_lane" | "s_ff1_i32_b64") && i.src == [Opnd::ExecLo]) {
             em.exec_snapshots = exec_snapshot::analyze(&em.insns, mode);
@@ -326,13 +341,25 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
-    em.compute_swizzle = ex.stage == Stage::Compute && scan_width.is_none() && !resolve_wave32
-        && (em.insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") || has_dynamic_lane_read || lane_broadcast);
+    em.compute_swizzle = ex.stage == Stage::Compute && !resolve_wave32
+        && (em.lane_area.is_some()
+            || scan_width.is_none()
+                && (em.insns.iter().any(|i| i.mnemonic == "ds_swizzle_b32") || has_dynamic_lane_read || lane_broadcast));
     if em.compute_swizzle {
         let [x, y, z] = compute_group(ex);
         let count = x.checked_mul(y).and_then(|n| n.checked_mul(z)).unwrap_or(0);
         if count == 0 || count > 1024 || count % 32 != 0 {
             return Err("compute swizzle requires complete blocks of 32 lanes".into());
+        }
+        // A lane-spill area (see `lower_dynamic_spill_areas`) is one word per
+        // (VGPR, 64-lane block); it is added to the same group-shared budget as
+        // `tb_swizzle` and the guest's reflected LDS allocation.
+        if let Some(area) = &em.lane_area {
+            let stride = count.div_ceil(64) * 64;
+            let words = (area.len() as u32).saturating_mul(stride);
+            if words.saturating_mul(4).saturating_add(4 * count) > 32768 {
+                return Err("lane spill area exceeds the group shared budget".into());
+            }
         }
         let last = em.insns.iter().rposition(exchanges).unwrap_or(0);
         if em.insns[..last].iter().any(|i| i.mnemonic == "s_endpgm") {
@@ -361,6 +388,17 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         if bytes == 0 || bytes + 4*threads > 32768 { return Err("guest LDS and exchange exceed the group shared budget".into()); }
         em.reflected_lds_words = Some(bytes/4);
     }
+    // A guest compute group that is a single wave64 with fewer than 64 threads
+    // runs as ceil(n/32) host wave32 waves. When the only lane-crossing
+    // operations are the verified masked reductions, every exchange can
+    // rendezvous through group memory instead (`portable_wave64`) and the guest
+    // lanes between n and 63 contribute the reduction's neutral element. That is
+    // exact: the guest prologue writes the same neutral element into every lane
+    // its saved EXEC excludes, and RDNA2 defines a cross-lane source for every
+    // lane of the wave, not only for lanes EXEC enables.
+    let partial_wave64 = ex.stage == Stage::Compute && required_wave_size == Some(64)
+        && compute_threads.is_some_and(|n| (33..64).contains(&n))
+        && wave_sum::portable_single_wave(&em.insns);
     if let Some(width) = required_wave_size {
         match wave_sum::check_control_flow(&em.insns, width) {
             Ok(guards) => em.reduction_execz_guards = guards,
@@ -383,7 +421,8 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             // 32-lane pixel wave is therefore natively satisfied; a 64-lane one would
             // need a second half-wave the host cannot offer.
             Stage::Pixel => width == 32,
-            _ => count.is_some_and(|n| n % width == 0 || partial_election && n > 0 && n < width),
+            _ => count.is_some_and(|n| n % width == 0 || partial_election && n > 0 && n < width
+                || width == 64 && partial_wave64),
         };
         if !complete {
             return Err(if ex.stage == Stage::Pixel {
@@ -394,7 +433,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         }
     }
     em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
-        && compute_group(ex) == [64, 1, 1]))
+        && (compute_group(ex) == [64, 1, 1] || partial_wave64)))
         && em.lockstep.is_none()
         && ex.stage == Stage::Compute
         && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
@@ -405,6 +444,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
+    if em.portable_wave64 && partial_wave64 { em.portable_threads = compute_threads; }
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
     }

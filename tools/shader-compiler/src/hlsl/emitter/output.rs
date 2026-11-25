@@ -358,6 +358,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             if self.compute_swizzle || self.indexed_lane {
                 writeln!(h, "groupshared uint tb_swizzle[{}];", tx * ty_ * tz).unwrap();
             }
+            if let Some(area) = &self.lane_area {
+                let stride = self.lane_area_stride();
+                writeln!(h, "groupshared uint tb_lane_area[{}];", area.len() as u32 * stride).unwrap();
+            }
             if let Some(width) = self.required_wave_size.filter(|_| !self.portable_wave64) {
                 writeln!(h, "[WaveSize({width})]").unwrap();
             }
@@ -382,7 +386,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 writeln!(h, "    uint tb_wave_tid = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
-            if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp {
+            if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp
+                || self.portable_threads.is_some() || self.lane_area.is_some()
+            {
                 writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             if self.resolve_wave32 {
