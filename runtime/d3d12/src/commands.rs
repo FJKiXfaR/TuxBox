@@ -170,6 +170,17 @@ impl Recording {
     fn draw(&mut self, list: &List, rasterizes: bool, draw: impl FnOnce()) {
         let null_usage = self.bindings.null_usage.clone();
         let display_bound = self.display_bound;
+        if display_bound && rasterizes {
+            static CALLERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            if let Some(rva) = crate::survey::title_rva() {
+                let mut seen = CALLERS.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 8 && !seen.contains(&rva) {
+                    seen.push(rva);
+                    drop(seen);
+                    crate::diagnostics::log(&format!("display draw submitted from title RVA {rva:#x}"));
+                }
+            }
+        }
         let draw = move || {
             draw();
             if rasterizes {
@@ -1721,6 +1732,15 @@ unsafe fn present_planes(
     // The finished frame usually lands in a placed render target while the
     // present names the committed display surface. Show the render target the
     // title actually drew into when its shape matches (see present::redirect).
+    static PRESENT_CALLERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    if let Some(rva) = crate::survey::title_rva() {
+        let mut seen = PRESENT_CALLERS.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 8 && !seen.contains(&rva) {
+            seen.push(rva);
+            drop(seen);
+            crate::diagnostics::log(&format!("PresentX submitted from title RVA {rva:#x}"));
+        }
+    }
     let redirected = crate::present::redirect::source(&source);
     static SOURCE_NOTE: std::sync::Once = std::sync::Once::new();
     crate::diagnostics::log_once(&SOURCE_NOTE, || format!(

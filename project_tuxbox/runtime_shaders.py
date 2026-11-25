@@ -241,8 +241,8 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     fast_limit = (256 << 10) if target == "ps_6_6" else (128 << 10)
     if target in ("ps_6_6", "cs_6_6") and hlsl.stat().st_size >= fast_limit:
         try:
-            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
-                      "-Fo", output, hlsl], timeout=15)
+            run_tool([dxc, "-T", target, *entry, *unoptimised, "-disable-lifetime-markers",
+                      "-Fo", output, hlsl], timeout=30 if unoptimised else 15)
             if not output.exists():
                 raise ValueError("compiler returned no DXIL output")
             return validated_dxil(dxv, output, stage)
@@ -268,7 +268,12 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         run_unoptimised()
         return validated_dxil(dxv, output, stage)
     try:
-        run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+        # TUXBOX_UNOPTIMISED_DXIL=1 compiles without optimisations: the native
+        # driver faults inside its own compiler on some optimised translations,
+        # and it re-optimises the DXIL when it builds the pipeline anyway.
+        unoptimised = ["-Od"] if os.environ.get("TUXBOX_UNOPTIMISED_DXIL") else []
+        run_tool([dxc, "-T", target, *entry, *unoptimised, "-Fo", output, hlsl],
+                 timeout=30 if unoptimised else 15)
     except subprocess.TimeoutExpired:
         if store:
             store.mark_slow(request, target)
@@ -450,7 +455,9 @@ def request_notifications(directory, stop):
 # when the executable is simply rebuilt. Hashing the binary made every rebuild
 # start from an empty cache directory, which looked like the driver recompiling
 # everything.
-TRANSLATOR_CACHE_VERSION = "tuxbox-xshader-output-2"
+TRANSLATOR_CACHE_VERSION = ("tuxbox-xshader-output-unoptimised"
+                        if os.environ.get("TUXBOX_UNOPTIMISED_DXIL")
+                        else "tuxbox-xshader-output-2")
 
 
 def snapshot_compiler_cache(xshader, cache_root):

@@ -59,7 +59,10 @@ class DxilStore:
             if not re.fullmatch(r"[a-f0-9]{64}", identity):
                 return None
             # <cache root>/runtime/<translator fingerprint> -> <cache root>/dxil/<toolchain>
-            root = cache.parent.parent / "dxil" / identity
+            # A compile-policy change gets its own tree: the key hashes the HLSL and
+            # target only, so optimised and unoptimised DXIL would otherwise mix.
+            policy = "dxil-unoptimised" if os.environ.get("TUXBOX_UNOPTIMISED_DXIL") else "dxil"
+            root = cache.parent.parent / policy / identity
             root.mkdir(parents=True, exist_ok=True)
         except (OSError, UnicodeError):
             return None

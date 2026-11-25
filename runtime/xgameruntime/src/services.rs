@@ -108,7 +108,16 @@ pub(super) unsafe extern "system" fn async_run(_: &Object, block: *mut c_void, w
 }
 
 /// XAsyncGetStatus (threading slot 3) for operations started here.
+/// `TUXBOX_TRACE_API=1`: name every XUser/XAsync call the title makes, so a
+/// frontend that stops right after sign-in is visible in the log.
+fn trace_api(call: &str) {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_TRACE_API").is_some());
+    if *ON { super::report(format_args!("api {call}")); }
+}
+
 pub(super) unsafe extern "system" fn async_status(_: &Object, block: *mut c_void, wait: bool) -> i32 {
+    trace_api("XAsyncGetStatus");
     loop {
         let status = match OPERATIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&(block as usize)) {
             Some(operation) => operation.status,
@@ -152,6 +161,7 @@ pub(super) fn take(block: *mut c_void) -> Result<Payload, i32> {
 // XUser (class 01acd177)
 
 pub(super) unsafe extern "system" fn user_duplicate(_: &Object, user: *mut c_void, out: *mut *mut c_void) -> i32 {
+    trace_api("XUserDuplicateHandle");
     if out.is_null() { return POINTER; }
     if !is_user(user) { return INVALID; }
     unsafe { out.write(user_handle()) };
@@ -168,10 +178,12 @@ pub(super) unsafe extern "system" fn user_max_users(_: &Object, out: *mut u32) -
 }
 /// XUserAddAsync: every add request signs in the same local user.
 pub(super) unsafe extern "system" fn user_add_async(_: &Object, options: u32, block: *mut c_void) -> i32 {
+    trace_api("XUserAddAsync");
     super::report(format_args!("XUserAddAsync options {options:#x}: signing in the local user"));
     unsafe { complete(block, OK, 0, Payload::User) }
 }
 pub(super) unsafe extern "system" fn user_add_result(_: &Object, block: *mut c_void, out: *mut *mut c_void) -> i32 {
+    trace_api("XUserAddResult");
     if out.is_null() { return POINTER; }
     match take(block) {
         Ok(Payload::User) => {
@@ -183,6 +195,7 @@ pub(super) unsafe extern "system" fn user_add_result(_: &Object, block: *mut c_v
     }
 }
 pub(super) unsafe extern "system" fn user_local_id(_: &Object, user: *mut c_void, out: *mut u64) -> i32 {
+    trace_api("XUserGetLocalId");
     if out.is_null() { return POINTER; }
     if !is_user(user) { return INVALID; }
     unsafe { out.write(LOCAL_ID) };
@@ -214,6 +227,7 @@ pub(super) unsafe extern "system" fn user_is_guest(_: &Object, user: *mut c_void
 }
 /// XUserState::SignedIn is 0.
 pub(super) unsafe extern "system" fn user_state(_: &Object, user: *mut c_void, out: *mut u32) -> i32 {
+    trace_api("XUserGetState");
     if out.is_null() { return POINTER; }
     if !is_user(user) { return INVALID; }
     unsafe { out.write(0) };
@@ -233,6 +247,7 @@ pub(super) unsafe extern "system" fn user_check_privilege(
 pub(super) unsafe extern "system" fn user_register_change(
     _: &Object, _queue: usize, _context: *mut c_void, _callback: *mut c_void, token: *mut u64,
 ) -> i32 {
+    trace_api("XUserRegisterForChangeEvent");
     if token.is_null() { return POINTER; }
     unsafe { token.write(next_token()) };
     OK
@@ -374,6 +389,7 @@ pub(super) extern "system" fn package_enumerate(
 pub(super) unsafe extern "system" fn user_gamertag(
     _: &Object, user: *mut c_void, _component: u32, size: usize, buffer: *mut u8, used: *mut usize,
 ) -> i32 {
+    trace_api("XUserGetGamertag");
     const NAME: &[u8] = b"TuxBox\0";
     if !is_user(user) { return INVALID; }
     if !used.is_null() { unsafe { used.write(NAME.len()) } };
