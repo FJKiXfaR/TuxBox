@@ -127,7 +127,9 @@ pub(super) fn prepare(insns: &mut [Insn]) -> Result<(), String> {
         let at = ins.offset;
         let m = ins.mnemonic.clone();
         if ins.enc == Enc::Vop2 && dpp(ins) {
-            if m != "v_add_nc_u32" && !idempotent(&m) { return Err(format!("lone lane: {m} across lanes at {at:#x}")); }
+            // Signed extrema can be observed outside the append loop: a lane-local
+            // copy loses their cross-lane result if exact lowering has failed.
+            if matches!(m.as_str(), "v_min_i32" | "v_max_i32") || m != "v_add_nc_u32" && !idempotent(&m) { return Err(format!("lone lane: {m} across lanes at {at:#x}")); }
             // The other lanes hold zero.
             let own = ins.src.get(1).cloned().ok_or("lone lane: operand")?;
             ins.mnemonic = "v_mov_b32".into();

@@ -64,6 +64,8 @@ pub fn extrema(width: u32, operation: &str) -> ShaderExtract {
     let (opcode, identity) = match operation {
         "umin" => (0x26000000, None),
         "umax" => (0x28000000, None),
+        "smin" => (0x22000000, Some(i32::MAX as u32)),
+        "smax" => (0x24000000, Some(i32::MIN as u32)),
         "fmin" => (0x1e000000, Some(0x7f800000)),
         "fmax" => (0x20000000, Some(0xff800000)),
         _ => panic!("invalid operation"),

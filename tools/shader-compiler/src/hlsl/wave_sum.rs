@@ -91,8 +91,7 @@ enum NeutralIdentity {
     // v_add_nc_u32 (0) and v_add_f32 (0.0 == 0x00000000). Accept ConstInt or
     // Literal encodings of the same bits.
     Immediate(i64),
-    // Neutral held in a VGPR: floating extrema materialize +/-inf with a
-    // literal move (v_mov_b32) before the AND and CNDMASK.
+    // Exact literal bits, used directly or materialized by a preceding v_mov_b32.
     LiteralBits(u32),
 }
 
@@ -107,6 +106,9 @@ fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> O
         }
         (NeutralIdentity::Immediate(v), Opnd::Literal(k)) if k == v as u32 => {
             (Opnd::Literal(k), None, None)
+        }
+        (NeutralIdentity::LiteralBits(bits), Opnd::Literal(k)) if k == bits => {
+            (ident, None, None)
         }
         (NeutralIdentity::LiteralBits(bits), Opnd::Vgpr(reg)) => {
             (Opnd::Vgpr(reg), Some(reg), Some(bits))
@@ -156,6 +158,8 @@ fn masked_identity(operation: &str) -> Option<NeutralIdentity> {
         "v_and_b32" | "v_min_u32" => Some(NeutralIdentity::Immediate(-1)),
         "v_add_nc_u32" => Some(NeutralIdentity::Immediate(0)),
         "v_add_f32" => Some(NeutralIdentity::Immediate(0)),
+        "v_min_i32" => Some(NeutralIdentity::LiteralBits(i32::MAX as u32)),
+        "v_max_i32" => Some(NeutralIdentity::LiteralBits(i32::MIN as u32)),
         "v_min_f32" => Some(NeutralIdentity::LiteralBits(f32::INFINITY.to_bits())),
         "v_max_f32" => Some(NeutralIdentity::LiteralBits(f32::NEG_INFINITY.to_bits())),
         _ => None,
@@ -811,20 +815,17 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         let Some(block) = insns.get(start..start + 12) else { return false };
         // The same group-shared exchange works for the already verified
         // extrema pattern, but only with the direct saved-EXEC predicate.
-        // A floating identity move belongs to the protected region too.
+        // A materialized identity belongs to the protected region too.
         let operation = i.mnemonic.as_str();
-        if !matches!(operation, "v_add_nc_u32" | "v_min_u32" | "v_max_u32" |
+        if !matches!(operation, "v_add_nc_u32" | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32" |
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_min_f32" | "v_max_f32") { return false; }
-        let floating = matches!(operation, "v_min_f32" | "v_max_f32");
-        let Some(covered_start) = start.checked_sub(usize::from(floating)) else { return false };
+        let Some((covered_start, _, _)) = masked_identity(operation)
+            .and_then(|identity| masked_prologue(insns, first, identity)) else { return false };
+        if covered_start != start && !(covered_start + 1 == start && block[0].mnemonic == "v_mov_b32") {
+            return false;
+        }
         let save = &insns[covered_start];
         let [Opnd::Sgpr(saved)] = save.dst[..] else { return false };
-        if floating {
-            let identity = if operation == "v_min_f32" { 0x7f800000 } else { 0xff800000 };
-            if block[0].mnemonic != "v_mov_b32" || block[0].src != [Opnd::Literal(identity)]
-                || block[0].dst.len() != 1 || block[1].src.first() != block[0].dst.first()
-            { return false; }
-        }
         if saved >= 105 || saved % 2 != 0 || save.mnemonic != "s_or_saveexec_b64"
             || save.src != [Opnd::ConstInt(-1)]
             || block[1].mnemonic != "v_cndmask_b32"
@@ -1208,7 +1209,7 @@ mod tests {
 
     #[test]
     fn portable_extrema_requires_direct_exec_and_no_mask_escape() {
-        for operation in ["umin", "umax", "fmin", "fmax"] {
+        for operation in ["umin", "umax", "smin", "smax", "fmin", "fmax"] {
             let ex = fixture::extrema(64, operation);
             let translated = super::super::translate(&ex).unwrap();
             assert_eq!(translated.required_wave_size, None);
@@ -1221,7 +1222,7 @@ mod tests {
             let mut altered = ops.clone();
             altered[select].src[2] = Opnd::Sgpr(8);
             assert!(!portable_single_wave(&altered));
-            if operation.starts_with('f') {
+            if matches!(operation, "smin" | "smax" | "fmin" | "fmax") {
                 let mut altered = ops.clone();
                 altered[select-1].src[0] = Opnd::Literal(0);
                 assert!(!portable_single_wave(&altered));
@@ -1232,6 +1233,41 @@ mod tests {
             assert!(!portable_single_wave(&altered));
             let native = fixture::extrema(32, operation);
             assert_eq!(super::super::translate(&native).unwrap().required_wave_size, Some(32));
+        }
+    }
+
+    #[test]
+    fn extrema_accept_the_same_identity_as_a_direct_literal() {
+        for op in ["smin", "smax", "fmin", "fmax"] {
+            let mut shader = fixture::extrema(64, op);
+            let mut words: Vec<u32> = shader.isa.chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            // Replace the literal move and register CNDMASK with a literal CNDMASK.
+            let select = [words[3], (words[4] & !0x1ff) | 0xff, words[2]];
+            words.splice(1..5, select);
+            shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            shader.isa_data = shader.isa.clone();
+            let translated = super::super::translate(&shader).unwrap();
+            assert_eq!(translated.required_wave_size, None);
+            assert!(translated.hlsl.contains("tb_reduction_read(gtid.x"));
+
+            words[3] ^= 1;
+            let isa = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            assert!(lower(&mut crate::rdna2::disassemble(&isa), 2).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_extrema_with_an_unproven_shuffle_cannot_become_lane_local() {
+        for operation in ["smin", "smax"] {
+            let mut shader = fixture::extrema(64, operation);
+            let mut words: Vec<u32> = shader.isa.chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            let shuffle = words.iter_mut().find(|w| **w == 0xde54_c102).unwrap();
+            *shuffle ^= 1 << 8; // Lane zero now reads itself instead of its partner.
+            shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            shader.isa_data = shader.isa.clone();
+            assert!(super::super::translate(&shader).is_err());
         }
     }
 
