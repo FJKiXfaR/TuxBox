@@ -653,3 +653,7 @@ Results on the measured CPU-only campaign:
 See [the receipt](../evidence/scarlett-scalar-oracle.json) for case IDs,
 seeds, exact corpus/compiler digests and counts. This is a reusable test tool,
 not a change to the shipping translator or a claim of retail compatibility.
+
+Rechecked the same core corpus after updating to upstream `3086e0b`: all
+8,577 cases passed again. The earlier #58 and mutation receipts retain their
+original source fingerprints.
