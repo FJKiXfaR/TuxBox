@@ -62,6 +62,7 @@ struct Recording {
     bound_placed_targets: Vec<Arc<Texture>>,
     resource_heap: Option<descriptors::ResourceHeap>,
     descriptor_arena: Option<Arc<device::descriptor_paging::Arena>>,
+    descriptor_leases: device::descriptor_paging::DescriptorLeases,
     indexed_arenas: Vec<Arc<device::descriptor_paging::Arena>>,
     scalar_descriptors: std::collections::HashSet<descriptors::ScalarDescriptor>,
     sampled_heaps: Vec<Range<usize>>,
@@ -120,8 +121,8 @@ impl Recording {
         };
         if let Some(table) = self.bindings.reflected_table::<true>() {
             if let Err(error) = self.bindings.with_reflected_table::<true>(
-                table, list, self.descriptor_arena.as_deref(), self.resource_heap.as_ref(),
-                &mut self.sampled_heaps, &self.resources, dispatch,
+                table, list, self.descriptor_arena.as_ref(), &mut self.descriptor_leases,
+                self.resource_heap.as_ref(), &mut self.sampled_heaps, &self.resources, dispatch,
             ) {
                 Self::skip("compute dispatch with a reflected table", error.code());
             }
@@ -131,7 +132,7 @@ impl Recording {
             Self::skip("compute dispatch: pipeline has no paged descriptor layout", E_NOTIMPL);
             return;
         }
-        if let Err(error) = self.bindings.refresh_inline_tables::<true>(self.descriptor_arena.as_deref()) {
+        if let Err(error) = self.bindings.refresh_inline_tables::<true>(self.descriptor_arena.as_ref(), &mut self.descriptor_leases) {
             Self::skip("compute dispatch: descriptor table refresh", error.code());
             return;
         }
@@ -246,7 +247,8 @@ impl Recording {
                 }
             }
             if let Err(error) = self.bindings.with_reflected_table::<false>(
-                table, list, self.descriptor_arena.as_deref(), self.resource_heap.as_ref(), &mut self.sampled_heaps, &self.resources, draw,
+                table, list, self.descriptor_arena.as_ref(), &mut self.descriptor_leases,
+                self.resource_heap.as_ref(), &mut self.sampled_heaps, &self.resources, draw,
             ) {
                 Self::skip("draw with a reflected table", error.code());
             } else { trace(self); }
@@ -256,7 +258,7 @@ impl Recording {
             Self::skip("draw: pipeline has no paged descriptor layout", E_NOTIMPL);
             return;
         }
-        if let Err(error) = self.bindings.refresh_inline_tables::<false>(self.descriptor_arena.as_deref()) {
+        if let Err(error) = self.bindings.refresh_inline_tables::<false>(self.descriptor_arena.as_ref(), &mut self.descriptor_leases) {
             Self::skip("draw: descriptor table refresh", error.code());
             return;
         }
@@ -395,6 +397,11 @@ impl Drop for RecordingGuard<'_> {
     }
 }
 
+struct RetireQueueFence {
+    fence: ID3D12Fence,
+    next: std::sync::atomic::AtomicU64,
+}
+
 // FD3D12CommandListFence::Signal reads the type at queue+0x10 before
 // selecting the flush flags. The queue's Xbox prefix precedes private state.
 #[repr(C)]
@@ -408,6 +415,23 @@ struct QueueState {
     page_worker: OnceLock<page_mapping::Worker>,
     wait_worker: OnceLock<memory_wait::Worker>,
     presentation: Presentation,
+    retire_fence: OnceLock<RetireQueueFence>,
+}
+
+impl QueueState {
+    fn retire_fence(&self, queue: &ID3D12CommandQueue) -> windows::core::Result<&RetireQueueFence> {
+        if let Some(rf) = self.retire_fence.get() {
+            return Ok(rf);
+        }
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { queue.GetDevice(&mut device)? };
+        let device = device.ok_or(E_FAIL)?;
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
+        Ok(self.retire_fence.get_or_init(|| RetireQueueFence {
+            fence,
+            next: std::sync::atomic::AtomicU64::new(0),
+        }))
+    }
 }
 
 type Queue = Proxy<ID3D12CommandQueue, QueueState>;
@@ -495,6 +519,7 @@ unsafe extern "system" fn reset(
         state.bound_placed_targets.clear();
         state.resource_heap = None;
         state.descriptor_arena = None;
+        state.descriptor_leases.clear();
         state.indexed_arenas.clear();
         state.scalar_descriptors.clear();
         state.sampled_heaps.clear();
@@ -1454,8 +1479,15 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
     let batch = std::cell::RefCell::new(String::new());
     let result = translate_batch(
         guest,
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), memory_wait::Splits::new()),
-        |&item, (textures, writes, shader_views, scene_lists, splits)| {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            memory_wait::Splits::new(),
+            device::descriptor_paging::PendingSubmissions::new(),
+        ),
+        |&item, (textures, writes, shader_views, scene_lists, splits, pending)| {
             let list = unsafe { guest_list(item, parent(&queue.parent)) }.ok_or(E_INVALIDARG)?;
             let state = recording(list);
             if !matches!(state.phase, ListState::Closed)
@@ -1478,6 +1510,9 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                     return Err(E_INVALIDARG);
                 }
             }
+            pending
+                .pin_from(&state.descriptor_leases)
+                .map_err(|e| e.code())?;
             memory_wait::note_list(
                 ptr::from_ref(list).addr(),
                 memory_wait::Fate::Submitted(queue.state.kind.0),
@@ -1506,7 +1541,7 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
             trace_samples.borrow_mut().extend(state.trace_samples.iter().cloned());
             Ok(list.native.as_raw())
         },
-        |host, (mut textures, mut writes, shader_views, scene_lists, splits)| {
+        |host, (mut textures, mut writes, shader_views, scene_lists, splits, mut pending)| {
             let holds = (!splits.is_empty())
                 .then(|| placement::held::Waits::new(splits.len().into()));
             let waits = holds.clone();
@@ -1534,7 +1569,26 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
                                 command.prepare(list)?;
                             }
                         }
+                        let retire = if !pending.is_empty() {
+                            Some(queue.state.retire_fence(&queue.native)?)
+                        } else {
+                            None
+                        };
                         memory_wait::submit(queue, host, splits, waits)?;
+                        if let Some(rf) = retire {
+                            let val = rf.next.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                            let val = if val == u64::MAX { 1 } else { val };
+                            if let Err(error) = queue.native.Signal(&rf.fence, val) {
+                                // Native work already reached the queue; retain pins rather than
+                                // exposing live GPU reads to immediate reuse.
+                                pending.disarm();
+                                return Err(error);
+                            }
+                            pending.commit(
+                                device::descriptor_paging::RetireFence::Native(rf.fence.clone()),
+                                val,
+                            );
+                        }
                         queue_trace::note(
                             &queue.native,
                             queue.state.kind.0,
@@ -1901,6 +1955,7 @@ pub(crate) unsafe fn wrap_command_list(
             bound_placed_targets: Vec::new(),
             resource_heap: None,
             descriptor_arena: None,
+            descriptor_leases: Default::default(),
             indexed_arenas: Vec::new(),
             scalar_descriptors: Default::default(),
             sampled_heaps: Vec::new(),
@@ -1964,6 +2019,7 @@ pub(crate) unsafe fn wrap_command_queue(
         page_worker: OnceLock::new(),
         wait_worker: OnceLock::new(),
         presentation: Presentation::default(),
+        retire_fence: OnceLock::new(),
     };
     unsafe {
         allocate(

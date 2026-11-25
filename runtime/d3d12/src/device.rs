@@ -477,7 +477,7 @@ unsafe extern "system" fn create_heap(
     {
         return E_INVALIDARG;
     }
-    let limit = if desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+    let mut limit = if desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         && desc.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
         && desc.NumDescriptors > 1_000_000 {
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
@@ -485,6 +485,15 @@ unsafe extern "system" fn create_heap(
             (&raw mut options).cast(), size_of_val(&options) as u32) }
             .map_or(1_000_000, |_| options.MaxViewDescriptorHeapSize.max(1_000_000))
     } else { desc.NumDescriptors };
+    if desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        && desc.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+        && let Some(cap) = std::env::var("TUXBOX_DESCRIPTOR_HEAP_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+    {
+        limit = limit.min(cap);
+    }
     let needs_inline = this.state.device11_queue && desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     let (native, arena) = if desc.NumDescriptors > limit || needs_inline {
         match descriptor_paging::Arena::create(this, desc, limit) {

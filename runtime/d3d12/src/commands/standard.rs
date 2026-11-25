@@ -46,6 +46,8 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     state.bound_placed_targets.clear();
     state.resource_heap = None;
     state.descriptor_arena = None;
+    // Earlier draws in this recording still reference their paged GPU handles,
+    // so descriptor_leases stays pinned until Reset() or Drop.
     // Desktop ClearState takes no pipeline. The guest argument is bound after
     // the reset so a following draw sees that pipeline.
     unsafe { list.native.ClearState(None::<&ID3D12PipelineState>) };
@@ -384,6 +386,9 @@ fn adopt_bundle(parent_state: &mut Recording, bundle: &Recording) -> Result<(), 
         parent_state.indexed_arenas.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
         parent_state.indexed_arenas.push(std::sync::Arc::clone(arena));
     }
+    parent_state
+        .descriptor_leases
+        .extend_from(&bundle.descriptor_leases)?;
     parent_state
         .scalar_descriptors
         .try_reserve(bundle.scalar_descriptors.len())
