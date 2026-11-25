@@ -15,9 +15,31 @@ rustup target add x86_64-pc-windows-msvc
 
 Building Lanes or a provider needs the desktop compiler and Proton setup in the [Lanes build requirements](examples/lanes/README.md#build-requirements).
 
-## Checks
+## Every change is verified on Lanes
 
-Run these from the repository root before opening a pull request. GitHub runs the same commands on every pull request and on every push to `main`. [Workflow](.github/workflows/ci.yml)
+A change is merged only after [Lanes](examples/lanes/README.md), the project's own test game, passes on a GPU with that change. This applies to every pull request. Run from the repository root:
+
+```sh
+python tuxbox.py check
+```
+
+It runs the checks below, builds Lanes and its providers, and then runs Lanes on your GPU:
+
+| Group | What runs |
+| --- | --- |
+| Replay | The game itself: course generation, input, presentation and board readback |
+| [Self-test](examples/lanes/README.md#self-test) | Xbox graphics behaviour retail titles depend on, each scenario failing if the GPU does not finish in time |
+| Shader cache | A console shader loaded from a cache prepared before launch, translated while running, then reused without compiling again |
+
+Put the printed summary, your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/lanes.json`.
+
+If your change adds or fixes behaviour, add or extend a Lanes scenario that fails without it. If it cannot be exercised from Lanes, say why in the pull request.
+
+CI has no GPU, so it cannot run Lanes. A reviewer should not merge a pull request without a passing GPU run, from the author or from someone who has the hardware. `python tuxbox.py check --no-gpu` runs only the first group while you work.
+
+## Code checks
+
+GitHub runs these on every pull request and on every push to `main`. [Workflow](.github/workflows/ci.yml)
 
 ```sh
 python -m unittest discover -s tests -q

@@ -127,17 +127,16 @@ Frosty’s menu material at entry 2 illustrates the overlap with AnyPS5’s inst
 
 ## ProjectScarlett refusals
 
-On November 25, 2026, preparation compiled 12,087 of 16,868 recorded requests and refused 4,781. None failed in DXC or the validator. [Preparation record](../evidence/projectscarlett-shader-preparation.json)
+On November 25, 2026, preparation compiled 20,583 of 25,079 recorded requests and refused 4,496. None failed in DXC or the validator. [Preparation record](../evidence/projectscarlett-shader-preparation.json)
 
 | Refusal reason | Requests |
 | --- | --- |
-| Wave reduction that may execute in divergent control flow | 2,171 |
 | Mesh request recorded without a root signature | 1,551 |
-| Image or buffer store to a table that isn't an unordered-access table | 293 |
-| Raw buffer `IDXEN` access that needs the console descriptor stride | 125 |
-| Lane operation with a non-constant lane | 114 |
-
-Pixel shaders can now use quad exchanges inside loops and in block-dispatched programs. The block-dispatched support added 49 compiled requests.
+| Wave reduction that may execute in divergent control flow | 1,502 |
+| Image store to a table that isn't an unordered-access table | 432 |
+| Buffer store to a table that isn't an unordered-access table | 145 |
+| Raw buffer `IDXEN` access that needs the console descriptor stride | 129 |
+| Lane operation with a non-constant lane | 115 |
 
 The counts are per recorded request, so they overstate what a live run loses: a request recorded without its root signature can't be translated offline. Rank failures by the pipelines a run lost with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
 

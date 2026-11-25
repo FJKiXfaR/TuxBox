@@ -2,21 +2,14 @@
   "schema": 1,
   "date_utc": "2026-11-25",
   "executable_sha256": "e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993",
-  "compiler_sha256": "7adb70be12b79126c05e5de11ffb88eb3c848f556039dcfb7e38b2d50658f0c6",
-  "log_sha256": "fc3c8fd26dd03ec0af2e63f0100f0ea4c87e2f055e223b40cefe2ac891a4b58c",
+  "compiler_sha256": "c28f447023d6379631a665c5845c06bf539e35c235ac43fab0691171f5f33aba",
+  "log_sha256": "869f7292e5d29d88ebcea5d009034c7eb3f855977432bdb2b111c8c5b67feb4c",
   "requests": {
-    "total": 16868,
-    "compiled": 12087,
-    "unsupported": 4781,
+    "total": 25079,
+    "compiled": 20583,
+    "unsupported": 4496,
     "failed": 0
   },
-  "mesh_pipelines": {
-    "gpu": "GeForce RTX 4070 Ti SUPER",
-    "backend": "stock Proton Experimental",
-    "tested": 74,
-    "created": 74,
-    "log_sha256": "20fcf954f7ed2f098ede9eb455e77a4ae44b3f96b6681d507a532398316c3cd3"
-  },
-  "duration_seconds": 86.6,
-  "dxil_reused": 12038
+  "duration_seconds": 1426,
+  "dxil_reused": 2227
 }

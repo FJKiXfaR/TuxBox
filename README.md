@@ -13,7 +13,7 @@ Many calls an Xbox Series game makes already work through standard Windows APIs.
 
 - **Lanes** is a small game that uses TuxBox’s Xbox graphics, memory and input libraries. Collect coins and dodge barriers using a keyboard, mouse or Xbox controller.
 - **The Matrix Awakens (Frosty)** reaches the Wake Up chase cinematic on Linux with TuxBox XG and reduced graphics settings. Earlier reduced-settings runs reached the highway chase and open city. With the original Xbox settings it loads the Construct map and presents a black frame before stopping while creating a compute shader during scene setup. You supply the game, its matching Xbox system files and Proton. [Setup and test results](docs/MATRIX_AWAKENS.md)
-- **GTA VI (ProjectScarlett)** gets into the story intro on Linux with stock Proton Experimental. It isn’t playable yet: many shaders are unsupported, and the recorded run crashed after about ten minutes. [Title progress](docs/PROGRESS.md) · [Setup guide](docs/PROJECTSCARLETT.md)
+- **GTA VI (ProjectScarlett)** gets into the story intro on Linux with stock Proton Experimental. It isn’t playable yet: GPU queues still stall there, many shaders are unsupported, and the prologue cutscene hasn't appeared. [Title progress](docs/PROGRESS.md) · [Setup guide](docs/PROJECTSCARLETT.md)
 
 ### Project Scarlett graphics trials
 
@@ -23,7 +23,7 @@ The Series S trial requested a 1920×1080 render resource and stopped on a textu
 
 ## Shader preparation
 
-On Linux, the launcher prepares shaders before opening Frosty and ProjectScarlett. Frosty uses a profile of its game files. ProjectScarlett records the shaders the game requests and prepares them before subsequent launches. New shaders can still compile as the game encounters them.
+On Linux, the launcher prepares shaders before opening Frosty, from a profile of its game files. ProjectScarlett records the shaders the game requests, but a normal launch doesn't wait for them: it translates shaders as the game asks. After an update that changes the shader translator, run `python tuxbox.py run --prepare-only` first. Preparing the recorded requests together is much faster than translating them during play.
 
 The launcher shows compilation progress and reuses the cache on later runs. After a TuxBox update, shaders that translate to the same source reuse their compiled output. While ProjectScarlett runs, a small panel over the game shows shader and pipeline progress. Pass `--prepare-only` to prepare the cache without opening the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the game path.
 
@@ -64,6 +64,16 @@ Run `python tuxbox.py inspect /path/to/game` to see the executable TuxBox will l
 [![Compatibility and shader progress for Frosty and Project Scarlett](docs/progress.svg)](docs/progress.svg)
 
 [Current progress](docs/PROGRESS.md) · [Xbox libraries](docs/LIBRARIES.md) · [Shader coverage](docs/SHADERS.md) · [Test results](docs/RESULTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Credits and references](docs/REFERENCES.md)
+
+## Checks before merging
+
+Every change is verified on Lanes before it is merged. From the repository root:
+
+```sh
+python tuxbox.py check
+```
+
+It runs the automated checks, builds Lanes and runs its replay, self-test and shader cache checks on your GPU. [Contributing](CONTRIBUTING.md#every-change-is-verified-on-lanes)
 
 ## Automated checks
 

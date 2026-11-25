@@ -1,6 +1,6 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The furthest recorded run got into the story intro and crashed after about ten minutes. The game isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The furthest recorded run got into the story intro, where GPU queues stalled. The game isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
@@ -80,7 +80,7 @@ Add `--mangohud` before the package path to record frame times. The prefix defau
 
 ## Shader preparation
 
-The first launch records each shader the game requests in the prefix. Before later launches, the launcher compiles the recorded requests and shows its progress, so the game reuses those translations instead of compiling them during play. Pass `--prepare-only` to prepare without starting the game, or `--no-shader-prep` to skip preparation for one launch. Place either option before the package path. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
+TuxBox records each shader the game requests in the prefix. A normal launch translates requests as they arrive and doesn't wait for the recorded set. Pass `--prepare-only` to compile every recorded request without starting the game, and the next launch reuses those translations. Place the option before the package path. [Preparation results](../evidence/projectscarlett-shader-preparation.json)
 
 ### Large pipeline compiles
 
@@ -229,20 +229,40 @@ with `--jobs 4` and add `--dxc-helper build/dxc-worker` for the experimental
 variant. Give each run a fresh output path. Compare per-request SHA-256
 values and latency.
 
+## Prepare shaders after an update
+
+A normal launch translates shaders as the game requests them. When an update
+changes the shader translator, prepare the recorded requests first. Set
+`TUXBOX_SHADER_PREP_JOBS` to run more translations at once.
+
+```sh
+python tuxbox.py run --prepare-only --backend proton --prefix PREFIX /path/to/scarlett-run/game_scarlett_master.exe
+```
+
 ## What to expect
 
-On November 25, 2026, an offline run on a GeForce RTX 4070 Ti SUPER ran for
-9 minutes 50 seconds. The game's own crash report records the state `Game
-Running`, frame 10,146 and the story intro script. The run then ended with exit
-code 5. The cause isn't established. [Run record](../evidence/projectscarlett-gameplay.json)
+On November 25, 2026, an offline run on a GeForce RTX 4070 Ti SUPER got into the
+story intro. The game's own crash report records the state `Game Running`, frame
+32,534 and the story intro script after 18 minutes 11 seconds. GPU queues stalled
+on fence waits there. The run ended on a game assert (exit code 3) after a command
+list ran out of descriptor memory. The prologue cutscene did not appear.
+[Run record](../evidence/projectscarlett-gameplay.json)
 
+- **Fence stalls.** TuxBox now records the game's fence value writes, keeps a
+  list's other work when one command can't be recorded, and no longer makes a
+  queue wait on work that sits behind a label wait. These are checked by the
+  [Lanes self-test](../examples/lanes/README.md#self-test). Stalls still occur at
+  the intro. A wait that never completes is released after five seconds, and the
+  log reports which lists write the label and where each queue stopped.
+- **Descriptor memory.** Shader-visible descriptor slots are not reclaimed and can
+  run out.
 - **Missing effects.** Many shaders are still unsupported, and large compute
   pipelines can receive empty stand-ins. Expect missing or wrong rendering.
   Image correctness hasn't been checked. [Shader coverage](SHADERS.md#projectscarlett-refusals)
-- **Long loads.** The driver takes minutes to compile the largest translated
-  compute shaders.
-- **Crashes.** The run above ended in a crash while large compiles were still
-  running.
+- **Long loads.** The driver takes minutes, and sometimes most of an hour, to
+  compile the largest translated compute shaders.
+- **Memory.** A long run needs about 15 GB of RAM plus swap. On a machine whose
+  `/tmp` is held in memory, clear large temporary files before launching.
 - **Not yet verified:** input and audio during play, frame times, and any other
   GPU or Windows.
 
