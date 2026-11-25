@@ -6713,13 +6713,6 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         }
         if ins.enc == Enc::Vop2 && ins.op == wave_sum::DPP_REDUCE {
             // Read the partner before the EXEC-guarded write, including when VDST aliases VSRC.
-            let lane = match ins.aux.imm {
-                0 => "WaveGetLaneIndex() ^ 1u",
-                1 => "(WaveGetLaneIndex() & ~3u) | ((WaveGetLaneIndex() ^ 2u) & 2u)",
-                2 => "(WaveGetLaneIndex() & ~7u) | ((WaveGetLaneIndex() ^ 4u) & 4u)",
-                3 => "WaveGetLaneIndex() ^ 15u",
-                _ => return Err("invalid integer sum step".into()),
-            };
             let t = self.tmp;
             self.tmp += 1;
             let acc = r(&s[0])?;
@@ -6728,8 +6721,19 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.pixel_sum = m.starts_with("v_add");
                 return self.wv(&d, &acc);
             }
+            let id = if self.portable_wave64 { "gtid.x" } else { "WaveGetLaneIndex()" };
+            let control = ins.raw[1] >> 8; // The reduction matcher verified this word.
+            let lane = match (ins.aux.imm, control) {
+                (0, _) => format!("{id} ^ 1u"),
+                (1, 0x936012) => format!("({id} & ~3u) | (({id} ^ 2u) & 2u)"),
+                (2, 0x000924) => format!("({id} & ~7u) | (({id} ^ 4u) & 4u)"),
+                (1, 0xb3e21a) => format!("{id} ^ 2u"),
+                (2, 0x688fac) => format!("{id} ^ 4u"),
+                (1 | 2, _) => format!("({id} & ~7u) | (({control:#x}u >> (3u * ({id} & 7u))) & 7u)"),
+                (3, _) => format!("{id} ^ 15u"),
+                _ => return Err("invalid integer sum step".into()),
+            };
             let partner = if self.portable_wave64 {
-                let lane = lane.replace("WaveGetLaneIndex()", "gtid.x");
                 format!("tb_reduction_read(gtid.x, {acc}, {lane})")
             } else { format!("WaveReadLaneAt({acc}, {lane})") };
             let combined = match m.as_str() {

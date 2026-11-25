@@ -237,23 +237,28 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
 
     // The first three DPP8 shuffles accumulate pairs, quads and octets.
     // DPP16 row_mirror combines the two octets in each 16-lane row.
-    let controls = [0xde54c1, 0x936012, 0x000924, 0xff0940];
-    for (i, (&ctrl, ins)) in controls.iter().zip(&block[2..6]).enumerate() {
+    for (step, ins) in block[2..6].iter().enumerate() {
         let [Opnd::Raw(selector), rhs] = ins.src[..] else {
             return Err("unrecognized DPP reduction shuffle");
         };
-        // SAVEEXEC enabled all lanes. FI has no effect, and ROW_MIRROR's
-        // source stays within its row, so its BOUND_CTRL has no effect either.
-        let (valid_selector, ignored_bits) = if i == 3 {
-            (selector == 250, (1 << 18) | (1 << 19))
-        } else {
-            (matches!(selector, 233 | 234), 0)
+        let Some(&word) = ins.raw.get(1) else {
+            return Err("missing DPP reduction control");
         };
-        let expected = ctrl << 8 | u32::from(acc);
-        if &ins.mnemonic != operation
-            || ins.dst != [Opnd::Vgpr(acc)]
-            || !valid_selector || rhs != Opnd::Vgpr(acc)
-            || ins.raw.get(1).is_none_or(|word| (word ^ expected) & !ignored_bits != 0)
+        // SAVEEXEC enabled every lane, so FI has no effect.
+        let valid = if step == 3 {
+            // ROW_MIRROR also stays in bounds. Preserve the row/bank masks and modifiers.
+            selector == 250 && (word & !((1 << 18) | (1 << 19))) >> 8 == 0xff0140
+        } else {
+            // Each lane holds a partial for its half. The selected lane must hold
+            // the complementary half of the same pair, quad or octet.
+            let selectors = word >> 8;
+            matches!(selector, 233 | 234) && (0..8).all(|lane| {
+                let partner = (selectors >> (3 * lane)) & 7;
+                (partner >> step) == ((lane >> step) ^ 1)
+            })
+        };
+        if !valid || word as u8 != acc || rhs != Opnd::Vgpr(acc)
+            || &ins.mnemonic != operation || ins.dst != [Opnd::Vgpr(acc)]
         {
             return Err("unrecognized DPP reduction shuffle");
         }
@@ -1099,6 +1104,38 @@ mod tests {
                 let mut ops = crate::rdna2::disassemble(&shader.isa);
                 ops[0].src = vec![Opnd::ConstInt(0)];
                 assert!(lower(&mut ops, 2).is_err(), "reduction requires full EXEC");
+            }
+        }
+    }
+
+    #[test]
+    fn dpp8_reductions_read_from_the_complementary_subgroup() {
+        for width in [32, 64] {
+            let (mut shader, mut words, _) = fixture::shader(width);
+            // Each lane picks its XOR-2 partner, then its XOR-4 partner.
+            words[6] = 0xb3e2_1a02;
+            words[8] = 0x688f_ac02;
+            shader.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            shader.isa_data = shader.isa.clone();
+            let translated = super::super::translate(&shader).unwrap();
+            let lane = if width == 32 { "WaveGetLaneIndex()" } else { "gtid.x" };
+            for distance in [2, 4] {
+                assert!(translated.hlsl.contains(&format!("{lane} ^ {distance}u")));
+            }
+
+            // An asymmetric table must retain its individual source lanes.
+            words[8] = 0x4c1d_e502; // [5, 4, 7, 6, 1, 0, 3, 2]
+            shader.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            shader.isa_data = shader.isa.clone();
+            let mixed = super::super::translate(&shader).unwrap();
+            assert!(mixed.hlsl.contains(&format!("0x4c1de5u >> (3u * ({lane} & 7u))")));
+
+            // One destination reading its own half would double-count a partial sum.
+            for (word_index, distance) in [(4, 1), (6, 2), (8, 4)] {
+                let mut invalid = words.clone();
+                invalid[word_index] ^= distance << 8;
+                let isa = invalid.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+                assert!(lower(&mut crate::rdna2::disassemble(&isa), 2).is_err());
             }
         }
     }
