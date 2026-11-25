@@ -226,13 +226,23 @@ fn refuses_unproved_ctrl_flow_and_buffer_accesses() {
         Shape::NoBitmapUpdate,
         Shape::TruncatedBitmapUpdate,
         Shape::UnresolvedOffset,
-        Shape::PerInvocation,
     ] {
         let native = translate(&shader(32, shape))
             .ok()
             .and_then(|t| t.required_wave_size);
         assert_eq!(native, None, "{shape:?}");
     }
+}
+
+#[test]
+fn per_invocation_programs_branch_with_the_whole_wave() {
+    let translated = translate(&shader(32, Shape::PerInvocation)).expect("whole-wave branches");
+    assert_eq!(translated.required_wave_size, Some(32));
+    assert!(translated.hlsl.contains("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)"));
+    assert!(!translated.hlsl.contains("if ((exec_lo & 1u) == 0u)"));
+    assert!(!translated.hlsl.contains("if ((vcc_lo & 1u) == 0u)"));
+    // Without a termination proof its loop keeps the watchdog.
+    assert!(translated.hlsl.contains("++tb_guard < 65536u"));
 }
 
 #[test]

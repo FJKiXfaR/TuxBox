@@ -10,7 +10,30 @@ pub(super) struct Flow {
 }
 
 impl Flow {
+    /// The graph of a program whose loops the structured emitter can express.
     pub(super) fn new(code: &[Insn]) -> Option<Self> {
+        let flow = Self::graph(code)?;
+        flow.structured().then_some(flow)
+    }
+
+    /// Whether every loop has one backedge and no two interleave.
+    pub(super) fn structured(&self) -> bool {
+        let mut enclosing = Vec::new();
+        let mut previous_head = None;
+        for &(head, latch) in &self.loops {
+            while enclosing.last().is_some_and(|&end| end < head) {
+                enclosing.pop();
+            }
+            if previous_head == Some(head) || enclosing.last().is_some_and(|&end| end <= latch) {
+                return false;
+            }
+            previous_head = Some(head);
+            enclosing.push(latch);
+        }
+        true
+    }
+
+    pub(super) fn graph(code: &[Insn]) -> Option<Self> {
         let n = code.len();
         let end = code.last()?.offset + 4 * code.last()?.dwords;
         let offsets: HashMap<_, _> = code
@@ -60,19 +83,6 @@ impl Flow {
             }
         }
         flow.loops.sort_unstable();
-        // Keep exactly the loop structure that the structured emitter can express.
-        let mut enclosing = Vec::new();
-        let mut previous_head = None;
-        for &(head, latch) in &flow.loops {
-            while enclosing.last().is_some_and(|&end| end < head) {
-                enclosing.pop();
-            }
-            if previous_head == Some(head) || enclosing.last().is_some_and(|&end| end <= latch) {
-                return None;
-            }
-            previous_head = Some(head);
-            enclosing.push(latch);
-        }
         let mut pending = vec![0];
         while let Some(i) = pending.pop() {
             if !std::mem::replace(&mut flow.reachable[i], true) && i < n {

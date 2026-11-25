@@ -502,6 +502,13 @@ fn execz_forward_guard(
             if op.enc == Enc::Sopp && (Emitter::branch_cond(op.op).is_some() || op.op == 1) {
                 let from = op.offset as i64;
                 let target_edge = from + 4 + 4 * op.aux.imm;
+                // An earlier EXECZ or SCC branch past the whole region is a
+                // decision of the whole wave: `check_control_flow` checks it
+                // as a skip of this region in its own right, and votes it if
+                // it is an EXECZ. So the wave still arrives here together.
+                if from < pc && target_edge > reduction_end as i64 && matches!(op.op, 4 | 5 | 8) {
+                    continue;
+                }
                 // Every invocation must reach the guard's wave vote. A forward
                 // rejoin at the guard is safe; bypasses and enclosing loops are not.
                 if (from < pc && target_edge > pc)
@@ -1254,6 +1261,41 @@ mod tests {
             ops.push(nop());
             edge(&mut ops, 1, after, 8);
             assert_eq!(check_control_flow(&ops, width).unwrap(), BTreeSet::from([1]));
+        }
+    }
+
+    #[test]
+    fn execz_forward_skip_accepts_earlier_skips_of_the_whole_region() {
+        // The shape compilers emit for nested conditions: an outer skip, then
+        // the guard, both leaving past the reduction.
+        for width in [32, 64] {
+            for (outer, extra) in [(8, 0), (8, 1), (5, 0)] {
+                let mut ops = vec![nop(), branch(outer), nop(), branch(8)];
+                ops.extend(masked_reduction(width, 7));
+                let after = ops.len();
+                ops.extend([nop(), nop()]);
+                edge(&mut ops, 1, after + extra, outer);
+                edge(&mut ops, 3, after, 8);
+                // Each EXECZ is voted on by the whole wave.
+                let voted = if outer == 8 { BTreeSet::from([1, 3]) } else { BTreeSet::from([3]) };
+                assert_eq!(check_control_flow(&ops, width).unwrap(), voted, "outer {outer} width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn execz_forward_skip_rejects_earlier_branches_it_cannot_vote_on() {
+        for width in [32, 64] {
+            // A divergent skip, and an outer skip that lands inside the region.
+            for (outer, inside) in [(6, false), (7, false), (9, false), (8, true), (5, true)] {
+                let mut ops = vec![nop(), branch(outer), nop(), branch(8)];
+                ops.extend(masked_reduction(width, 7));
+                let after = ops.len();
+                ops.push(nop());
+                edge(&mut ops, 1, if inside { 7 } else { after }, outer);
+                edge(&mut ops, 3, after, 8);
+                assert!(check_control_flow(&ops, width).is_err(), "outer {outer} width {width}");
+            }
         }
     }
 

@@ -268,20 +268,17 @@ fn region_is_intact(flow: &Flow, region: &RangeInclusive<usize>) -> bool {
         && (*region.start()..*region.end()).all(|i| flow.edges[i] == [None, Some(i + 1)])
 }
 
-/// In this emitter mode the entry scalars already have wave-uniform values.
-/// Every reachable scalar write must preserve that invariant. Scalar branch
-/// conditions then preserve host participation, including in earlier loops
-/// that retain the emitter's watchdog.
-pub(super) fn bounded_latches(em: &Emitter<'_>) -> Option<BTreeSet<usize>> {
-    let code = &em.insns;
-    if !em.resolve_wave32
-        || em.packed.is_some()
-        || em.wave_cull
-        || em.page_waves
-        || em.compute_swizzle
-        || em.indexed_lane
-        || !em.vote_uses.is_empty()
-        || code.iter().any(|op| {
+/// Whether the emitter keeps whole lane masks and nothing outside the scalar
+/// instructions can change them.
+fn full_mask_program(em: &Emitter<'_>) -> bool {
+    em.resolve_wave32
+        && em.packed.is_none()
+        && !em.wave_cull
+        && !em.page_waves
+        && !em.compute_swizzle
+        && !em.indexed_lane
+        && em.vote_uses.is_empty()
+        && !em.insns.iter().any(|op| {
             (op.mnemonic.starts_with("tb_") && op.mnemonic != ray_resolve::READ_LANE)
                 || op.enc == Enc::Ds
                 || matches!(
@@ -289,7 +286,32 @@ pub(super) fn bounded_latches(em: &Emitter<'_>) -> Option<BTreeSet<usize>> {
                     "s_barrier" | "s_sendmsg" | "s_sendmsghalt"
                 )
         })
-    {
+}
+
+/// Interleaved loops go through the block dispatcher, where no loop needs a
+/// bound of its own: it is enough that every scalar write keeps the entry
+/// scalars wave-uniform, so each branch is a decision of the whole wave and the
+/// lanes follow the same blocks.
+pub(super) fn uniform_dispatch(em: &Emitter<'_>) -> bool {
+    let code = &em.insns;
+    if !full_mask_program(em) {
+        return false;
+    }
+    let Some(flow) = Flow::graph(code) else { return false };
+    if flow.structured() || wave_sum::reduction_regions(code, 32).any(|(_, region)| !region_is_intact(&flow, &region)) {
+        return false;
+    }
+    let effects: Vec<_> = code.iter().map(Effect::new).collect();
+    (0..code.len()).all(|i| !flow.reachable[i] || scalar::scalar_step(em, &flow, &effects, i))
+}
+
+/// In this emitter mode the entry scalars already have wave-uniform values.
+/// Every reachable scalar write must preserve that invariant. Scalar branch
+/// conditions then preserve host participation, including in earlier loops
+/// that retain the emitter's watchdog.
+pub(super) fn bounded_latches(em: &Emitter<'_>) -> Option<BTreeSet<usize>> {
+    let code = &em.insns;
+    if !full_mask_program(em) {
         return None;
     }
     let flow = Flow::new(code)?;

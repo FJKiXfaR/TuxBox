@@ -84,6 +84,7 @@ mod ray_resolve;
 mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
+mod lockstep;
 mod wave_loops;
 mod raw_index;
 mod reflection_compact;
@@ -644,6 +645,9 @@ struct Emitter<'a> {
     required_wave_size: Option<u32>,
     // Proven whole-wave EXECZ guards of verified masked reductions.
     reduction_execz_guards: BTreeSet<usize>,
+    /// Set when every branch is a decision of the whole wave (see `lockstep`),
+    /// with the condition codes to vote after the instructions that set them.
+    lockstep: Option<BTreeMap<usize, lockstep::Vote>>,
     /// Structured loop latches with a verified guest trip bound.
     wave_bounded_latches: BTreeSet<usize>,
     portable_wave64: bool,
@@ -1932,9 +1936,15 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         match wave_sum::check_control_flow(&em.insns, width) {
             Ok(guards) => em.reduction_execz_guards = guards,
             Err(reason) if em.resolve_wave32 && !requires_ballot && scan_width.is_none() => {
-                em.wave_bounded_latches = wave_loops::bounded_latches(&em).ok_or(reason)?;
+                if !wave_loops::uniform_dispatch(&em) {
+                    em.wave_bounded_latches = wave_loops::bounded_latches(&em).ok_or(reason)?;
+                }
             }
-            Err(reason) => return Err(reason),
+            Err(reason) => {
+                let ordinary = ex.stage == Stage::Compute && !em.wave_cull && !em.page_waves
+                    && !em.resolve_wave32 && !lone_lane::on();
+                em.lockstep = Some(ordinary.then(|| lockstep::prove(&em.insns, width)).flatten().ok_or(reason)?);
+            }
         }
         let [x, y, z] = compute_group(ex);
         if ex.stage != Stage::Compute || !x.checked_mul(y).and_then(|n| n.checked_mul(z)).is_some_and(|n| n % width == 0 || partial_election && n > 0 && n < width) {
@@ -1943,6 +1953,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     }
     em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
         && compute_group(ex) == [64, 1, 1]))
+        && em.lockstep.is_none()
         && ex.stage == Stage::Compute
         && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
         && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
@@ -2458,6 +2469,7 @@ impl<'a> Emitter<'a> {
             view_cull: None,
             required_wave_size: None,
             reduction_execz_guards: BTreeSet::new(),
+            lockstep: None,
             wave_bounded_latches: BTreeSet::new(),
             portable_wave64: false,
             msel: HashMap::new(),
@@ -5279,6 +5291,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
 
     fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
         self.emit_insn_body(idx, ins, is_ps, br)?;
+        if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
+            let mask = r(&vote.mask)?;
+            let not = if vote.none { "!" } else { "" };
+            self.line(&format!("scc = uint({not}WaveActiveAnyTrue(({mask} & 1u) != 0u));"));
+        }
         if self.vote_defs.contains(&idx) {
             let mask = r(&ins.dst[0])?;
             self.line(&format!("tb_votes{idx} = WaveActiveCountBits(({mask} & 1u) != 0u);"));
@@ -5506,7 +5523,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     _ => return Err("unsupported SOPP".into()),
                 };
                 if let (Some(c), Some(t)) = (cond, br) {
-                    let c = if self.resolve_wave32 { wave_cull::branch_condition(self, ins, &c) } else { c };
+                    let c = if self.resolve_wave32 || self.lockstep.is_some() {
+                        wave_cull::branch_condition(self, ins, &c)
+                    } else { c };
                     self.line(&format!("if ({c}) j{t} = true;"));
                 }
                 Ok(())
@@ -11162,7 +11181,7 @@ mod reduction_execz_regression {
     }
 
     #[test]
-    fn reduction_execz_rejects_prior_bypass_before_prologue() {
+    fn reduction_execz_behind_a_bypass_branches_with_the_whole_wave() {
         for width in [32, 64] {
             let (mut shader, mut words, end) = fixture::shader(width);
             words.truncate(end);
@@ -11172,8 +11191,10 @@ mod reduction_execz_regression {
             words.push(0xbf81_0000);
             shader.isa = words.into_iter().flat_map(u32::to_le_bytes).collect();
             shader.isa_data = shader.isa.clone();
-            let error = translate(&shader).err().expect("bypassed wave vote refused");
-            assert!(error.contains("divergent control flow"), "{error}");
+            // One targeted vote cannot cover this shape, so every branch votes.
+            let translated = translate(&shader).expect("whole-wave branches");
+            assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 2);
+            assert!(!translated.hlsl.contains("if ((exec_lo & 1u) == 0u)"));
         }
     }
 
