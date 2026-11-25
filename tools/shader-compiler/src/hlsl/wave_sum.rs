@@ -802,7 +802,7 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<
 
 // Only a complete, single guest wave64 may use group rendezvous. Every
 // branch must be proven group-uniform and every collective must be one of the
-// exact recognized integer reductions. All other programs keep the native path.
+// exact recognized reductions. All other programs keep the native path.
 pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
     let mut covered = vec![false; insns.len()];
     let mut masks = Vec::new();
@@ -817,7 +817,7 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         // extrema pattern, but only with the direct saved-EXEC predicate.
         // A materialized identity belongs to the protected region too.
         let operation = i.mnemonic.as_str();
-        if !matches!(operation, "v_add_nc_u32" | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32" |
+        if !matches!(operation, "v_add_nc_u32" | "v_add_f32" | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32" |
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_min_f32" | "v_max_f32") { return false; }
         let Some((covered_start, _, _)) = masked_identity(operation)
             .and_then(|identity| masked_prologue(insns, first, identity)) else { return false };
@@ -1185,8 +1185,11 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_reductions_use_shared_memory_only_for_a_single_wave64() {
-        for (opcode, neutral, operator) in [(0x36, 0xc1, '&'), (0x38, 0x80, '|'), (0x3a, 0x80, '^')] {
+    fn bitwise_and_float_sum_reductions_use_shared_memory_only_for_a_single_wave64() {
+        for (opcode, neutral, combine) in [
+            (0x36, 0xc1, ") & v2;"), (0x38, 0x80, ") | v2;"),
+            (0x3a, 0x80, ") ^ v2;"), (0x06, 0x80, ")) + asfloat(v2))"),
+        ] {
             let (mut shader, mut words, end) = fixture::shader(64);
             words.truncate(end);
             words[2] = (words[2] & !0xff) | neutral;
@@ -1199,7 +1202,7 @@ mod tests {
             let single = super::super::translate(&shader).unwrap();
             assert_eq!(single.required_wave_size, None);
             assert!(single.hlsl.lines().any(|line| line.contains("tb_reduction_read(gtid.x")
-                && line.contains(&format!(") {operator} v2;"))));
+                && line.contains(combine)));
 
             shader.isa_preamble = [0, 128, 1, 1];
             let multi = super::super::translate(&shader).unwrap();
