@@ -2,6 +2,7 @@
 mod depth;
 mod msaa_color;
 #[cfg(test)]
+#[path = "tests/lib.rs"]
 mod tests;
 pub use depth::DepthStencil;
 
