@@ -534,60 +534,6 @@ python tools/reference/scarlett_resource_fixture.py /tmp/resource-control
 the sampled memory and the improved/negative frame-time controls. In the
 negative control two pairs improve but the third contains 100 ms stalls;
 the all-pairs gate correctly fails despite the improved median.
-### Ordinary scalar bit operations
-
-The generic translator supports nine additional scalar bit instructions and applies the ordinary-scalar proof to the three forms already added by #56
-(32/64-bit zero counts, zero searches, leading-bit searches, reversal,
-bit setting/clearing and testing). The local reaching-definition check
-requires ordinary scalar values, not an assumed full-wave EXEC/VCC mask.
-Unknown halves, branch entries and indirect control flow remain unsupported;
-private packed and mesh paths are outside this proof. The rules follow
-[AMD's RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf), SOP1/SOPC.
-
-CPU-only controls:
-
-- Capture `cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu scalar_bit_cpu_oracle_fixture -- --nocapture`
-  to a fresh fixture file. Run `python tools/check_scalar_bits.py --help`
-  for the DXC/DXV numerical oracle: 1,944 cases, 7,776 checked values.
-- Run `python tools/check_scalar_native.py --help` with the baseline and
-  candidate xshader executables: 13 synthetic native programs recovered,
-  six deliberately unsupported controls retained, one unchanged control.
-
-[CPU evidence](../evidence/scarlett-ordinary-scalar-bits.json). These controls
-are not retail shader coverage or proof of GPU execution.
-
-
-The dependent-compute follow-up preserves ordinary scalar provenance through
-verified min/max, wide shifts, bit updates and conditional/carry operations
-only when the ordinary inputs (and, when required, SCC) are proven. It
-does not relax branch, special wave-mask, mesh or unknown-input checks.
-The CPU campaign found 483 rejected programs among 2,048 synthetic extended
-programs on the previous #58 implementation, across twelve known
-provenance-related refusal signatures. The twelve minimized native
-reproducers are now permanent compiler tests. The full 2,048-program
-campaign and the older 8,577 core plus 10,113 extended CPU-oracle programs
-pass on the integrated current main + follow-up build (186,642 observed
-register/flag values in total). Negative controls reject unknown SCC,
-EXEC-derived SCC and unproven high halves. See
-[evidence](../evidence/scarlett-dependent-scalar-chains.json). No GPU or
-retail compatibility claim.
-
-### Investigate allocation-size mismatches
-
-For a diagnostic launch, set `TUXBOX_LOG=stderr` and
-`TUXBOX_TRACE_ALLOCATION_BYTES=8192,16384,invalid` before the normal offline
-launch command. Rebuild and restage the provider first. The optional trace
-reports exact selected allocation sizes (decimal or 0x-prefixed hex), including
-the failing size sentinel with `invalid`. It records the title-relative caller,
-resource descriptions and returned alignment, not resource contents. Repeated
-records are deduplicated; at most 256 distinct records and eight descriptions
-per record are emitted. Lines share an ID to correlate interleaved threads.
-No allocation decisions are changed. This is intended to help locate the
-source of a size mismatch, not to bypass the title's assertion.
-
-
-When you report a run, include the package version, executable hash, GPU and driver, Proton build, and the log printed in the first line of the launcher's output.
-
 
 ### CPU scalar reference and generated semantic tests
 
@@ -718,3 +664,165 @@ both arms; cache primed once) measured 4.63 s vs 0.47 s median on the
 local machine. This is repeat validation with an unchanged toolchain,
 not faster cold discovery or a claim of higher FPS. The campaign remains
 deliberately narrow: no memory, wave execution, branches or GPU testing.
+
+## Offline launch and visual diagnostics
+
+These tools consume existing logs or captures; neither starts the title,
+touches the Wine prefix, changes driver settings, or uses a GPU.
+
+### Locate a launch failure
+
+```sh
+python tools/diagnose_scarlett_run.py build/scarlett.log --json build/diagnosis.json
+```
+
+The diagnostic reads the launcher's actual status format, including appended
+sessions, recorded D3D12 milestones, shader compiler outcomes, explicit
+pipeline/resource/command failures, missing imports, survey call-site RVAs
+and unhandled Wine exceptions. It reports line numbers and timestamps
+where available, counts diagnostic events separately from distinct shader
+requests, and suggests the next check for each observed fault type. Terminal
+exception/device-loss evidence is listed first, then recent diagnostic
+groups by line number; this is an investigation order, not causal ranking.
+An absolute fault address is not a title RVA. Survey asserts that were
+continued are not terminal errors. A missing exit record remains incomplete,
+not a diagnosed hang. The first presentation does not prove visible output.
+The input file should be complete and stable; mixed process output cannot
+establish exact timing or causal attribution. Files over 512 MiB are rejected
+and lines over 64 KiB are counted and skipped. Reports omit raw log messages
+and paths, but may include module names and addresses; review before sharing.
+
+In the public issue #39 log, the tool identifies the first presentation at
+line 514, page mapping at 548, the slot 86 module-not-found HRESULT at 541,
+64 logged compute-pipeline failure events and 836 distinct refused shaders.
+The log has no exit record; the missing module is not identified by its
+HRESULT, and these observations do not establish the ultimate stop.
+
+### Compare rendered frames
+
+Use a Python environment with Pillow installed (the existing project
+requirements are unchanged; the frame analysis is optional).
+Capture reference and candidate at the same camera, resolution, frame,
+UI state and color settings, preferably lossless RGB or RGBA 8-bit SDR PNG.
+The tool cannot automatically establish this equivalence.
+
+```sh
+python tools/compare_scarlett_frames.py reference.png candidate.png \
+    --json frame-comparison.json --heatmaps frame-errors
+```
+
+For a sequence, pass two directories of equally named PNGs; names must
+match exactly. The tool compares in lexicographic name order and counts
+adjacent identical pixel digests, not elapsed time or proven freezes.
+Dimensions, color metadata and modes must match. No automatic alignment,
+resizing or color conversion. RGBA compares all four straight channels,
+including transparent RGB. Optional `--roi X0 Y0 X1 Y1` uses half-open
+coordinates to exclude deliberately chosen UI/overlay areas.
+
+Default gates require exact agreement. Set `--tolerance` to a maximum
+per-channel integer difference and both `--max-fraction` and
+`--max-tile-fraction` to the allowed fraction of pixels exceeding it,
+globally and in each tile. Choose thresholds before testing; the local
+gate protects small defects from being hidden by global averages.
+The report includes MAE, MSE, PSNR (null for exact equality), bounding box,
+worst tiles, pixel digests, near-black/flat-color observations and optional
+absolute-error grayscale PNGs (0=no difference, 255=maximum difference).
+It returns 1 for a failed comparison, 2 for invalid input. Output paths
+must be fresh. Maximum capture size is 16,777,216 pixels and maximum
+sequence length 256 pairs. HDR/16-bit captures, animation, perceptual
+quality and gameplay assessment are out of scope.
+
+Reproduce six synthetic 4K comparisons and two independent launch sessions:
+
+```sh
+python tools/reference/scarlett_observability_fixture.py /tmp/observability-control
+```
+
+[Validation receipt](../evidence/scarlett-observability.json) includes the
+public log fingerprint, controlled diagnostic outcomes and six 4K pairs
+(identical, one changed pixel, local defect, black, tolerated one-level
+changes, and swapped color channels). These are CPU-side checks, not real
+title rendering comparisons.
+
+
+The offline diagnosis also counts driver allocation attempts by memory type
+and Vulkan result, host-memory import failures, shader interface mismatch
+messages, driver compiler failures, and signaller timeouts. It tracks the
+maximum reported cumulative null-pipeline and cache-skip counters rather than
+summing their samples, and reports sampled stage-pair counts and link status
+without disclosing shader identifiers. These are observed log events, not
+independent allocations or confirmed causes. A missing exit record remains
+an incomplete log, not proof of a crash or hang.
+
+Applied to the public issue #39 retest log (SHA256
+`9d728e2e9d8374702a094e973be03f6528d6c63e906e416594df1188543a5b34`),
+this distinguishes 262 failed memory-allocation attempts from 131 host-memory
+import failures, 12 shader interface mismatch messages, 32 sampled unlinked
+stage failures and three signaller timeouts. The last recorded draw does not
+establish a visible frame or gameplay. The recorded maximum counters are
+1,024 compute and 2,048 raster-stream substitute pipelines; not exact final
+totals or distinct shaders. No retail inputs were used locally.
+### Ordinary scalar bit operations
+
+The generic translator supports nine additional scalar bit instructions and applies the ordinary-scalar proof to the three forms already added by #56
+(32/64-bit zero counts, zero searches, leading-bit searches, reversal,
+bit setting/clearing and testing). The local reaching-definition check
+requires ordinary scalar values, not an assumed full-wave EXEC/VCC mask.
+Unknown halves, branch entries and indirect control flow remain unsupported;
+private packed and mesh paths are outside this proof. The rules follow
+[AMD's RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf), SOP1/SOPC.
+
+CPU-only controls:
+
+- Capture `cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu scalar_bit_cpu_oracle_fixture -- --nocapture`
+  to a fresh fixture file. Run `python tools/check_scalar_bits.py --help`
+  for the DXC/DXV numerical oracle: 1,944 cases, 7,776 checked values.
+- Run `python tools/check_scalar_native.py --help` with the baseline and
+  candidate xshader executables: 13 synthetic native programs recovered,
+  six deliberately unsupported controls retained, one unchanged control.
+
+[CPU evidence](../evidence/scarlett-ordinary-scalar-bits.json). These controls
+are not retail shader coverage or proof of GPU execution.
+
+
+The dependent-compute follow-up preserves ordinary scalar provenance through
+verified min/max, wide shifts, bit updates and conditional/carry operations
+only when the ordinary inputs (and, when required, SCC) are proven. It
+does not relax branch, special wave-mask, mesh or unknown-input checks.
+The CPU campaign found 483 rejected programs among 2,048 synthetic extended
+programs on the previous #58 implementation, across twelve known
+provenance-related refusal signatures. The twelve minimized native
+reproducers are now permanent compiler tests. The full 2,048-program
+campaign and the older 8,577 core plus 10,113 extended CPU-oracle programs
+pass on the integrated current main + follow-up build (186,642 observed
+register/flag values in total). Negative controls reject unknown SCC,
+EXEC-derived SCC and unproven high halves. See
+[evidence](../evidence/scarlett-dependent-scalar-chains.json). No GPU or
+retail compatibility claim.
+
+### Investigate allocation-size mismatches
+
+For a diagnostic launch, set `TUXBOX_LOG=stderr` and
+`TUXBOX_TRACE_ALLOCATION_BYTES=8192,16384,invalid` before the normal offline
+launch command. Rebuild and restage the provider first. The optional trace
+reports exact selected allocation sizes (decimal or 0x-prefixed hex), including
+the failing size sentinel with `invalid`. It records the title-relative caller,
+resource descriptions and returned alignment, not resource contents. Repeated
+records are deduplicated; at most 256 distinct records and eight descriptions
+per record are emitted. Lines share an ID to correlate interleaved threads.
+No allocation decisions are changed. This is intended to help locate the
+source of a size mismatch, not to bypass the title's assertion.
+
+
+For host heap import failures, set `TUXBOX_TRACE_HEAP_IMPORTS=1` and
+`TUXBOX_LOG=stderr` after rebuilding/restaging the provider. This optional
+trace identifies the failing native heap-open API (sized or legacy), the
+provider caller path (virtual placement, layout placement or view), requested
+bytes, HRESULT and title-relative caller. It omits host addresses and
+resource data, deduplicates the first 256 distinct failure keys, and does
+not change allocation, lifetime, fallback or error-return behavior. It
+does not trace imports performed internally by the desktop driver.
+The issue #39 log contains 262 failed driver allocation attempts and
+131 host import failure messages, not a confirmed VRAM exhaustion or
+a proven fault in these provider call sites. The opt-in trace is intended
+to distinguish those possibilities in a subsequent authorized run.

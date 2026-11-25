@@ -30,7 +30,8 @@ SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
                    "indirect-dispatch", "texture-readback",
-                   "ray-tracing-builder", "thread-dimensions", "descriptor-reclaim")
+                   "ray-tracing-builder", "thread-dimensions",
+                   "descriptor-reclaim")
 
 
 class LanesShader:
