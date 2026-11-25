@@ -296,7 +296,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         checksum = dest.with_suffix(".sha256")
         refusal = dest.with_suffix(".unsupported")
         reply = work / "reply"
-        stages = {1, 2} if linked else {0} if source.suffix == ".stencil" else set(STAGE_IDS.values())
+        stages = {1, 2, 13} if linked else {0} if source.suffix == ".stencil" else set(STAGE_IDS.values())
         expected_stage = container_stage(source_data, portable=False)
         if expected_stage is not None:
             stages &= {expected_stage}
@@ -343,7 +343,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
             target = profile.read_text().strip()
             # Mesh and amplification stages start at shader model 6.5. Linked
             # requests currently repack the outputs of vertex and geometry shaders.
-            profiles = r"(vs|gs)_6_[016]" if linked else r"((cs|ps|vs|gs)_6_[016]|cs_6_[45]|(ms|as)_6_[56]|lib_6_3)"
+            profiles = r"(vs|gs)_6_[016]|ms_6_[56]" if linked else r"((cs|ps|vs|gs)_6_[016]|cs_6_[45]|(ms|as)_6_[56]|lib_6_3)"
             if not re.fullmatch(profiles, target):
                 raise ValueError(f"unsupported compiler profile {target!r}")
             target_stage = STAGE_IDS[target.split("_", 1)[0]]

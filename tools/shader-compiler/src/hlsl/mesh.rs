@@ -34,6 +34,7 @@ fn mesh_vertex_budget(vertex_rows: usize, primitive_rows: usize, launch: usize) 
 pub(super) fn translate(
     ex: &ShaderExtract,
     interpolation: Option<&InputInterp>,
+    output_order: &[String],
 ) -> Result<Translated, String> {
     let info = ex.mesh_info.ok_or("missing mesh PSV runtime information")?;
     if !matches!(info.vertices, 128 | 256)
@@ -237,8 +238,8 @@ pub(super) fn translate(
         h.push_str(&super::page_waves::declarations([128, 1, 1], false));
     }
     em.push_helpers(&mut h);
-    signature(&mut h, "Vertex", &ex.output_sig, &ex.flat_outputs, interpolation)?;
-    signature(&mut h, "Primitive", &ex.primitive_sig, &[], None)?;
+    signature(&mut h, "Vertex", &ex.output_sig, &ex.flat_outputs, interpolation, output_order)?;
+    signature(&mut h, "Primitive", &ex.primitive_sig, &[], None, output_order)?;
     if !cull {
         h = h.replace("    bool cull : SV_CullPrimitive;\n", "");
     }
@@ -690,9 +691,20 @@ fn signature(
     elements: &[SigElement],
     flat: &[u32],
     interp: Option<&InputInterp>,
+    output_order: &[String],
 ) -> Result<(), String> {
     writeln!(h, "struct {name} {{").unwrap();
-    for (i, e) in elements.iter().enumerate() {
+    // A linked program declares its outputs in the pixel consumer's register
+    // order, so DXC packs them where the consumer reads them. Field names keep
+    // the signature index that the exports write.
+    let mut ordered: Vec<_> = elements.iter().enumerate().collect();
+    if !output_order.is_empty() {
+        ordered.sort_by_cached_key(|(_, e)| {
+            let name = semantic(e);
+            output_order.iter().position(|s| s.eq_ignore_ascii_case(&name)).unwrap_or(usize::MAX)
+        });
+    }
+    for (i, e) in ordered {
         if !(matches!(e.comp_type, 1..=3) || e.comp_type == 6 && name == "Vertex")
             || !(matches!(e.sysval, 0 | 1) || name == "Vertex" && e.sysval == 2)
             || e.mask == 0
@@ -712,6 +724,9 @@ fn signature(
             } else {
                 "nointerpolation"
             });
+        // A pixel consumer that pulls attributes declares them with the
+        // TB_VERTEX_INPUT macro (nointerpolation on SM 6); mesh shaders are SM 6.
+        let modifier = if modifier == "TB_VERTEX_INPUT" { "nointerpolation" } else { modifier };
         writeln!(h, "    {modifier} {} attr{i} : {sem};", sig_type(e).0).unwrap();
     }
     if name == "Primitive" {

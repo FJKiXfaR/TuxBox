@@ -1,5 +1,5 @@
 //! Xbox graphics-list query slots 28–30 and queue clock slots 16–17.
-use super::{List, Queue, parent, recording};
+use super::{List, Queue, Recording, parent, recording};
 use crate::device::{queries::range, resource_proxy};
 use core::ffi::c_void;
 use windows::Win32::Foundation::E_INVALIDARG;
@@ -65,37 +65,31 @@ pub(super) unsafe extern "system" fn resolve(
 
 // A Series timestamp packet writes the queue clock directly to title memory.
 // Desktop D3D12 exposes the same clock through a timestamp query and resolve.
-pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg: u32, flags: u32, mode: u32) {
+pub(super) fn timestamp(list: &List, state: &mut Recording, address: u64) -> windows::core::Result<()> {
     const SLOTS: u32 = 256;
-    let mut state = recording(list);
-    if !state.ensure_open(&list.native) { return; }
-    let result = (|| -> windows::core::Result<()> {
-        if arg != 0 || flags != 0 || mode != 1 || address == 0 || !address.is_multiple_of(8) { return Err(E_INVALIDARG.into()); }
-        let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };
-        let resource = resource.ok_or(E_INVALIDARG)?;
-        let offset = gpu.checked_sub(unsafe { resource.GetGPUVirtualAddress() }).ok_or(E_INVALIDARG)?;
-        super::raytracing::retain(&state, &[&resource])?;
-        if state.timestamp_page.as_ref().is_none_or(|(_, next)| *next >= SLOTS) {
-            let mut device: Option<ID3D12Device> = None;
-            unsafe { list.native.GetDevice(&mut device)? };
-            let mut heap: Option<ID3D12QueryHeap> = None;
-            unsafe { device.ok_or(E_INVALIDARG)?.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
-                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: SLOTS, NodeMask: 0,
-            }, &mut heap)? };
-            let heap = heap.ok_or(E_INVALIDARG)?;
-            let mut keep = state.resources.lock().unwrap_or_else(|e| e.into_inner());
-            keep.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
-            keep.push(heap.clone().into());
-            drop(keep);
-            state.timestamp_page = Some((heap, 0));
-        }
-        let (heap, index) = state.timestamp_page.as_mut().unwrap();
-        let packet = super::memory_wait::Packet::Timestamp(heap.clone(), *index, resource, offset);
-        *index += 1;
-        super::memory_wait::trace_write("timestamp", address, 8, 0);
-        state.prefix.push(&list.native, packet)
-    })();
-    if let Err(error) = result { state.error = error.code(); }
+    let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };
+    let resource = resource.ok_or(E_INVALIDARG)?;
+    let offset = gpu.checked_sub(unsafe { resource.GetGPUVirtualAddress() }).ok_or(E_INVALIDARG)?;
+    super::raytracing::retain(state, &[&resource])?;
+    if state.timestamp_page.as_ref().is_none_or(|(_, next)| *next >= SLOTS) {
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { list.native.GetDevice(&mut device)? };
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        unsafe { device.ok_or(E_INVALIDARG)?.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: SLOTS, NodeMask: 0,
+        }, &mut heap)? };
+        let heap = heap.ok_or(E_INVALIDARG)?;
+        let mut keep = state.resources.lock().unwrap_or_else(|e| e.into_inner());
+        keep.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
+        keep.push(heap.clone().into());
+        drop(keep);
+        state.timestamp_page = Some((heap, 0));
+    }
+    let (heap, index) = state.timestamp_page.as_mut().unwrap();
+    let packet = super::memory_wait::Packet::Timestamp(heap.clone(), *index, resource, offset);
+    *index += 1;
+    super::memory_wait::trace_write("timestamp", address, 8, 0);
+    state.prefix.push(&list.native, packet)
 }
 
 pub(super) unsafe extern "system" fn frequency(queue: &Queue, hz: *mut u64) -> HRESULT {

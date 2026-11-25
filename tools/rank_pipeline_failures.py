@@ -12,7 +12,10 @@ from pathlib import Path
 import re
 
 
-NO_REASON = "no translator refusal recorded (driver or runtime rejected it)"
+NO_REASON = "no translator refusal recorded"
+HOST_REJECTED = "translated, then rejected by the driver or runtime"
+NO_ANSWER = "translation missing with no recorded reason"
+ROOTLESS = "root signature missing"
 
 
 def normalize(reason):
@@ -42,10 +45,19 @@ def rank(lines, reasons):
             continue
         count, outcome, _, stages = int(fields[0]), *fields[1:]
         outcomes[outcome] += count
-        digests = [item.partition("=")[2] for item in stages.split()]
-        found = [(reasons[digest], digest) for digest in digests if digest in reasons]
-        # A pipeline is counted once, under its first refused stage.
-        reason = found[0][0] if found else NO_REASON
+        items = [item.partition("=") for item in stages.split()]
+        used = {digest for name, _, digest in items if name.endswith(".used")}
+        found = [(reasons[digest], digest) for _, _, digest in items
+                 if digest in reasons and digest not in used]
+        # A pipeline is counted once, under its first refused stage. A request
+        # without a root signature says less than the rooted one beside it.
+        found.sort(key=lambda entry: ROOTLESS in entry[0])
+        if found:
+            reason = found[0][0]
+        elif any(name.endswith(".missing") for name, _, _ in items):
+            reason = NO_ANSWER
+        else:
+            reason = HOST_REJECTED if used else NO_REASON
         pipelines[reason] += count
         distinct = shaders.setdefault(reason, set())
         if found:

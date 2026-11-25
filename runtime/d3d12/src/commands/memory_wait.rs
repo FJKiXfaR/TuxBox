@@ -18,8 +18,13 @@ impl Packet {
         unsafe {
             match self {
                 Self::Marker(write) => {
-                    list.cast::<ID3D12GraphicsCommandList2>()?
-                        .WriteBufferImmediate(1, write, None);
+                    // Marker-out lands after the preceding work, as the
+                    // bottom-of-pipe write it stands for does.
+                    list.cast::<ID3D12GraphicsCommandList2>()?.WriteBufferImmediate(
+                        1,
+                        write,
+                        Some(&D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT),
+                    );
                 }
                 Self::Timestamp(heap, index, dest, offset) => {
                     list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *index);
@@ -126,6 +131,103 @@ pub(super) struct Segment {
     target: u64,
 }
 
+/// One fence label operation a list recorded.
+#[derive(Clone, Copy)]
+pub(super) struct Label {
+    /// `None` for a write. For a wait, whether it holds the queue (`false` when
+    /// it came after rendering commands and became a barrier).
+    wait: Option<bool>,
+    address: u64,
+    value: u64,
+}
+
+impl Label {
+    pub(super) fn write(address: u64, value: u64) -> Self {
+        Self { wait: None, address, value }
+    }
+}
+
+/// What happened to a closed list.
+#[derive(Clone, Copy)]
+pub(super) enum Fate {
+    /// Submitted to a queue of this command list type.
+    Submitted(i32),
+    /// Rejected at Close with this status, so it never runs.
+    Dropped(i32),
+}
+
+struct Seen {
+    order: u64,
+    list: usize,
+    fate: Fate,
+    labels: Vec<Label>,
+}
+
+/// The most recent lists that wrote or waited on a label, oldest first.
+static HISTORY: std::sync::Mutex<std::collections::VecDeque<Seen>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+pub(super) fn note_list(list: usize, fate: Fate, labels: &[Label]) {
+    if labels.is_empty() {
+        return;
+    }
+    static ORDER: AtomicU64 = AtomicU64::new(0);
+    let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if history.len() >= 4096 {
+        history.pop_front();
+    }
+    history.push_back(Seen {
+        order: ORDER.fetch_add(1, Ordering::Relaxed),
+        list,
+        fate,
+        labels: labels.to_vec(),
+    });
+}
+
+fn fate(seen: &Seen) -> String {
+    match seen.fate {
+        Fate::Submitted(kind) => format!("submitted to a type {kind} queue"),
+        Fate::Dropped(status) => format!("rejected at Close ({status:#010x})"),
+    }
+}
+
+/// Say which lists should have satisfied a stalled wait, and which waits stand
+/// before it: the one waiting and the one writing.
+fn explain(address: u64, target: u64) {
+    let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = 0;
+    for seen in history.iter() {
+        for (at, label) in seen.labels.iter().enumerate() {
+            let matches = label.address == address
+                && match label.wait {
+                    None => label.value >= target,
+                    Some(_) => label.value == target,
+                };
+            if !matches || found >= 6 {
+                continue;
+            }
+            found += 1;
+            let earlier: Vec<_> = seen.labels[..at]
+                .iter()
+                .filter(|l| l.wait == Some(true))
+                .map(|l| format!("{:#x}>={:#x}", l.address, l.value))
+                .collect();
+            crate::diagnostics::log(&format!(
+                "stalled label {address:#x} target {target:#x}: {} by list {:#x} (order {}), {}, after waits [{}]",
+                if label.wait.is_some() { "waited" } else { "written" },
+                seen.list, seen.order, fate(seen), earlier.join(" "),
+            ));
+        }
+    }
+    if !history.iter().any(|seen| seen.labels.iter().any(|l| {
+        l.wait.is_none() && l.address == address && l.value >= target
+    })) {
+        crate::diagnostics::log(&format!(
+            "stalled label {address:#x} target {target:#x}: no submitted or rejected list writes it"
+        ));
+    }
+}
+
 /// Guest addresses the title has waited on, so writes to them can be logged.
 static WAITED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
@@ -188,6 +290,8 @@ pub(super) unsafe extern "system" fn wait_value64(
         }
         let list_type = unsafe { list.native.GetType() }.0;
         trace_wait(address, target, word.value(), list_type, state.prefix.in_body);
+        let split = !state.prefix.in_body;
+        state.labels.push(Label { wait: Some(split), address, value: target });
         if state.prefix.in_body {
             // Honoring this would split the list and replay its bound state.
             // Order the work already in this list with a global UAV barrier and
@@ -322,6 +426,9 @@ fn report_stall(address: u64, target: u64, value: u64) {
             "GPU memory wait released after {}s without reaching its target (#{count}): address={address:#x} target={target:#x} value={value:#x}",
             STALL.as_secs()
         ));
+    }
+    if count <= 8 {
+        explain(address, target);
     }
 }
 

@@ -14,8 +14,12 @@ use std::sync::{LazyLock, Mutex, Once};
 /// Distinct rows kept. Further new rows are counted together.
 const LIMIT: usize = 20_000;
 
+/// Translation lookups kept per pipeline. A mesh pipeline needs a handful.
+const KEYS: usize = 16;
+
 thread_local! {
     static STAGES: RefCell<Vec<(&'static str, usize, usize)>> = const { RefCell::new(Vec::new()) };
+    static LOOKUPS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static STAND_IN: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -58,7 +62,21 @@ static RECORD: LazyLock<Mutex<Record>> = LazyLock::new(Default::default);
 /// Start describing the pipeline this thread is about to create.
 pub(crate) fn begin() {
     STAGES.with_borrow_mut(Vec::clear);
+    LOOKUPS.with_borrow_mut(Vec::clear);
     STAND_IN.set(false);
+}
+
+/// Note a translation this thread asked for. The key names the recorded
+/// request and its cached output or refusal reason; it differs from the guest
+/// shader digest when a root signature is part of the request.
+pub(crate) fn lookup(stage: &str, key: &str, found: bool) {
+    let kind = if found { "used" } else { "missing" };
+    LOOKUPS.with_borrow_mut(|lookups| {
+        let item = format!("{stage}.{kind}={key}");
+        if lookups.len() < KEYS && !lookups.contains(&item) {
+            lookups.push(item);
+        }
+    });
 }
 
 /// Note one guest shader. The bytes must stay readable until `finish`.
@@ -73,7 +91,13 @@ pub(crate) fn stand_in() {
     STAND_IN.set(true);
 }
 
-fn row(path: &str, status: i32, stand_in: bool, stages: &[(&str, Option<String>)]) -> Option<String> {
+fn row(
+    path: &str,
+    status: i32,
+    stand_in: bool,
+    stages: &[(&str, Option<String>)],
+    lookups: &[String],
+) -> Option<String> {
     let outcome = if status < 0 {
         format!("{:#010x}", status as u32)
     } else if stand_in {
@@ -84,6 +108,7 @@ fn row(path: &str, status: i32, stand_in: bool, stages: &[(&str, Option<String>)
     let stages: Vec<_> = stages
         .iter()
         .map(|(name, digest)| format!("{name}={}", digest.as_deref().unwrap_or("unknown")))
+        .chain(lookups.iter().cloned())
         .collect();
     let stages = if stages.is_empty() { "-".to_string() } else { stages.join(" ") };
     Some(format!("{outcome}\t{path}\t{stages}"))
@@ -100,6 +125,7 @@ pub(crate) unsafe fn finish(
     digest: impl Fn(&[u8]) -> Option<String>,
 ) -> Option<PathBuf> {
     let stand_in = STAND_IN.replace(false);
+    let lookups = LOOKUPS.take();
     if status >= 0 && !stand_in {
         STAGES.with_borrow_mut(Vec::clear);
         return None;
@@ -113,7 +139,7 @@ pub(crate) unsafe fn finish(
             (name, digest(code))
         })
         .collect();
-    let row = row(path, status, stand_in, &stages)?;
+    let row = row(path, status, stand_in, &stages, &lookups)?;
     RECORD.lock().unwrap_or_else(|e| e.into_inner()).add(row);
     static WRITER: Once = Once::new();
     let mut started = None;
@@ -170,12 +196,12 @@ mod tests {
     #[test]
     fn only_failures_and_stand_ins_make_rows() {
         let stages = [("MS", Some("aa".to_string())), ("PS", None)];
-        assert_eq!(row("slot86", 0, false, &stages), None);
+        assert_eq!(row("slot86", 0, false, &stages, &[]), None);
         assert_eq!(
-            row("slot86", 0x8000_4001_u32 as i32, false, &stages).unwrap(),
-            "0x80004001\tslot86\tMS=aa PS=unknown"
+            row("slot86", 0x8000_4001_u32 as i32, false, &stages, &["MS.missing=bb".into()]).unwrap(),
+            "0x80004001\tslot86\tMS=aa PS=unknown MS.missing=bb"
         );
-        assert_eq!(row("slot62", 0, true, &[]).unwrap(), "stand-in\tslot62\t-");
+        assert_eq!(row("slot62", 0, true, &[], &[]).unwrap(), "stand-in\tslot62\t-");
     }
 
     #[test]
@@ -204,6 +230,8 @@ mod tests {
         let code = *b"shader";
         begin();
         stage("CS", code.as_ptr(), code.len());
+        lookup("CS", "key", true);
+        lookup("CS", "key", true);
         // SAFETY: `code` is alive across the call.
         let first = unsafe { finish("slot62", -1, |bytes| Some(format!("len{}", bytes.len()))) };
         assert!(first.is_some());
@@ -211,6 +239,6 @@ mod tests {
         write_if_changed(&RECORD, &file);
         let text = std::fs::read_to_string(&file).unwrap();
         let _ = std::fs::remove_file(&file);
-        assert!(text.contains("1\t0xffffffff\tslot62\tCS=len6\n"), "{text}");
+        assert!(text.contains("1\t0xffffffff\tslot62\tCS=len6 CS.used=key\n"), "{text}");
     }
 }

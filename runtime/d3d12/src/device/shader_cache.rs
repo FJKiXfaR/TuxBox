@@ -27,6 +27,18 @@ pub(super) enum Stage {
 }
 
 impl Stage {
+    fn short(self) -> &'static str {
+        match self {
+            Self::Pixel => "PS",
+            Self::Vertex => "VS",
+            Self::Geometry => "GS",
+            Self::Library => "LIB",
+            Self::Compute => "CS",
+            Self::Mesh => "MS",
+            Self::Amplification => "AS",
+        }
+    }
+
     fn report(self, source: &str, hit: bool) {
         static PIXEL: Once = Once::new();
         static VERTEX: Once = Once::new();
@@ -273,6 +285,36 @@ pub(super) fn link_on_demand(
     (!tuxbox_dxbc::has_packing_mismatch(&linked, pixel_dxil)).then_some(linked)
 }
 
+/// The Xbox source a mesh stage was translated from: the precompiled original
+/// when one exists, otherwise its pipeline-root variant (see `mesh_stage`).
+pub(super) fn mesh_link_source(shader: &[u8], root: Option<&[u8]>) -> Vec<u8> {
+    if let Some(source) = source_digest(shader)
+        && read_portable("by_source", &source, Stage::Mesh).is_some()
+    {
+        return shader.to_vec();
+    }
+    root.and_then(|root| with_root(shader, root)).unwrap_or_else(|| shader.to_vec())
+}
+
+/// Retranslates a mesh program for one pixel consumer, so that its vertex and
+/// primitive outputs match the consumer's registers and component types.
+/// Desktop drivers reject a mesh/pixel pair whose signatures differ
+/// (vkd3d: "Input signature element ... not compatible with ...").
+pub(super) fn link_mesh(
+    mesh: &[u8],
+    pixel: (&str, &[u8]),
+    mesh_dxil: &[u8],
+    pixel_dxil: &[u8],
+) -> Option<Vec<u8>> {
+    if shader_code(pixel_dxil) != Some((Stage::Pixel, ShaderCode::Portable))
+        || shader_code(mesh_dxil) != Some((Stage::Mesh, ShaderCode::Portable))
+    {
+        return None;
+    }
+    let source = source_digest(mesh)?;
+    compile::linked((&source, mesh), pixel, pixel_dxil, Stage::Mesh)
+}
+
 pub(super) fn stencil_target(shader: &[u8], slot: u32) -> Option<Vec<u8>> {
     let source = source_digest(shader)?;
     compile::stencil(shader, &source, slot)
@@ -423,5 +465,6 @@ fn translate(shader: &[u8], stage: Stage) -> Option<Vec<u8>> {
     }
     let translation = cached.or_else(|| compile::on_demand(shader, &source, stage));
     stage.report(&source, translation.is_some());
+    crate::failures::lookup(stage.short(), &source, translation.is_some());
     translation
 }

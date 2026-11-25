@@ -36,8 +36,8 @@ fn translate(
 
     let translated = if let Some(path) = consumer {
         let bytes = read(path)?;
-        if !matches!(shader.stage, Stage::Vertex | Stage::Geometry) {
-            return Err("expected a vertex or geometry producer and a pixel consumer".into());
+        if !matches!(shader.stage, Stage::Vertex | Stage::Geometry | Stage::Mesh) {
+            return Err("expected a vertex, geometry or mesh producer and a pixel consumer".into());
         }
         let actual = pixel_order.map(read).transpose()?;
         // A portable original consumer has no native ISA to translate. Read
@@ -51,11 +51,14 @@ fn translate(
             }
             // Portable consumers need the same component-type repair as
             // native consumers. Only established 32-bit types are supported.
-            for output in producer.output_sig.iter_mut().filter(|o| o.sysval == 0) {
+            // Mesh programs also feed per-primitive attributes to the pixel stage.
+            for output in producer.output_sig.iter_mut().chain(producer.primitive_sig.iter_mut()).filter(|o| o.sysval == 0) {
                 let mut matches = interface.inputs.iter().filter(|i| i.sysval == 0
                     && i.index == output.index && i.name.eq_ignore_ascii_case(&output.name));
                 if let Some(input) = matches.next() {
-                    if matches.next().is_some() || !matches!(input.comp_type, 1..=3) {
+                    // A packed half output has no integer form.
+                    if matches.next().is_some() || !matches!(input.comp_type, 1..=3)
+                        || output.comp_type == 6 && input.comp_type != 3 {
                         return Err(Error::Unsupported("ambiguous or unsupported portable pixel component type".into()));
                     }
                     output.comp_type = input.comp_type;
@@ -71,7 +74,7 @@ fn translate(
             // as float and read it as uint (or the reverse). Desktop drivers reject
             // the pair (vkd3d: "signature element ... not compatible"). Give each
             // producer output the consumer's component type; exports keep the bits.
-            for output in producer.output_sig.iter_mut().filter(|o| o.sysval == 0) {
+            for output in producer.output_sig.iter_mut().chain(producer.primitive_sig.iter_mut()).filter(|o| o.sysval == 0) {
                 let input = pixel.input_sig.iter().find(|i| {
                     i.sysval == 0 && i.index == output.index && i.name.eq_ignore_ascii_case(&output.name)
                 });

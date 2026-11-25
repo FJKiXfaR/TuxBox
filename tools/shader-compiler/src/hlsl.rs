@@ -1399,7 +1399,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         }
     }
     if ex.stage == Stage::Mesh {
-        return mesh::translate(ex, feeds_ps);
+        return mesh::translate(ex, feeds_ps, output_order);
     }
     if persistent::applies(ex) {
         return persistent::translate(ex);

@@ -152,7 +152,8 @@ pub(super) unsafe extern "system" fn table<const COMPUTE: bool>(
     let logical = base;
     let base = if let Some(arena) = &state.descriptor_arena && arena.contains(base.ptr) {
         let Some(Some(length)) = state.bindings.paged_layout::<COMPUTE>().and_then(|t| t.get(index as usize)) else {
-            state.error = windows::Win32::Foundation::E_NOTIMPL;
+            // The draw or dispatch that needs it is skipped too.
+            super::Recording::skip("descriptor table: no paged layout", windows::Win32::Foundation::E_NOTIMPL);
             return;
         };
         // The selected PSO may supply a more precise descriptor layout.

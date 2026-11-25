@@ -285,6 +285,45 @@ pub(super) unsafe extern "system" fn batch(list: &List, count: u32, entries: *co
     unsafe { record_builds(list, count, entries, &[]) };
 }
 
+/// Why a guest build entry cannot be recorded, if it cannot.
+fn refusal(entry: &Entry) -> Option<(&'static str, windows::core::HRESULT)> {
+    if entry.extension != [0; 4] {
+        return Some(("unsupported extension", E_NOTIMPL));
+    }
+    let b = &entry.build;
+    let alignment = u64::from(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    let update = b
+        .Inputs
+        .Flags
+        .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
+    if !unsafe { ray_build::valid(&b.Inputs) } {
+        return Some(("invalid inputs", E_INVALIDARG));
+    }
+    if b.DestAccelerationStructureData == 0
+        || !(b.DestAccelerationStructureData
+            | b.ScratchAccelerationStructureData
+            | b.SourceAccelerationStructureData)
+            .is_multiple_of(alignment)
+        || (update && b.SourceAccelerationStructureData == 0)
+    {
+        return Some(("destination, scratch or source address", E_INVALIDARG));
+    }
+    if b.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
+        && b.Inputs.NumDescs != 0
+    {
+        let va = unsafe { b.Inputs.Anonymous.InstanceDescs };
+        let align = if b.Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY {
+            u64::from(D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT)
+        } else {
+            8
+        };
+        if va == 0 || !va.is_multiple_of(align) {
+            return Some(("instance address", E_INVALIDARG));
+        }
+    }
+    None
+}
+
 unsafe fn record_builds(
     list: &List,
     count: u32,
@@ -311,43 +350,6 @@ unsafe fn record_builds(
         return;
     }
     let entries = unsafe { core::slice::from_raw_parts(entries, count as usize) };
-    let alignment = u64::from(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-    for e in entries {
-        if e.extension != [0; 4] {
-            state.error = E_NOTIMPL;
-            return;
-        }
-        let b = &e.build;
-        let update = b
-            .Inputs
-            .Flags
-            .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
-        if !unsafe { ray_build::valid(&b.Inputs) }
-            || b.DestAccelerationStructureData == 0
-            || !(b.DestAccelerationStructureData
-                | b.ScratchAccelerationStructureData
-                | b.SourceAccelerationStructureData)
-                .is_multiple_of(alignment)
-            || (update && b.SourceAccelerationStructureData == 0)
-        {
-            state.error = E_INVALIDARG;
-            return;
-        }
-        if b.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
-            && b.Inputs.NumDescs != 0
-        {
-            let va = unsafe { b.Inputs.Anonymous.InstanceDescs };
-            let align = if b.Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY {
-                u64::from(D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT)
-            } else {
-                8
-            };
-            if va == 0 || !va.is_multiple_of(align) {
-                state.error = E_INVALIDARG;
-                return;
-            }
-        }
-    }
     let Some(owner) = &list.parent else {
         state.error = E_INVALIDARG;
         return;
@@ -359,11 +361,32 @@ unsafe fn record_builds(
             state.error = E_OUTOFMEMORY;
             return;
         }
-        let (build, instances, bytes) = match translate(&mut state, owner, host, entry.build) {
+        // A build TuxBox cannot record is left out on its own, so the rest of
+        // the list still runs.
+        let translated = match refusal(entry) {
+            Some((reason, code)) => Err((reason, code)),
+            None => translate(&mut state, owner, host, entry.build)
+                .map_err(|e| ("translation", e.code())),
+        };
+        let (build, instances, bytes) = match translated {
             Ok(build) => build,
-            Err(err) => {
-                state.error = err.code();
-                return;
+            Err((reason, code)) => {
+                let b = &entry.build;
+                super::Recording::skip(
+                    &format!(
+                        "acceleration structure build: {reason} (type={} flags={:#x} count={} layout={} dest={:#x} scratch={:#x} source={:#x} extension={:x?})",
+                        b.Inputs.Type.0,
+                        b.Inputs.Flags.0,
+                        b.Inputs.NumDescs,
+                        b.Inputs.DescsLayout.0,
+                        b.DestAccelerationStructureData,
+                        b.ScratchAccelerationStructureData,
+                        b.SourceAccelerationStructureData,
+                        entry.extension,
+                    ),
+                    code,
+                );
+                continue;
             }
         };
         if entry.build.SourceAccelerationStructureData != 0 {

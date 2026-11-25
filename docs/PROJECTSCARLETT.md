@@ -120,7 +120,10 @@ as open compatibility problems.
 Each run writes every pipeline that failed, or received an empty stand-in, to
 `tuxbox_shader_cache/pipeline-failures/<run>.tsv` in the prefix's temporary
 folder: how often it happened, the error, the creation path and the guest shader
-digests. To rank the translator's refusal reasons by the pipelines each cost:
+digests. Rows also name each translation the pipeline looked up, as
+`<stage>.used=<key>` or `<stage>.missing=<key>`. The key names the recorded
+request, which differs from the shader digest when a root signature is part of
+the request. To rank the reasons by the pipelines each cost:
 
 ```sh
 python tools/rank_pipeline_failures.py "$PREFIX/drive_c/users/steamuser/AppData/Local/Temp/tuxbox_shader_cache"

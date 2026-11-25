@@ -486,27 +486,68 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     if unsafe { VirtualQuery(Some(address as _), &mut region, size_of_val(&region)) } == 0 || region.State != MEM_COMMIT {
         return if required { Err(E_INVALIDARG.into()) } else { Ok(None) };
     }
-    let mut host = D3D12_RESOURCE_DESC {
+    let host = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1,
-        // D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT (Agility SDK 617).
-        Flags: D3D12_RESOURCE_FLAGS(flags.0 | if tight { 0x400 } else { 0 }),
         MipLevels: 1, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
     };
-    let page = if tight {
-        let probe = D3D12_RESOURCE_DESC { Flags: host.Flags | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, ..host };
-        let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(&probe)) };
-        if info.Alignment == 0 || info.SizeInBytes == u64::MAX { return Err(E_INVALIDARG.into()); }
-        let origin = region.AllocationBase.addr() as u64;
+    let origin = region.AllocationBase.addr() as u64;
+    let import = |page: u64, tight: bool| -> windows::core::Result<std::sync::Arc<TextureAddress>> {
+        let mut host = host;
+        // D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT (Agility SDK 617).
+        host.Flags = D3D12_RESOURCE_FLAGS(flags.0 | if tight { 0x400 } else { 0 });
+        host.Width = bytes.checked_add(address - page).ok_or(E_INVALIDARG)?;
+        if !tight { host.Width = host.Width.checked_next_multiple_of(65536).ok_or(E_INVALIDARG)?; }
+        let (native, heap) = super::heap::import_buffer_with_heap(device, page, &host, D3D12_RESOURCE_STATE_COMMON, "view")?;
+        Ok(TextureAddress::with_heap(device, &native, page as usize, false, None, None, None, 0, Some(heap)))
+    };
+    if !tight {
+        return import(nearest, false).map(Some);
+    }
+    let mut probe = host;
+    probe.Flags = D3D12_RESOURCE_FLAGS(flags.0 | 0x400) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(&probe)) };
+    let close = if info.Alignment == 0 || info.SizeInBytes == u64::MAX { None } else {
         // Search no further than a single period of the alignment congruence.
         (0..info.Alignment.min((address - origin) / u64::from(stride) + 1))
             .map(|n| address - n * u64::from(stride))
-            .find(|&base| (base - origin).is_multiple_of(info.Alignment)).ok_or(E_INVALIDARG)?
-    } else { nearest };
-    host.Width = bytes.checked_add(address - page).ok_or(E_INVALIDARG)?;
-    if !tight { host.Width = host.Width.checked_next_multiple_of(65536).ok_or(E_INVALIDARG)?; }
-    let (native, heap) = super::heap::import_buffer_with_heap(device, page, &host, D3D12_RESOURCE_STATE_COMMON, "view")?;
-    Ok(Some(TextureAddress::with_heap(device, &native, page as usize, false, None, None, None, 0, Some(heap))))
+            .find(|&base| (base - origin).is_multiple_of(info.Alignment))
+    };
+    let first = match close {
+        Some(page) => import(page, true),
+        None => Err(E_INVALIDARG.into()),
+    };
+    let error = match first {
+        Ok(entry) => return Ok(Some(entry)),
+        Err(error) => error,
+    };
+    // No nearby start works. An earlier page boundary of the same allocation
+    // can still put the view on a whole element.
+    let earlier = earlier_page(address, stride, origin);
+    let second = earlier.map(|page| import(page, false));
+    static NOTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if NOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        crate::diagnostics::log(&format!(
+            "buffer import at {address:#x} bytes={bytes:#x} stride={stride}: tight start {close:?} alignment={:#x} failed {:?}; allocation={origin:#x} region={:#x}; earlier page {earlier:?} {}",
+            info.Alignment, error.code(), region.RegionSize,
+            match &second { Some(Ok(_)) => "worked", Some(Err(_)) => "failed", None => "unavailable" }
+        ));
+    }
+    match second {
+        Some(result) => result.map(Some),
+        None => Err(error),
+    }
+}
+
+/// The closest 64 KiB boundary at or after `origin` from which `address` is a
+/// whole number of elements away.
+fn earlier_page(address: u64, stride: u32, origin: u64) -> Option<u64> {
+    let stride = u64::from(stride.max(1));
+    let nearest = address & !0xffff;
+    // Page offsets repeat modulo the stride within `stride` pages.
+    (0..stride)
+        .map_while(|pages| nearest.checked_sub(pages * 65536).filter(|&page| page >= origin))
+        .find(|&page| (address - page).is_multiple_of(stride))
 }
 
 pub(crate) unsafe fn command_buffer_address(device: *mut c_void, address: u64, bytes: u64) -> windows::core::Result<(Option<ID3D12Resource>, u64)> {
@@ -1102,7 +1143,20 @@ pub(super) unsafe extern "system" fn sampler_x(
 
 #[cfg(test)]
 mod tests {
-    use super::desktop_cbv_bytes;
+    use super::{desktop_cbv_bytes, earlier_page};
+
+    #[test]
+    fn an_earlier_page_puts_a_view_on_a_whole_element() {
+        // ProjectScarlett: 20-byte elements starting 352 bytes into a page.
+        let page = earlier_page(0xaa8f_0160, 20, 0xaa00_0000).unwrap();
+        assert_eq!(page, 0xaa8c_0000);
+        assert_eq!((0xaa8f_0160 - page) % 20, 0);
+        // The allocation starts at the view's own page: nothing earlier to use.
+        assert_eq!(earlier_page(0xaa8f_0160, 20, 0xaa8f_0000), None);
+        // No page boundary can fix an offset the stride's page factor rules out.
+        assert_eq!(earlier_page(0xaa8f_0162, 20, 0), None);
+        assert_eq!(earlier_page(0x2_0028, 20, 0), Some(0x2_0000));
+    }
 
     #[test]
     fn desktop_cbv_size_is_a_256_byte_multiple_up_to_the_limit() {
