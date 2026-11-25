@@ -20,6 +20,14 @@ pub(crate) struct Presentation {
 }
 
 impl Presentation {
+    /// Drop the host window and swap chain after DXGI_ERROR_ACCESS_LOST. The next
+    /// present acquires a fresh window (the title may have recreated or hidden
+    /// its own during loading) and builds a new swap chain.
+    pub(crate) fn reset(&self) {
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = session.take();
+    }
+
     pub(crate) fn present(&self, queue: &ID3D12CommandQueue, source: &ID3D12Resource) -> HRESULT {
         self.present_texture(queue, source)
             .unwrap_or_else(|error| error.code())
@@ -414,5 +422,48 @@ pub(crate) mod sampler {
                 crate::diagnostics::log_once(&std::sync::Once::new(), || summary);
             }
         }
+    }
+}
+
+/// `TUXBOX_PRESENT_REDIRECT` (default on): the title draws its finished frame
+/// into a placed render target while PresentX names the committed display
+/// surface, which TuxBox backs with a separate host texture. Present the most
+/// recently bound full-size render target with the same shape instead.
+pub(crate) mod redirect {
+    use std::sync::{LazyLock, Mutex};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
+    pub(crate) fn enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("TUXBOX_PRESENT_REDIRECT").is_none_or(|value| value != "0")
+        });
+        *ON
+    }
+    static LAST: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+
+    pub(crate) fn bound(target: &ID3D12Resource) {
+        if !enabled()
+            || crate::diagnostics::display::is_display_any(windows::core::Interface::as_raw(target))
+        {
+            return;
+        }
+        let desc = unsafe { target.GetDesc() };
+        if desc.Width >= 1280
+            && desc.Height >= 720
+            && desc.SampleDesc.Count == 1
+            && desc.MipLevels == 1
+            && desc.DepthOrArraySize == 1
+        {
+            *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.clone());
+        }
+    }
+
+    pub(crate) fn source(display: &ID3D12Resource) -> Option<ID3D12Resource> {
+        if !enabled() {
+            return None;
+        }
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let (a, b) = unsafe { (display.GetDesc(), last.GetDesc()) };
+        (a.Width == b.Width && a.Height == b.Height && a.Format == b.Format).then_some(last)
     }
 }

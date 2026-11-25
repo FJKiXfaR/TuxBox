@@ -46,8 +46,14 @@ def prepare_scarlett(executable, host):
         tools, cache = snapshot_compiler_cache(Path(tmp) / "xshader", cache_root)
         phase = PrepPhase(progress, "Previously used Xbox shaders", len(sources))
 
+        # Shaders above the limit are substituted at run time instead of being
+        # translated, so preparing them would only burn hours of CPU time.
+        limit = int(os.environ.get("TUXBOX_MAX_CONSOLE_COMPILE_BYTES", "16384") or "0")
+
         def compile_one(source):
             try:
+                if limit and source.stat().st_size > limit and not (cache / (source.stem + ".cso")).is_file():
+                    return "skipped", None
                 compiled = compile_request(source, source.stem, tools, cache, None)
                 return ("compiled" if compiled else "cached"), None
             except ShaderRefused:
@@ -55,7 +61,7 @@ def prepare_scarlett(executable, host):
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 return "failed", f"{source.name}: {exc}"
 
-        workers = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1))
+        workers = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
         try:
             pending = [workers.submit(compile_one, source) for source in sources]
             for completed, result in enumerate(as_completed(pending), 1):
@@ -70,5 +76,6 @@ def prepare_scarlett(executable, host):
         elapsed = monotonic() - started
         report_progress(progress, f"ProjectScarlett shader preparation took {elapsed:.1f}s. "
                         f"{totals['compiled']} compiled, {totals['cached']} cached, "
-                        f"{totals['unsupported']} unsupported, {totals['failed']} failed.", 1, 1)
+                        f"{totals['unsupported']} unsupported, {totals['failed']} failed, "
+                        f"{totals['skipped']} skipped over {limit} bytes.", 1, 1)
     return True

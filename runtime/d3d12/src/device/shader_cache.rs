@@ -183,6 +183,50 @@ fn read_portable_file(path: &std::path::Path, stage: Stage) -> Option<Vec<u8>> {
     (shader_code(&bytes) == Some((stage, ShaderCode::Portable))).then_some(bytes)
 }
 
+/// A console (Xbox) DXIL container: a DXBC container that carries an `ILDN` chunk.
+/// Its bitcode is built for the console DXIL flavour, which the host compiler does
+/// not accept; passing it on faulted the host driver, so it must never reach it.
+pub(super) fn is_console_dxil(shader: &[u8]) -> bool {
+    if shader.len() < 32 || !shader.starts_with(b"DXBC") {
+        return false;
+    }
+    let Some(count) = word(shader, 28) else { return false };
+    let table_end = 32 + count * 4;
+    let Some(table) = shader.get(32..table_end) else { return false };
+    let mut dxil = false;
+    let mut ildn = false;
+    for offset in table.as_chunks::<4>().0 {
+        let start = u32::from_le_bytes(*offset) as usize;
+        if start < table_end || start + 8 > shader.len() {
+            return false;
+        }
+        match &shader[start..start + 4] {
+            b"DXIL" => dxil = true,
+            b"ILDN" => ildn = true,
+            _ => {}
+        }
+    }
+    dxil && ildn
+}
+
+/// Whether this shader bytecode is an Xbox-native program (XDAT/NOBC or console DXIL).
+pub(super) fn is_xbox_native(shader: &[u8]) -> bool {
+    matches!(shader_code(shader), Some((_, ShaderCode::Xbox)))
+}
+
+/// Whether the desktop host compiler can parse this shader bytecode.
+///
+/// Portable DXIL containers and legacy DXBC are accepted. Console-native
+/// containers are not: Xbox programs stripped to `XDAT`/`NOBC` (`ShaderCode::Xbox`)
+/// and console DXIL carrying an `ILDN` chunk have both been observed to fault the
+/// host driver's compiler instead of failing cleanly, so they must never reach it.
+pub(super) fn host_compatible(shader: &[u8]) -> bool {
+    if is_console_dxil(shader) {
+        return false;
+    }
+    !matches!(shader_code(shader), Some((_, ShaderCode::Xbox)))
+}
+
 pub(super) fn source_digest(shader: &[u8]) -> Option<String> {
     if shader.len() > MAX_BYTES {
         return None;
@@ -242,10 +286,35 @@ pub(super) fn ray_library(bytes: &[u8], source: &str) -> Option<Vec<u8>> {
 }
 
 pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
-    let (stage, ShaderCode::Xbox) = shader_code(shader)? else {
-        return None;
-    };
-    translate(shader, stage)
+    match shader_code(shader)? {
+        (stage, ShaderCode::Xbox) => translate(shader, stage),
+        (stage, ShaderCode::Portable) if is_console_dxil(shader) => {
+            // Console DXIL has no translator path. Use a pre-seeded host
+            // translation from the shared cache; never request one at run time
+            // (a request would stall the title behind a multi-minute compile).
+            let source = source_digest(shader)?;
+            // Diagnostics: where console-DXIL translations are looked up and
+            // whether each distinct container found one.
+            static DIRECTORY: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&DIRECTORY, || {
+                format!(
+                    "console DXIL cache directory {}",
+                    std::env::temp_dir().join("tuxbox_shader_cache").join("by_source").display()
+                )
+            });
+            let translation = read_portable("by_source", &source, stage);
+            static SIGHTINGS: Seen<String> = Seen::new(32);
+            if let Sighting::New = SIGHTINGS.sight(&source) {
+                crate::diagnostics::log(&format!(
+                    "console DXIL translation {} for source {}",
+                    if translation.is_some() { "found" } else { "missing" },
+                    &source[..12]
+                ));
+            }
+            translation
+        }
+        _ => None,
+    }
 }
 
 /// A shader may receive its root signature only at pipeline creation. Include
@@ -316,8 +385,27 @@ pub(super) fn mesh_stage(
 
 fn translate(shader: &[u8], stage: Stage) -> Option<Vec<u8>> {
     let source = source_digest(shader)?;
-    let translation = read_portable("by_source", &source, stage)
-        .or_else(|| compile::on_demand(shader, &source, stage));
+    let cached = read_portable("by_source", &source, stage);
+    // `TUXBOX_TRACE_SHADER_DIGEST=<prefix>`: trace one program's cache path.
+    if let Ok(prefix) = std::env::var("TUXBOX_TRACE_SHADER_DIGEST")
+        && !prefix.is_empty() && source.starts_with(&prefix)
+    {
+        let stage_name = match stage {
+            Stage::Vertex => "vs",
+            Stage::Pixel => "ps",
+            Stage::Geometry => "gs",
+            Stage::Compute => "cs",
+            Stage::Library => "lib",
+            Stage::Mesh => "ms",
+            Stage::Amplification => "as",
+        };
+        crate::diagnostics::log(&format!(
+            "trace shader {source} stage={stage_name} bytes={} by_source={}",
+            shader.len(),
+            cached.is_some()
+        ));
+    }
+    let translation = cached.or_else(|| compile::on_demand(shader, &source, stage));
     stage.report(&source, translation.is_some());
     translation
 }

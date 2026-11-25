@@ -152,14 +152,21 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         # under a second or sit in it until the cap. The ones that sit there
         # compile at -O0 in a few seconds, and the driver optimises that DXIL
         # again when it builds the pipeline.
-        if target == "cs_6_6":
-            run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
+        # Large programs (big synthetic compute kernels) take minutes at the
+        # default optimisation level and grow several times bigger at -O0, which
+        # then faults the host driver's backend. Give them a long default-level
+        # compile; small programs keep the quick -O0 retry for timeouts.
+        large = not linked and source.stat().st_size >= 8192
+        if large:
+            # The huge kernels need an optimised compile to stay small enough for
+            # the host backend; -O0 produces multi-megabyte DXIL that stalls it.
+            run_tool([dxc, "-T", target, *entry, "-O1", "-Fo", output, hlsl], timeout=600)
         else:
             try:
                 run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
             except subprocess.TimeoutExpired:
                 output.unlink(missing_ok=True)
-                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
+                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=120)
         run_tool([dxv, output], timeout=10)
         if not has_dxil_container(output.read_bytes()):
             raise ValueError("compiler returned an invalid DXIL container")
@@ -235,6 +242,13 @@ def snapshot_compiler_cache(xshader, cache_root):
 
 
 def _serve_requests(session, stop, report, xshader, wait, archive):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    lock = threading.Lock()
+    state = {"tools": None, "cache": None}
+    counters = {"refused": 0, "cached_refusals": 0}
+
     def bind_cache():
         tools, cache = snapshot_compiler_cache(xshader, session.parent)
         # Publish only after the exact compiler used by this worker is pinned.
@@ -244,62 +258,78 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
         pending.replace(session / "compiler-id")
         return tools, cache
 
-    tools = cache = None
+    def ensure_compiler():
+        with lock:
+            if state["tools"] is None:
+                state["tools"], state["cache"] = bind_cache()
+            return state["tools"], state["cache"]
+
+    def note(text):
+        with lock:
+            report(text)
+
     if (session.parent / "runtime").is_dir():
         try:
-            tools, cache = bind_cache()
+            ensure_compiler()
         except (OSError, ValueError, subprocess.SubprocessError):
             pass  # Retry and report the error if this game needs a shader.
-    refused = cached_refusals = 0
 
     def remember(source, inputs):
         nonlocal archive
-        if archive is not None:
-            try:
-                archive_request(archive, source, inputs)
-            except OSError as exc:
-                report(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
+        with lock:
+            current = archive
+        if current is None:
+            return
+        try:
+            archive_request(current, source, inputs)
+        except OSError as exc:
+            with lock:
                 archive = None
+            note(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
 
-    while not stop.is_set():
-        directory = session / "requests"
-        requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
-        if not requests:
-            wait()
-            continue
-        for source in requests:
-            if stop.is_set():
-                break
-            key = source.stem
-            if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
-                remove_request(source)
+    def handle(source):
+        if stop.is_set():
+            return
+        key = source.stem
+        if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
+            remove_request(source)
+            return
+        failed = False
+        try:
+            tools, cache = ensure_compiler()
+            if archive is None:
+                compiled = compile_request(source, key, tools, cache, session)
+            else:
+                compiled = compile_request(source, key, tools, cache, session, remember=remember)
+            if compiled:
+                note(f"Compiled Xbox shader {key}")
+        except ShaderRefused as exc:
+            failed = True
+            with lock:
+                counters["cached_refusals" if exc.cached else "refused"] += 1
+            if not exc.cached:
+                note(f"Xbox shader {key}: {exc}")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            failed = True
+            note(f"Xbox shader {key}: {exc}")
+        finally:
+            remove_request(source)
+            if failed:
+                (session / (key + ".failed")).touch()
+
+    # Shader translation is CPU bound and the driver compiler keeps the GPU idle;
+    # a small worker pool keeps the title's pipeline requests moving.
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="shader-compile") as pool:
+        while not stop.is_set():
+            directory = session / "requests"
+            requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
+            if not requests:
+                wait()
                 continue
-            failed = False
-            try:
-                if tools is None:
-                    tools, cache = bind_cache()
-                if archive is None:
-                    compiled = compile_request(source, key, tools, cache, session)
-                else:
-                    compiled = compile_request(source, key, tools, cache, session, remember=remember)
-                if compiled:
-                    report(f"Compiled Xbox shader {key}")
-            except ShaderRefused as exc:
-                failed = True
-                if exc.cached:
-                    cached_refusals += 1
-                else:
-                    refused += 1
-                    report(f"Xbox shader {key}: {exc}")
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                failed = True
-                report(f"Xbox shader {key}: {exc}")
-            finally:
-                remove_request(source)
-                if failed:
-                    (session / (key + ".failed")).touch()
-    if refused or cached_refusals:
-        report(f"Xbox shader worker: {refused} new unsupported translations, {cached_refusals} cached refusals")
+            list(pool.map(handle, requests))
+    if counters["refused"] or counters["cached_refusals"]:
+        report(f"Xbox shader worker: {counters['refused']} new unsupported translations, "
+               f"{counters['cached_refusals']} cached refusals")
 
 
 @contextmanager

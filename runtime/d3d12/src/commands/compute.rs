@@ -113,9 +113,25 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u3
         state.error = E_INVALIDARG;
         return;
     }
+    if state.null_pipeline {
+        // A substituted null pipeline stands in for a shader the translator does not
+        // support; dispatching it crashed the host driver, so record no work for it.
+        // Record which untranslated program the title actually dispatches so the
+        // translator work can be ranked by use.
+        crate::diagnostics::counters::NULL_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(super::compute_bindings::Pipeline::Regular(pso, ..)) = &state.bindings.pipeline {
+            crate::diagnostics::display::null_dispatch(windows::core::Interface::as_raw(pso), [x, y, z]);
+        }
+        static SKIPPED: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&SKIPPED, || {
+            format!("skipped Dispatch on substituted null compute pipeline groups=({x},{y},{z})")
+        });
+        return;
+    }
     if let Some(super::compute_bindings::Pipeline::Regular(pso, ..)) = &state.bindings.pipeline {
         crate::diagnostics::display::null_dispatch(windows::core::Interface::as_raw(pso), [x, y, z]);
     }
+    crate::diagnostics::counters::DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: the native list remains open under its recording lock.
     state.compute_dispatch(list, || unsafe {
         list.native.Dispatch(x, y, z);

@@ -34,8 +34,12 @@ pub(crate) fn enabled() -> bool {
 /// ProjectScarlett 1.0.2.1, RVA `0x4ffd879`: the tile-heap mapper asserts when a
 /// request is shorter than a whole flagged page run (8 KiB against a 16 KiB
 /// run). The continue path maps `min(run, remaining)`, which is the request.
-const RECOVERABLE: [(usize, [u8; 9]); 1] =
-    [(0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff])];
+const RECOVERABLE: [(usize, [u8; 9]); 2] = [
+    (0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff]),
+    // ProjectScarlett 1.0.2.1, RVA 0x131a2ad: a debug assert the title raises while
+    // bringing up its render path; the code after the int3 is the normal continue.
+    (0x131a2ad, [0xcc, 0xeb, 0xe1, 0xe8, 0x3b, 0xb2, 0xba, 0x03, 0xeb]),
+];
 
 fn is_recoverable(rva: usize, bytes: &[u8]) -> bool {
     RECOVERABLE.iter().any(|&(site, expected)| rva == site && bytes == expected)

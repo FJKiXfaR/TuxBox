@@ -1380,7 +1380,22 @@ unsafe extern "system" fn queue_fence<const WAIT: bool>(
     } else {
         queue.native.vtable().Signal
     };
+    let began = std::time::Instant::now();
     let status = unsafe { method(queue.native.as_raw(), fence.as_raw(), value) };
+    if WAIT {
+        let elapsed = began.elapsed();
+        crate::diagnostics::counters::fence_wait(elapsed);
+        if elapsed >= std::time::Duration::from_millis(500) {
+            static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 32 {
+                crate::diagnostics::log(&format!(
+                    "guest fence wait took {} ms for value {value} (queue type {})",
+                    elapsed.as_millis(),
+                    queue.state.kind.0
+                ));
+            }
+        }
+    }
     if !WAIT && status.is_ok() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || format!(
@@ -1441,16 +1456,25 @@ unsafe extern "system" fn present(
     params: *const PresentParameters,
 ) -> HRESULT {
     let result = unsafe { present_planes(queue, count, planes, params) };
+    if let Some(summary) = crate::diagnostics::counters::present() {
+        crate::diagnostics::log(&summary);
+    }
     if result.is_err() {
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || format!("PresentX failed planes={count} HRESULT={:#010x}", result.0));
         if result == windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST {
-            // The desktop window was closed. A console title has no such event
-            // and would otherwise wait for this frame's flip until its own
-            // watchdog fires. Treat the close as a request to quit.
-            crate::diagnostics::log_once(&std::sync::Once::new(), || "presentation window closed; exiting title".into());
-            use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-            let _ = unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+            // The host window association was lost (the title recreated or hid
+            // its window, the display mode changed, or a desktop switch). A
+            // console title never closes a desktop window: drop the host window
+            // and swap chain so the next present builds a fresh one, and keep
+            // the title running; it may still be in its loading phase.
+            static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let lost = LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::diagnostics::log(&format!(
+                "presentation access lost; recreating host window/swap chain (#{})",
+                lost + 1
+            ));
+            queue.state.presentation.reset();
         }
         // A rejected present still ends this frame for the title's pacing.
         if count >= 1 && let Some(plane) = unsafe { planes.as_ref() } {
@@ -1512,7 +1536,17 @@ unsafe fn present_planes(
             return E_NOTIMPL;
         }
     }
-    let result = queue.state.presentation.present(&queue.native, source);
+    let redirected = crate::present::redirect::source(&source);
+    if redirected.is_some() {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST, || {
+            "presenting the title's full-size render target in place of the display surface".into()
+        });
+    }
+    let result = queue
+        .state
+        .presentation
+        .present(&queue.native, redirected.as_ref().unwrap_or(&source));
     // Frame pacing must advance even if the host present failed; the title
     // otherwise waits forever for this token's flip.
     unsafe { device::frame_events::display_flip(parent(&queue.parent), plane.token) };

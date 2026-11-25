@@ -31,6 +31,10 @@ pub(crate) fn run_logged<R, F: FnOnce() -> R>(label: &str, job: F) -> R {
             .stack_size(STACK_BYTES)
             .spawn_scoped(scope, move || {
                 let pointer = pointer;
+                // Record the OS thread that runs the host compiler so a crash
+                // inside it can be matched to the pipeline being created.
+                let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+                crate::diagnostics::log(&format!("pipeline job tid={tid:x} enter"));
                 // SAFETY: the spawning thread waits for this scope to end
                 // before reading `slot` again.
                 let job = unsafe { (*pointer.0).take() }.expect("pipeline job already taken");
@@ -73,6 +77,7 @@ impl PipelineWatch {
         });
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
+        crate::diagnostics::log(&format!("CreatePipelineState #{id} {label} started"));
         flights().push(Flight { id, label: label.to_string(), started, next_due: 5 });
         Self { id: Some(id), label: label.to_string(), started }
     }

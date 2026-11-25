@@ -43,7 +43,8 @@ pub(super) unsafe extern "system" fn pipeline(list: &List, guest: *mut c_void) {
     match unsafe { crate::device::compute::pipeline(guest, parent(&list.parent)) } {
         Ok(Some(host)) => {
             state.stencil_slot = host.state.stencil_slot;
-            state.null_pipeline = crate::diagnostics::display::is_null_pipeline(host.native.as_raw());
+            state.null_pipeline = crate::diagnostics::display::is_null_pipeline(host.native.as_raw())
+                || crate::diagnostics::display::is_null_compute(host.native.as_raw());
             state.bindings.pipeline = Some(host.into());
             state.bindings.draw_trace = host.state.draw_trace.clone();
             unsafe { list.native.SetPipelineState(&host.native) };
@@ -116,6 +117,7 @@ pub(super) unsafe extern "system" fn targets(
         state.trace_target = if count == 1 {
             crate::diagnostics::display::draw_target(unsafe { (*rtvs).ptr })
         } else { None };
+        if let Some(target) = &state.trace_target { crate::present::redirect::bound(target); }
     }
     if crate::diagnostics::display::enabled() {
         // Contiguous ranges: the display target is bound alone in practice.
@@ -164,6 +166,10 @@ pub(super) unsafe extern "system" fn draw(
 ) {
     let mut state = recording(list);
     if state.can_record(&list.native) {
+        crate::diagnostics::counters::DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if state.display_bound {
+            crate::diagnostics::counters::DISPLAY_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         state.draw(list, vertices != 0 && instances != 0, || unsafe {
             list.native
                 .DrawInstanced(vertices, instances, start_vertex, start_instance);

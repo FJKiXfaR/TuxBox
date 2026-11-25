@@ -4,6 +4,34 @@ use crate::proxy::{Proxy, Slots, allocate, check_output, child_slots, unwrap};
 use core::{ffi::c_void, mem::ManuallyDrop, slice};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
+
+// The host driver's shader compiler faults when many compute pipelines compile
+// at once. Compile at most this many concurrently; anything beyond falls back to
+// the null pipeline instead of waiting (waiting deadlocks on nested creation).
+static COMPILING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const MAX_CONCURRENT_COMPILES: usize = 4;
+
+struct CompilePermit;
+impl CompilePermit {
+    fn acquire() -> Option<Self> {
+        use core::sync::atomic::Ordering;
+        let mut current = COMPILING.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_CONCURRENT_COMPILES {
+                return None;
+            }
+            match COMPILING.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+}
+impl Drop for CompilePermit {
+    fn drop(&mut self) {
+        COMPILING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
 use windows::core::{GUID, HRESULT, Interface};
 
 pub(crate) use super::compute_table::ComputeTable;
@@ -178,6 +206,40 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
     // SAFETY: the guest retains its shader bytes until this synchronous call returns.
     let bytes =
         unsafe { slice::from_raw_parts(desc.CS.pShaderBytecode.cast(), desc.CS.BytecodeLength) };
+    if std::env::var_os("TUXBOX_NULL_ALL_COMPUTE").is_some() {
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    }
+    // Ray-tracing helper programs whose translated DXIL crashed the host
+    // driver's shader compiler; substitute the fallback pipeline for them.
+    const DRIVER_REFUSED: [&str; 3] = [
+        "a206014458c885ecd189c1bbabd1a5e1415b4fa8198d8a63dae88e3d52c6406c",
+        "df3e12f81ce9222b1df78cf72a0b1e7207fb8288d80321d90051e986a52b3579",
+        "e708b4435708e2fcf221ca1840f819d5287a41ac3aa963ec090dcbbd5fa25f15",
+    ];
+    if let Some(digest) = super::shader_cache::source_digest(bytes)
+        && DRIVER_REFUSED.contains(&digest.as_str())
+    {
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    }
+    // Optional policy for boot experiments: console programs above a size limit
+    // take the host backend minutes to translate; skip straight to the fallback
+    // pipeline instead of blocking the title on them.
+    if let Some(kilobytes) = std::env::var("TUXBOX_SKIP_CONSOLE_SHADER_KB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value != 0)
+        && bytes.len() > kilobytes.saturating_mul(1024)
+        && super::shader_cache::is_xbox_native(bytes)
+    {
+        crate::diagnostics::log(&format!(
+            "skipping {}-byte console program under the large-shader policy",
+            bytes.len()
+        ));
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    }
     use super::compute_table::{Program, TableLayout};
     let layout = match root.map(|r| super::compute_table::reflected(
         &this.native, &r.state, Program::Compute(bytes), desc.NodeMask,
@@ -219,7 +281,49 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
     } else {
         None
     };
+    if translation.is_none() && !super::shader_cache::host_compatible(bytes) {
+        // No host translation exists for this console-native container (console
+        // DXIL, or an Xbox program stripped to XDAT/NOBC): the host compiler
+        // cannot consume it and faults on it, so use the fallback pipeline
+        // instead of handing the original bytes over.
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    }
     let code = translation.as_deref().unwrap_or(bytes);
+    // Very large translated kernels take the host driver's backend minutes and
+    // can fault it outright; keep the title running with the fallback pipeline.
+    // Very large translated programs are usable once the translator emits them
+    // compactly; the limit only guards the host backend against absurd sizes.
+    let max_host_code = std::env::var("TUXBOX_MAX_HOST_CODE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1024 * 1024);
+    if max_host_code != 0 && code.len() > max_host_code {
+        crate::diagnostics::log(&format!(
+            "substituted oversized compute program ({} bytes of DXIL) to keep the host compiler alive",
+            code.len()
+        ));
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    }
+    // Translated programs whose DXIL faults the host driver's shader compiler;
+    // the pipeline is replaced by the fallback one instead of being submitted.
+    const DRIVER_REFUSED_DXIL: [&str; 7] = [
+        "1a4cc49811c9ba8a9a629dd89b66cebc1354b0474379db7410019032ba44da06",
+        "e951f7018607ad7f5c3abac8bc625c21acac087010ecd07bc70be1f5638c280e",
+        "c93880131432c6b01b3b43a49fefeeb38f96542feaf3c371c6c98127c32803db",
+        "3e0a42e6f112262c31133d592cbc2e8e00f82bf2ba423d77c207c11048459c04",
+        "4553864955f532c9cb654aeece3170b8f3c62e6e33da3e72c50b8fb9ff1f6561",
+        "6577a0c9c6cd7cc2857c96855661fa790950b5aea62d5ad0e2a7ef9e626093f6",
+        // Variant discovered by cptest: the host backend faults on this translation.
+        "5cce092978870dd9b0c5715f90b1c5e6cd46bde85aef464a9bb7d4b76102a50e",
+    ];
+    if let Some(digest) = super::shader_cache::source_digest(code)
+        && DRIVER_REFUSED_DXIL.contains(&digest.as_str())
+    {
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    }
     let label = super::shader_cache::source_digest(bytes)
         .map(|hash| format!("CS {}", &hash[..8]))
         .unwrap_or_else(|| "CS".to_string());
@@ -246,16 +350,32 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
         this.native
             .CreateComputePipelineState::<ID3D12PipelineState>(descriptor)
     });
+    let Some(_permit) = CompilePermit::acquire() else {
+        // Too many concurrent compiles: keep the title running with a substitute.
+        crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+        return unsafe { null_compute(this, root.as_ref().map(|p| &p.native), desc, out) }.unwrap_or(E_NOTIMPL);
+    };
     let mut native = create(&host);
-    if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err() {
+    if translation.is_some()
+        && reflected.is_none()
+        && scene_root.is_none()
+        && native.is_err()
+        && super::shader_cache::host_compatible(bytes)
+    {
         // Structural checks cannot validate DXIL instructions or root bindings.
-        // Let the adapter handle the original guest shader if it rejects the cache.
+        // Let the adapter handle the original guest shader if it rejects the
+        // cache, but only when the guest bytecode is host-parseable: retrying a
+        // console-native container faults inside the host compiler.
         host.CS = desc.CS;
         native = create(&host);
     }
     unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
     if let Err(error) = &native {
         if let Some(root) = root { super::compute_table::capture_stage_root(bytes, &root.state); }
+        if let Ok(dump) = std::env::var("TUXBOX_SHADER_DUMP") {
+            let _ = std::fs::write(format!("{dump}.dxil"), code);
+            let _ = std::fs::write(format!("{dump}.src"), bytes);
+        }
         crate::diagnostics::compute_failure(bytes, error.code().0);
         if let Some(status) = unsafe { null_compute(this, root.map(|p| &p.native), desc, out) } {
             return status;

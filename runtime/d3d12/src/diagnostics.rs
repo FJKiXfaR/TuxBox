@@ -150,6 +150,26 @@ pub(super) fn compute_failure(shader: &[u8], status: i32) {
     static FAILURES: Seen<Option<[u8; 16]>> = Seen::new(64);
     let id = (shader.starts_with(b"DXBC") && shader.len() >= 32)
         .then(|| <[u8; 16]>::try_from(&shader[4..20]).unwrap());
+    // Optional capture for translator work: keep every distinct container the
+    // host could not translate, including pipeline-root variants that share a
+    // DXBC id but differ in their appended payload (so they are keyed by length
+    // as well and dumped before the per-id dedup below).
+    if let Ok(directory) = std::env::var("TUXBOX_DUMP_COMPUTE_FAILURES") {
+        let name = id.map_or_else(
+            || format!("anon-{}", shader.len()),
+            |id| {
+                format!(
+                    "{}-{}",
+                    id.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                    shader.len()
+                )
+            },
+        );
+        let directory = std::path::Path::new(&directory);
+        let _ = std::fs::create_dir_all(directory);
+        let _ = std::fs::write(directory.join(format!("{name}.dxbc")), shader);
+        let _ = std::fs::write(directory.join(format!("{name}.status")), format!("{status:#010x}"));
+    }
     match FAILURES.sight(&id) {
         Sighting::Repeat => return,
         Sighting::Full => {
@@ -339,7 +359,10 @@ pub(crate) mod display {
     }
 
     pub(crate) fn capture_draws() -> bool {
-        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_CAPTURE_DRAW_READBACK").as_deref() == Some(std::ffi::OsStr::new("1")));
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("TUXBOX_CAPTURE_DRAW_READBACK").as_deref() == Some(std::ffi::OsStr::new("1"))
+                || crate::present::redirect::enabled()
+        });
         *ON
     }
     use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -371,7 +394,11 @@ pub(crate) mod display {
     static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
     pub(crate) fn mark_resource(native: *mut core::ffi::c_void) {
-        if enabled() { RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).insert(native as usize); }
+        RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).insert(native as usize);
+    }
+    /// Whether a resource was created with ALLOW_DISPLAY, used by the present redirect.
+    pub(crate) fn is_display_any(native: *mut core::ffi::c_void) -> bool {
+        RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
     }
     pub(crate) fn is_display(native: *mut core::ffi::c_void) -> bool {
         enabled() && RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
@@ -401,11 +428,37 @@ pub(crate) mod display {
     /// Report each distinct (null compute shader, group count) dispatch once.
     pub(crate) fn null_dispatch(native: *mut core::ffi::c_void, groups: [u32; 3]) {
         if !enabled() { return; }
-        let Some(digest) = NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).get(&(native as usize)).cloned() else { return };
-        let mut seen = NULL_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.len() < 120 && seen.insert((native as usize, groups)) {
-            super::log_once(&std::sync::Once::new(), || format!("null compute dispatch CS={digest} groups=({},{},{})", groups[0], groups[1], groups[2]));
+        let digest = match NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).get(&(native as usize)).cloned() {
+            Some(digest) => digest,
+            None => {
+                static UNKNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if UNKNOWN.fetch_add(1, Ordering::Relaxed) < 8 {
+                    super::log(&format!("null compute dispatch on untracked pso={:#x} groups=({},{},{})", native as usize, groups[0], groups[1], groups[2]));
+                }
+                return;
+            }
+        };
+        // Count dispatches per untranslated program and report at powers of two
+        // so the final count ranks what the renderer actually needs.
+        static COUNTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+            std::sync::LazyLock::new(Default::default);
+        let count = {
+            let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = counts.entry(digest.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        if count.is_power_of_two() {
+            super::log(&format!(
+                "null compute dispatch CS={digest} groups=({},{},{}) count={count}",
+                groups[0], groups[1], groups[2]
+            ));
         }
+        let mut seen = NULL_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
+        seen.insert((native as usize, groups));
+    }
+    pub(crate) fn is_null_compute(native: *mut core::ffi::c_void) -> bool {
+        enabled() && NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(native as usize))
     }
     pub(crate) fn is_null_pipeline(native: *mut core::ffi::c_void) -> bool {
         enabled() && NULL_PIPELINES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
@@ -447,5 +500,56 @@ mod tests {
         assert_eq!(seen.sight("c"), Sighting::Full);
         assert_eq!(seen.sight("d"), Sighting::Repeat);
         assert_eq!(seen.sight("b"), Sighting::Repeat);
+    }
+}
+
+/// Log the first command-list error at each site with the title RVA that raised it.
+pub(crate) fn invalid_site(file: &'static str, line: u32) {
+    static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&(file, line)) {
+        seen.push((file, line));
+        let rva = crate::survey::title_rva().unwrap_or(0);
+        log_once(&Once::new(), || format!("command list error at {file}:{line} title RVA {rva:#x}"));
+    }
+}
+
+/// Process-lifetime render counters, reported periodically with the present
+/// trace so a black screen can be attributed to missing draws/dispatches.
+pub(crate) mod counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DRAWS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DISPLAY_DRAWS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NULL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FENCE_WAIT_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+    /// Report every this many presentations.
+    static EVERY: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn present() -> Option<String> {
+        let presents = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if presents % 300 != 0 {
+            return None;
+        }
+        let _ = EVERY.fetch_add(1, Ordering::Relaxed);
+        Some(format!(
+            "render counters: presents={presents} dispatches={} draws={} display_draws={} \
+             null_dispatches={} fence_waits={} fence_wait_ms={}",
+            DISPATCHES.load(Ordering::Relaxed),
+            DRAWS.load(Ordering::Relaxed),
+            DISPLAY_DRAWS.load(Ordering::Relaxed),
+            NULL_DISPATCHES.load(Ordering::Relaxed),
+            FENCE_WAITS.load(Ordering::Relaxed),
+            FENCE_WAIT_TOTAL_MS.load(Ordering::Relaxed),
+        ))
+    }
+
+    pub(crate) fn fence_wait(elapsed: std::time::Duration) {
+        FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
+        FENCE_WAIT_TOTAL_MS.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
     }
 }

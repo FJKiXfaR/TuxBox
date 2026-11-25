@@ -368,7 +368,50 @@ unsafe fn create(
         SizeInBytes: size,
         pPipelineStateSubobjectStream: output.cast(),
     };
+    // A stage whose translation is unavailable keeps its console-native
+    // bytecode. Handing that to the host compiler faults inside the driver
+    // (observed with XboxBvhBuilder's console-DXIL compute streams at startup),
+    // so substitute the fallback pipeline instead of crashing.
+    if let Some(index) = unsafe { console_native_stage(&fields) } {
+        const STAGES: [&str; 6] = ["VS", "PS", "DS", "HS", "GS", "CS"];
+        crate::diagnostics::log_once(&std::sync::Once::new(), || {
+            format!(
+                "refusing console-native {} slot 86 stream stage; substituting null pipeline",
+                STAGES[index]
+            )
+        });
+        if let Some(status) =
+            unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record) }
+        {
+            return status;
+        }
+        return Err(E_NOTIMPL.into());
+    }
     let label = stream_label(&original);
+    if fields[6].is_some() || fields[7].is_some() {
+        // Console mesh/amplification stages are not translated; record what the
+        // title asks for so a refused pipeline can be attributed.
+        static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(Default::default);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 8 && seen.insert(label.clone()) {
+            drop(seen);
+            let describe = |field: &Option<*mut D3D12_SHADER_BYTECODE>| -> String {
+                let Some(field) = field else { return "none".into() };
+                let code = unsafe { &**field };
+                if code.pShaderBytecode.is_null() || code.BytecodeLength == 0 {
+                    return "empty".into();
+                }
+                let bytes = unsafe { slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) };
+                let native = !shader_cache::host_compatible(bytes);
+                format!("{} bytes console_native={native} digest={}", bytes.len(),
+                    shader_cache::source_digest(bytes).unwrap_or_default())
+            };
+            crate::diagnostics::log(&format!(
+                "mesh/amplification stream {label}: AS={} MS={}", describe(&fields[6]), describe(&fields[7])
+            ));
+        }
+    }
     // SAFETY: the stream storage, translated shaders, and guest-owned inputs
     // all stay alive throughout this synchronous call on the desktop Device2.
     let initial = crate::big_stack::run_logged(&label, || unsafe { host.CreatePipelineState(&native_desc) });
@@ -478,6 +521,28 @@ unsafe fn create(
 
 /// Retry a rejected stream with resource-free shaders (see `fallback`). Mesh
 /// and stream-output pipelines keep their original failure.
+/// Index of the first stream stage whose bytecode the host compiler cannot parse.
+///
+/// Stages that were translated point at portable DXIL containers; an untranslated
+/// console stage still points into the guest's Xbox container, which the host
+/// driver rejects and can fault on.
+unsafe fn console_native_stage(fields: &[Option<*mut D3D12_SHADER_BYTECODE>; 8]) -> Option<usize> {
+    for (index, field) in fields.iter().enumerate().take(6) {
+        let Some(field) = field else { continue };
+        let code = unsafe { &**field };
+        if code.BytecodeLength == 0 || code.pShaderBytecode.is_null() {
+            continue;
+        }
+        let bytes = unsafe {
+            slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+        };
+        if !shader_cache::host_compatible(bytes) {
+            return Some(index);
+        }
+    }
+    None
+}
+
 unsafe fn null_pipeline(
     host: &ID3D12Device2,
     desc: &D3D12_PIPELINE_STATE_STREAM_DESC,
@@ -490,6 +555,12 @@ unsafe fn null_pipeline(
         return None;
     }
     let compute = fields[5].is_some();
+    // Remember which guest compute program this substitute stands for, so a
+    // dispatch can be attributed to a specific untranslated shader.
+    let guest_compute = fields[5].map(|field| unsafe {
+        let code = &*field;
+        (code.pShaderBytecode, code.BytecodeLength)
+    });
     let replacement = |index: usize| match index {
         0 => shader(Stage::Vertex).map(bytecode),
         1 => shader(Stage::Pixel).map(bytecode),
@@ -512,9 +583,48 @@ unsafe fn null_pipeline(
     let result = unsafe { host.CreatePipelineState::<ID3D12PipelineState>(desc) };
     if let Ok(pipeline) = &result {
         crate::diagnostics::display::mark_null_pipeline(pipeline.as_raw());
+        if let Some((pointer, length)) = guest_compute
+            && !pointer.is_null() && length != 0
+            && let Some(digest) = shader_cache::source_digest(unsafe {
+                slice::from_raw_parts(pointer.cast::<u8>(), length)
+            })
+        {
+            crate::diagnostics::display::mark_null_compute(pipeline.as_raw(), digest);
+        }
         substituted(if compute { "compute stream" } else { "raster stream" });
     }
     Some(result)
+}
+
+// Diagnostic only: fingerprint every graphics/compute pipeline stream so the
+// share of duplicate descriptors can be measured before caching them.
+fn pipeline_stream_fingerprint(bytes: &[u8]) -> [u64; 4] {
+    let mut h = [0xcbf29ce484222325u64, 0x9e3779b97f4a7c15u64, 0xbf58476d1ce4e5b9u64, 0x94d049bb133111ebu64];
+    for (index, byte) in bytes.iter().enumerate() {
+        let value = *byte as u64;
+        for (lane, seed) in h.iter_mut().enumerate() {
+            let mixed = (value ^ seed.rotate_left((lane * 17) as u32)).wrapping_mul(0x100000001b3);
+            *seed = mixed.rotate_right(11) ^ (mixed >> 7) ^ (index as u64).wrapping_mul(lane as u64 + 1);
+        }
+    }
+    h
+}
+
+fn observe_pipeline_stream(size: usize, fingerprint: [u64; 4]) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static STATS: LazyLock<Mutex<(HashMap<[u64; 4], u32>, u64, std::time::Instant)>> =
+        LazyLock::new(|| Mutex::new((HashMap::new(), 0, std::time::Instant::now())));
+    let Ok(mut stats) = STATS.lock() else { return None };
+    *stats.0.entry(fingerprint).or_insert(0) += 1;
+    stats.1 += 1;
+    (stats.1 % 8192 == 0).then(|| {
+        let (unique, elapsed) = (stats.0.len(), stats.2.elapsed());
+        format!(
+            "pipeline stream descriptors: total={} unique={} elapsed={:.1}s last_size={}",
+            stats.1, unique, elapsed.as_secs_f64(), size
+        )
+    })
 }
 
 pub(super) unsafe extern "system" fn create_pipeline(
@@ -530,13 +640,62 @@ pub(super) unsafe extern "system" fn create_pipeline(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_POINTER;
     };
+    if let Some(summary) = observe_pipeline_stream(
+        desc.SizeInBytes,
+        pipeline_stream_fingerprint(unsafe {
+            std::slice::from_raw_parts(desc.pPipelineStateSubobjectStream.cast::<u8>(), desc.SizeInBytes)
+        }),
+    ) {
+        crate::diagnostics::log(&summary);
+    }
     let mut state = compute::PipelineData::default();
     let native = unsafe { create(device, desc, &mut state) };
+    if let Err(error) = &native {
+        use std::collections::HashSet;
+        use std::sync::{LazyLock, Mutex};
+        static FAILURES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+        let label = stream_label_from_desc(desc);
+        let key = format!("{label} code={:#010x}", error.code().0);
+        let mut failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+        if failures.len() < 16 && failures.insert(key.clone()) {
+            crate::diagnostics::log(&format!("stream pipeline refused: {key} size={}", desc.SizeInBytes));
+        }
+    }
     crate::diagnostics::pipeline_stream(
         desc.SizeInBytes,
         native.as_ref().err().map(|e| e.code().0),
     );
     unsafe { wrap_pageable(native, &compute::PIPELINE, device, state, out) }
+}
+
+/// Best-effort label for a pipeline stream descriptor that failed to create.
+fn stream_label_from_desc(desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> String {
+    let mut names = String::new();
+    if desc.pPipelineStateSubobjectStream.is_null() || desc.SizeInBytes < 4 {
+        return names;
+    }
+    const NAMES: [&str; 8] = ["VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(desc.pPipelineStateSubobjectStream.cast::<u8>(), desc.SizeInBytes)
+    };
+    let mut at = 0usize;
+    while at + 4 <= bytes.len() {
+        let tag = i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let Some((_, size)) = layout(tag) else { break };
+        let index = match tag {
+            1..=6 => tag - 1,
+            x if x == AMPLIFICATION_X => 6,
+            x if x == MESH_X => 7,
+            _ => -1,
+        };
+        if (0..8).contains(&index) {
+            names.push_str(NAMES[index as usize]);
+            names.push(' ');
+        }
+        at += 4 + size;
+        if size == 0 { break; }
+    }
+    names.trim_end().to_string()
 }
 
 /// With TUXBOX_TRACE_RASTER_ROOTS=1, describe each distinct raster root
