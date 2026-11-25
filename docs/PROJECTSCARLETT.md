@@ -131,6 +131,15 @@ python tools/rank_pipeline_failures.py "$PREFIX/drive_c/users/steamuser/AppData/
 
 The files stay on your machine. The printed ranking holds no paths or shader data.
 
+The ranking uses explicit missing request keys when the run has lookup
+telemetry, not raw shader digests from older compiler versions. A stage with
+both successful and unresolved lookup attempts is ambiguous, not a proven
+refusal. Stand-ins after successful translation and unlisted overflow rows are
+reported separately from host failures. Refusal markers that disagree across
+runtime cache versions are reported as conflicting; if you know which runtime
+directory belongs to the run, pass `--runtime-cache /path/to/runtime/version`.
+Older records without lookup telemetry still use the guest digests as hints.
+
 ### In-game progress panel
 
 TuxBox draws a small panel over the presented frame while the game is translating
