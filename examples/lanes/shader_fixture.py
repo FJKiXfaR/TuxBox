@@ -3,6 +3,7 @@
 It is a small hand-written console program, not taken from any game: one
 `v_mov_b32` and `s_endpgm`, with an empty root signature embedded.
 """
+import hashlib
 from pathlib import Path
 import struct
 import sys
@@ -32,7 +33,9 @@ def shader():
 def header(data):
     values = ",".join(str(byte) for byte in data)
     return ("// Generated from shader_fixture.py.\n"
-            f"constexpr unsigned char xbox_shader[] = {{{values}}};\n")
+            f"constexpr unsigned char xbox_shader[] = {{{values}}};\n"
+            "// The name its translation is cached under.\n"
+            f"constexpr wchar_t xbox_shader_digest[] = L\"{hashlib.sha256(data).hexdigest()}\";\n")
 
 
 if __name__ == "__main__":

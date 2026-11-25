@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from time import monotonic
@@ -37,6 +38,39 @@ def gpu_steps(python, output, host_options):
              [python, "tuxbox.py", "verify", "--output", str(output), *host_options])]
 
 
+def regression_step(python, results, options, windows_dxc):
+    """The command for the isolated D3D12 controls, or why they cannot run.
+
+    They need Linux, a Proton installation and prefix to copy, and the
+    Microsoft DXC libraries for Windows. The adapter is the one asked for, or
+    the one the guest checks ran on.
+    """
+    given = {name: options[options.index(name) + 1] for name in ("--proton", "--prefix", "--adapter")
+             if name in options}
+    if "--proton" not in given or "--prefix" not in given or windows_dxc is None:
+        return None, "pass --proton, --prefix and --windows-dxc"
+    adapter = given.get("--adapter")
+    if adapter is None and results.is_file():
+        found = re.search(r"pci=([0-9a-fA-F]{4}:[0-9a-fA-F]{4})", results.read_text(encoding="utf-8"))
+        adapter = found and found.group(1)
+    if adapter is None:
+        return None, "no adapter known; pass --adapter"
+    work, output = results.parent / "regression-work", results.parent / "regressions.json"
+    # The runner refuses to write over an earlier run.
+    shutil.rmtree(work, ignore_errors=True)
+    output.unlink(missing_ok=True)
+    from tools.check_d3d12_regressions import CASES
+
+    command = [python, "tools/check_d3d12_regressions.py",
+               "--build-dir", "build/d3d12-smoke", "--xmem", "build/xmem-smoke/xmem.dll",
+               "--proton", given["--proton"], "--prefix", given["--prefix"],
+               "--compiler-dir", str(windows_dxc), "--work", str(work), "--output", str(output),
+               "--adapter", adapter]
+    for case in CASES:
+        command += ["--case", case]
+    return command, None
+
+
 def benchmark_readings(path):
     """The `name: value` timings of the Lanes benchmark recorded in a results file."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -56,7 +90,8 @@ def compare_benchmarks(baseline, current):
             for name in shared]
 
 
-def run_checks(*, gpu=True, host_options=(), baseline=None, run=subprocess.run, report=print):
+def run_checks(*, gpu=True, host_options=(), baseline=None, windows_dxc=None, run=subprocess.run,
+               report=print):
     """Run the steps in order and return a process exit code.
 
     Every step runs even after a failure, except that the GPU check is skipped
@@ -78,10 +113,22 @@ def run_checks(*, gpu=True, host_options=(), baseline=None, run=subprocess.run, 
         passed = run(command, cwd=ROOT, env=os.environ.copy()).returncode == 0
         build_failed |= name == "Build" and not passed
         results.append((name, "passed" if passed else "FAILED", monotonic() - started))
+    skipped = None
+    if gpu:
+        name = "D3D12 regression controls"
+        command, skipped = (None, "a build failed") if build_failed else regression_step(
+            sys.executable, output, list(host_options), windows_dxc)
+        if command:
+            report(f"== {name}")
+            started = monotonic()
+            passed = run(command, cwd=ROOT, env=os.environ.copy()).returncode == 0
+            results.append((name, "passed" if passed else "FAILED", monotonic() - started))
+        else:
+            results.append((name, f"not run: {skipped}", 0.0))
     report("\nSummary")
     for name, result, seconds in results:
         report(f"  {result:8s} {name} ({seconds:.0f}s)")
-    failed = any(result != "passed" for _, result, _ in results)
+    failed = any(result != "passed" and not result.startswith("not run") for _, result, _ in results)
     if gpu and baseline and output.is_file():
         report(f"\nBenchmark against {baseline}")
         for line in compare_benchmarks(baseline, output):
@@ -89,5 +136,8 @@ def run_checks(*, gpu=True, host_options=(), baseline=None, run=subprocess.run, 
     if not gpu:
         report("\nThe GPU checks were not run. A change cannot be merged until Lanes passes on a GPU.")
     elif not failed:
-        report(f"\nAll checks passed. Attach the GPU results to the pull request: {output}")
+        report(f"\nAll checks that ran passed. Attach the GPU results to the pull request: {output}"
+               if skipped else f"\nAll checks passed. Attach the GPU results to the pull request: {output}")
+        if skipped:
+            report(f"The D3D12 regression controls did not run: {skipped}. On Linux a change needs them too.")
     return 1 if failed else 0

@@ -73,7 +73,7 @@ Every change is verified on Lanes before it is merged. From the repository root:
 python tuxbox.py check
 ```
 
-It runs the automated checks, builds everything, and runs Lanes and the other guest fixtures on your GPU. [Contributing](CONTRIBUTING.md#every-change-is-verified-on-lanes)
+It runs the automated checks, builds everything, and runs Lanes and the other guest fixtures on your GPU. On Linux, add `--windows-dxc` to include the D3D12 regression controls. [Contributing](CONTRIBUTING.md#every-change-is-verified-on-lanes)
 
 ## Automated checks
 

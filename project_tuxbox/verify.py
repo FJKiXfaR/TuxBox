@@ -33,6 +33,35 @@ LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", 
                    "ray-tracing-builder")
 
 
+class LanesShader:
+    """The Lanes console shader in a prefix's translation cache."""
+
+    def __init__(self, host):
+        from examples.lanes.shader_fixture import shader
+        from .shader_prep import SOURCE_CACHE
+
+        self.data = shader()
+        self.key = hashlib.sha256(self.data).hexdigest()
+        self.sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+        self.root = self.sources.parent
+
+    def forget(self):
+        # Only this synthetic shader's entries; a prefix may hold a title cache.
+        for path in [*self.sources.glob(f"{self.key}.*"), *self.root.glob(f"runtime/*/{self.key}.*")]:
+            path.unlink()
+
+    def prepare(self, work):
+        """Translate it into the prepared cache, as shader preparation does."""
+        from .runtime_shaders import compile_request
+        from .shader_prep import compiler_tools
+
+        self.forget()
+        self.sources.mkdir(parents=True, exist_ok=True)
+        request = work / f"{self.key}.dxbc"
+        request.write_bytes(self.data)
+        compile_request(request, self.key, compiler_tools(), self.sources, None)
+
+
 def lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work):
     """Load the Lanes console shader from a prepared cache, then from the runtime worker.
 
@@ -40,19 +69,10 @@ def lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work):
     The runtime gates start with it uncached: the first launch must have the
     host worker compile it, and the second must reuse that result.
     """
-    from examples.lanes.shader_fixture import shader
-    from .runtime_shaders import compile_request, shader_session
-    from .shader_prep import SOURCE_CACHE, compiler_tools
+    from .runtime_shaders import shader_session
 
-    data = shader()
-    key = hashlib.sha256(data).hexdigest()
-    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
-    root = sources.parent
-
-    def forget():
-        # Only this synthetic shader's entries; a prefix may hold a title cache.
-        for path in [*sources.glob(f"{key}.*"), *root.glob(f"runtime/*/{key}.*")]:
-            path.unlink()
+    lanes = LanesShader(host)
+    key, root, forget = lanes.key, lanes.root, lanes.forget
 
     saved = {name: host.env.get(name) for name in ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")}
     host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
@@ -70,11 +90,7 @@ def lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work):
                      config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=log_check)
 
     try:
-        forget()
-        sources.mkdir(parents=True, exist_ok=True)
-        request = work / f"{key}.dxbc"
-        request.write_bytes(data)
-        compile_request(request, key, compiler_tools(), sources, None)
+        lanes.prepare(work)
         launch("lanes-shader-cache-prepared", expect_loaded)
 
         forget()
@@ -570,11 +586,22 @@ def verify(host, output, adapter, selected=None, samples=1):
                       config="lanes/MicrosoftGame.config", device_factory="xbox",
                       dependencies=("lanes/XboxBvhBuilder.dll",) if scenario == "ray-tracing-builder" else ())
         if "lanes-benchmark" in selected:
-            check("lanes-benchmark", "lanes/lanes.exe", ["--benchmark", *gpu_args, "--report"],
-                  rf"lanes-benchmark PASS pci={pci}(?: [a-z0-9_]+=[0-9]+\.[0-9])+",
-                  providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
-                             "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
-                  config="lanes/MicrosoftGame.config", device_factory="xbox")
+            # Console shaders are only translated on the Proton backend, so the
+            # pipeline readings exist there alone.
+            shader = LanesShader(host) if host.backend == "proton" else None
+            readings = rf"lanes-benchmark PASS pci={pci}(?: [a-z0-9_]+=[0-9]+\.[0-9])+"
+            if shader:
+                shader.prepare(work)
+                readings = (rf"lanes-benchmark PASS pci={pci}(?: [a-z0-9_]+=[0-9]+\.[0-9])*"
+                            r" shader_pipeline_us=[0-9]+\.[0-9] dxil_pipeline_us=[0-9]+\.[0-9]")
+            try:
+                check("lanes-benchmark", "lanes/lanes.exe", ["--benchmark", *gpu_args, "--report"], readings,
+                      providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                 "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                      config="lanes/MicrosoftGame.config", device_factory="xbox")
+            finally:
+                if shader:
+                    shader.forget()
         if "lanes-shader-cache" in selected and host.backend == "proton":
             lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work)
         if "cpu-benchmark" in selected:
@@ -675,7 +702,7 @@ GATE_LABELS = {
     "lanes-selftest-shared-texture": "A waiting queue reading a texture another queue writes",
     "lanes-selftest-indirect-dispatch": "ExecuteIndirect matching a direct dispatch",
     "lanes-selftest-texture-readback": "A guest texture copied back to title memory",
-    "lanes-benchmark": "Lanes submission, fence handover, copy and pipeline timings",
+    "lanes-benchmark": "Lanes frame, submission, fence handover, copy and pipeline timings",
     "lanes-selftest-ray-tracing-builder": "Single, copied and batched builds through XboxBvhBuilder",
     "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
     "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",

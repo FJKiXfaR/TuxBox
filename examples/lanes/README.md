@@ -60,14 +60,16 @@ python tuxbox.py run --app-id Lanes build/lanes --selftest all --report selftest
 
 ## Benchmark
 
-`lanes.exe --benchmark` times fixed operations on the Series X|S device layout and reports the median of each in microseconds. Lower is better.
+`lanes.exe --benchmark` times fixed operations and reports each in microseconds, as a median unless noted. Lower is better.
 
 | Reading | Operation |
 | --- | --- |
 | `submit_us` | Record, submit and wait for a list holding one fence write |
 | `roundtrip_us` | Hand a fence label from the direct queue to a waiting compute queue |
 | `copy64k_us` | Copy 64 KiB of title memory with `CopyMemoryToMemoryX` |
-| `shader_pipeline_us` | Create a compute pipeline from the cached console shader |
+| `frame_us`, `frame_p99_us` | Paint the game board, upload it through the Xbox command list and read it back (typical and 99th percentile, without a window) |
+| `shader_pipeline_us` | Create a compute pipeline from the console shader, found in the prepared cache (Proton only) |
+| `dxil_pipeline_us` | Create the same pipeline from its translation directly. The difference from `shader_pipeline_us` is the cache lookup (Proton only) |
 
 `python tuxbox.py check` runs it. Compare with an earlier run on the same machine:
 

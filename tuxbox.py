@@ -126,6 +126,9 @@ def main():
                       help="run only the checks CI runs; the change still needs a GPU run before merging")
     gate.add_argument("--baseline", type=Path, metavar="RESULTS",
                       help="compare the Lanes benchmark with an earlier check's results")
+    gate.add_argument("--windows-dxc", type=Path, metavar="DIR",
+                      help="directory holding Microsoft's x64 dxcompiler.dll and dxil.dll, "
+                           "for the Linux D3D12 regression controls")
     gate.add_argument("--adapter", help="select a hardware graphics adapter by PCI vendor:device")
     for cmd in (run, check, gate):
         cmd.add_argument("--backend", choices=("native", "proton", "wine"))
@@ -143,7 +146,8 @@ def main():
         for name in ("adapter", "backend", "proton", "prefix"):
             if getattr(args, name) is not None:
                 options += [f"--{name}", str(getattr(args, name))]
-        return run_checks(gpu=not args.no_gpu, host_options=options, baseline=args.baseline)
+        dxc = args.windows_dxc.expanduser().resolve() if args.windows_dxc else None
+        return run_checks(gpu=not args.no_gpu, host_options=options, baseline=args.baseline, windows_dxc=dxc)
     if args.command == "status":
         evidence = Path(__file__).resolve().parent / "evidence"
         if args.svg:

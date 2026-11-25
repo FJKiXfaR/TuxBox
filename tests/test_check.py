@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from project_tuxbox import check
+from tools.check_d3d12_regressions import CASES
 from project_tuxbox.verify import BASE_SUITES, LANES_SCENARIOS
 
 
@@ -42,6 +43,23 @@ class CheckCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(any("verify" in command for command in commands))
         self.assertIn("skipped: a build failed", report)
+
+    def test_regression_controls_need_their_inputs(self):
+        code, commands, report = self.run_checks(host_options=["--backend", "proton"])
+        self.assertEqual(code, 0)
+        self.assertIn("D3D12 regression controls did not run", report)
+        self.assertFalse(any("tools/check_d3d12_regressions.py" in command for command in commands))
+
+    def test_regression_controls_run_every_case_on_the_chosen_adapter(self):
+        options = ["--proton", "/proton", "--prefix", "/prefix", "--adapter", "10de:2705"]
+        code, commands, report = self.run_checks(host_options=options, windows_dxc="/dxc")
+        self.assertEqual(code, 0)
+        controls = commands[-1]
+        self.assertIn("tools/check_d3d12_regressions.py", controls)
+        for case in CASES:
+            self.assertIn(case, controls)
+        self.assertEqual(controls[controls.index("--adapter") + 1], "10de:2705")
+        self.assertIn("passed   D3D12 regression controls", report)
 
     def test_without_a_gpu_says_the_change_is_not_ready(self):
         code, commands, report = self.run_checks(gpu=False)

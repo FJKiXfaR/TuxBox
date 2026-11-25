@@ -1,13 +1,18 @@
 #include "selftest.h"
 #include "game.h"
+#include "gpu.h"
+#include "screen.h"
 #include "../../runtime/d3d12/compute_fixture.h"
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <vector>
 #include "xbox_shader.h"
 #include "course_shader.h"
 #include <algorithm>
+#include <memory>
 
 namespace {
 using compute_fixture::buffer;
@@ -415,9 +420,9 @@ void texture_readback(ID3D12Device* device) {
         throw std::runtime_error("texture readback differs from the uploaded texels");
 }
 
-// The middle reading, in microseconds, of `count` timed calls.
+// `count` timed calls, in microseconds, sorted.
 template<class Timed>
-double median_us(unsigned count, Timed timed) {
+std::vector<double> timed_us(unsigned count, Timed timed) {
     LARGE_INTEGER frequency{}, before{}, after{};
     QueryPerformanceFrequency(&frequency);
     std::vector<double> readings(count);
@@ -428,11 +433,29 @@ double median_us(unsigned count, Timed timed) {
         reading = double(after.QuadPart - before.QuadPart) * 1e6 / double(frequency.QuadPart);
     }
     std::sort(readings.begin(), readings.end());
-    return readings[readings.size() / 2];
+    return readings;
+}
+
+template<class Timed>
+double median_us(unsigned count, Timed timed) {
+    return timed_us(count, timed)[count / 2];
+}
+
+// The translation of the console shader that preparation left in the cache, or
+// nothing when it has not been prepared.
+std::vector<char> prepared_translation() {
+    wchar_t temporary[MAX_PATH + 1]{};
+    if (!GetTempPathW(MAX_PATH, temporary)) return {};
+    const auto file = std::filesystem::path(temporary) / L"tuxbox_shader_cache" / L"by_source" /
+                      (std::wstring(xbox_shader_digest) + L".cso");
+    std::ifstream input(file, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 struct Readings {
-    double submit_us, roundtrip_us, copy_us, shader_us;
+    double submit_us, roundtrip_us, copy_us;
+    // Zero when the console shader's translation is not prepared.
+    double shader_us, dxil_us;
 };
 
 Readings measure(ID3D12Device* device) {
@@ -481,9 +504,11 @@ Readings measure(ID3D12Device* device) {
             direct.finish("benchmark memory copy");
         });
     }
-    {
-        // Pipelines from a console shader: the translation cache lookup and
-        // the driver's pipeline creation.
+    const auto translation = prepared_translation();
+    if (!translation.empty()) {
+        // The same pipeline twice over: from the console shader, which the
+        // provider looks up in the translation cache, and from the translation
+        // itself. The difference is what the lookup costs.
         D3D12_ROOT_SIGNATURE_DESC signature{};
         ComPtr<ID3DBlob> serialized;
         check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
@@ -491,15 +516,17 @@ Readings measure(ID3D12Device* device) {
         ComPtr<ID3D12RootSignature> root;
         check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
                                           IID_PPV_ARGS(&root)), "create empty root signature");
-        D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
-        shader.pRootSignature = root.Get();
-        shader.CS = {xbox_shader, sizeof(xbox_shader)};
-        result.shader_us = median_us(100, [&] {
+        auto create = [&](const void* bytes, size_t size) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+            shader.pRootSignature = root.Get();
+            shader.CS = {bytes, size};
             ComPtr<ID3D12PipelineState> pipeline;
             check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
                                                                                IID_PPV_ARGS(&pipeline)),
                   "benchmark pipeline");
-        });
+        };
+        result.shader_us = median_us(100, [&] { create(xbox_shader, sizeof(xbox_shader)); });
+        result.dxil_us = median_us(100, [&] { create(translation.data(), translation.size()); });
     }
     return result;
 }
@@ -733,11 +760,31 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
 
 std::string run_benchmark(const wchar_t* adapter) {
     char pci[16]{};
-    auto device = create_scarlett_device(adapter, pci);
-    const Readings readings = measure(device.Get());
-    char line[240];
-    std::snprintf(line, sizeof(line),
-                  "lanes-benchmark PASS pci=%s submit_us=%.1f roundtrip_us=%.1f copy64k_us=%.1f shader_pipeline_us=%.1f",
-                  pci, readings.submit_us, readings.roundtrip_us, readings.copy_us, readings.shader_us);
+    Readings readings{};
+    {
+        auto device = create_scarlett_device(adapter, pci);
+        readings = measure(device.Get());
+    }
+    // The game's own frame: paint the board, upload it through the Xbox command
+    // list and read it back, without a window.
+    std::string selected;
+    auto device = create_lanes_device(adapter, selected);
+    auto game = std::make_unique<Game>();
+    generate_course(device.Get(), game->rows, 0x5194c0d1u);
+    Screen screen(device.Get());
+    const auto frames = timed_us(300, [&] {
+        game->move(0);
+        if (game->finish != Finish::playing) game->restart();
+        screen.verify(*game);
+    });
+    char line[320];
+    int used = std::snprintf(line, sizeof(line),
+                             "lanes-benchmark PASS pci=%s submit_us=%.1f roundtrip_us=%.1f copy64k_us=%.1f "
+                             "frame_us=%.1f frame_p99_us=%.1f",
+                             pci, readings.submit_us, readings.roundtrip_us, readings.copy_us,
+                             frames[frames.size() / 2], frames[frames.size() * 99 / 100]);
+    if (readings.shader_us > 0)
+        std::snprintf(line + used, sizeof(line) - used, " shader_pipeline_us=%.1f dxil_pipeline_us=%.1f",
+                      readings.shader_us, readings.dxil_us);
     return line;
 }

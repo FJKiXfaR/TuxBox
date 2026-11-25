@@ -32,6 +32,12 @@ It runs the code checks below, builds every provider and guest, and then runs La
 | Shader cache | A console shader loaded from a cache prepared before launch, translated while running, then reused without compiling again |
 | [Benchmark](examples/lanes/README.md#benchmark) | Submission, fence handover, copy and pipeline timings. Add `--baseline` with an earlier result to compare. |
 
+On Linux it also runs the [D3D12 regression controls](tools/check_d3d12_regressions.py), which cover buffer imports, page remapping, descriptor tables and other provider behaviour in isolated copies of the prefix. They need `--proton`, `--prefix`, `--windows-dxc` pointing at Microsoft's x64 `dxcompiler.dll` and `dxil.dll`, plus Bubblewrap and `xvfb-run`:
+
+```sh
+python tuxbox.py check --proton PROTON --prefix PREFIX --windows-dxc DXC/bin/x64
+```
+
 Put the printed summary, your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/results.json`.
 
 If your change adds or fixes behaviour, add or extend a Lanes scenario that fails without it. If it cannot be exercised from Lanes, say why in the pull request.
