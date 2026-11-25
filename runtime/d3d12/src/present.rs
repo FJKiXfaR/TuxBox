@@ -201,8 +201,18 @@ impl SwapChain {
             let panel = self.overlay.prepare(&self.device, index as usize);
             frame.allocator.Reset()?;
             frame.list.Reset(&frame.allocator, None)?;
-            record_copy(&frame.list, source, &buffer, panel.as_ref());
-            let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
+            // The title leaves its display surface in RENDER_TARGET; a barrier
+            // that claims COMMON is an invalid transition and the driver may
+            // drop the copy. Non-display fallback targets are not rendered.
+            let source_state = if crate::diagnostics::display::is_display_any(
+                windows::core::Interface::as_raw(source),
+            ) {
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            record_copy(&frame.list, source, &buffer, panel.as_ref(), source_state);
+            let sample = sampler::due().then(|| sampler::record(&frame.list, source, source_state)).flatten();
             frame.list.Close()?;
             frame.source = Some(source.clone());
             queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
@@ -276,6 +286,7 @@ fn record_copy(
     source: &ID3D12Resource,
     buffer: &ID3D12Resource,
     panel: Option<&overlay::Placement>,
+    source_state: D3D12_RESOURCE_STATES,
 ) {
     let transition = |resource: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -292,7 +303,7 @@ fn record_copy(
     let mut barriers = [
         transition(
             source,
-            D3D12_RESOURCE_STATE_COMMON,
+            source_state,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         ),
         transition(
@@ -473,6 +484,9 @@ pub(crate) mod redirect {
         *ON
     }
     static LAST: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+    /// The display surface a draw actually rendered into this frame. The title
+    /// may present the other one of its two surfaces, which would stay black.
+    static DRAWN_DISPLAY: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
 
     pub(crate) fn bound(target: &ID3D12Resource) {
         if !enabled()
@@ -491,9 +505,25 @@ pub(crate) mod redirect {
         }
     }
 
+    pub(crate) fn bound_display(target: &ID3D12Resource) {
+        if !enabled() {
+            return;
+        }
+        *DRAWN_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.clone());
+    }
+
     pub(crate) fn source(display: &ID3D12Resource) -> Option<ID3D12Resource> {
         if !enabled() {
             return None;
+        }
+        // A draw into the other display surface makes that surface the frame.
+        if let Some(drawn) = DRAWN_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            let different = windows::core::Interface::as_raw(&drawn)
+                != windows::core::Interface::as_raw(display);
+            let (a, b) = unsafe { (display.GetDesc(), drawn.GetDesc()) };
+            if different && a.Width == b.Width && a.Height == b.Height && a.Format == b.Format {
+                return Some(drawn);
+            }
         }
         let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
         let (a, b) = unsafe { (display.GetDesc(), last.GetDesc()) };

@@ -113,6 +113,11 @@ def portable_stage(data):
     return container_stage(data, portable=True)
 
 
+def retry_refusals():
+    """One pass that re-translates programs an earlier translator refused."""
+    return os.environ.get("TUXBOX_RETRY_REFUSALS") == "1"
+
+
 def exact_marker(path, expected):
     """Read a tiny regular marker, without following links or blocking."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -309,7 +314,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
                     reply.write_bytes(cached)
                     os.replace(reply, session / dest.name)
                 return True
-            if exact_marker(refusal, key.encode("ascii")):
+            if not retry_refusals() and exact_marker(refusal, key.encode("ascii")):
                 reason = remembered_reason(dest.with_suffix(".reason"))
                 if reason:
                     raise ShaderRefused(reason, cached=True, remembered=True)
@@ -366,6 +371,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
                 reply.write_bytes(data)
             os.replace(output, dest)
             os.replace(stamp, checksum)
+            # A successful translation overrides any earlier refusal for the key.
+            refusal.unlink(missing_ok=True)
+            dest.with_suffix(".reason").unlink(missing_ok=True)
             if session is not None:
                 os.replace(reply, session / dest.name)
     return True
@@ -416,6 +424,13 @@ def request_notifications(directory, stop):
         os.close(fd)
 
 
+# Bump when a translator change alters the meaning of a published entry, not
+# when the executable is simply rebuilt. Hashing the binary made every rebuild
+# start from an empty cache directory, which looked like the driver recompiling
+# everything.
+TRANSLATOR_CACHE_VERSION = "tuxbox-xshader-output-1"
+
+
 def snapshot_compiler_cache(xshader, cache_root):
     """Pin the executable used for all requests under this toolchain fingerprint."""
     compiler, dxc, dxv = compiler_tools()
@@ -423,13 +438,55 @@ def snapshot_compiler_cache(xshader, cache_root):
     xshader.chmod(0o700)
     tools = (xshader, dxc, dxv)
     version = subprocess.check_output([dxc, "--version"], timeout=10)
-    fingerprint = hashlib.sha256(version)
-    for tool in tools:
-        fingerprint.update(bytes.fromhex(digest(Path(tool))))
+    fingerprint = hashlib.sha256(TRANSLATOR_CACHE_VERSION.encode())
+    fingerprint.update(version)
     cache = cache_root / "runtime" / fingerprint.hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
+    seed_cache_from_siblings(cache, cache_root)
     write_identity(cache, version, dxc, dxv)
     return tools, cache
+
+
+def seed_cache_from_siblings(cache, cache_root):
+    """Link published entries from earlier cache directories into `cache`.
+
+    Shader translations stay valid across translator rebuilds, so a new cache
+    directory starts from the entries earlier directories already proved. Linked
+    entries share storage and are ignored when they already exist.
+    """
+    runtime = cache_root / "runtime"
+    if not runtime.is_dir():
+        return
+    previous = []
+    for directory in runtime.iterdir():
+        if directory == cache or not directory.is_dir():
+            continue
+        try:
+            count = sum(1 for entry in directory.iterdir() if entry.suffix == ".cso")
+        except OSError:
+            continue
+        if count:
+            previous.append((count, directory))
+    for _, directory in sorted(previous, reverse=True):
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            # Refusal markers are only meaningful for the translator that wrote
+            # them; a newer translator may accept the same program.
+            if entry.suffix not in (".cso", ".sha256"):
+                continue
+            target = cache / entry.name
+            if target.exists():
+                continue
+            try:
+                os.link(entry, target)
+            except OSError:
+                try:
+                    shutil.copyfile(entry, target)
+                except OSError:
+                    continue
 
 
 def runtime_jobs(env, report):

@@ -70,6 +70,11 @@ fn cached_translation(cache: &Path, key: &str, stage: Stage) -> Option<Vec<u8>> 
 }
 
 fn cached_refusal(cache: &Path, key: &str) -> bool {
+    // `TUXBOX_RETRY_REFUSALS=1` asks for one pass that re-translates programs an
+    // earlier translator refused: the current translator may accept them.
+    if std::env::var_os("TUXBOX_RETRY_REFUSALS").is_some_and(|value| value == "1") {
+        return false;
+    }
     let Ok(file) = fs::File::open(cache.join(format!("{key}.unsupported"))) else {
         return false;
     };

@@ -128,6 +128,11 @@ pub(super) unsafe extern "system" fn targets(
             .map(|i| unsafe { (*rtvs.add(if contiguous.as_bool() { 0 } else { i })).ptr })
             .collect();
         state.display_bound = crate::diagnostics::display::bound(&handles);
+        if state.display_bound && count == 1
+            && let Some(target) = crate::diagnostics::display::draw_target(unsafe { (*rtvs).ptr })
+        {
+            crate::present::redirect::bound_display(&target);
+        }
     }
     let binding = unsafe { dsv.as_ref() }
         .and_then(|h| unsafe { crate::device::stencil::binding(parent(&list.parent), h.ptr) });
