@@ -234,7 +234,8 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     # Large generated pixel programs can spend the cap in Jump Threading.
     # Try this validated variant before consulting the baseline slow marker;
     # an older DXC's flag rejection falls back just like a candidate timeout.
-    if target == "ps_6_6" and hlsl.stat().st_size >= (256 << 10):
+    fast_limit = (256 << 10) if target == "ps_6_6" else (128 << 10)
+    if target in ("ps_6_6", "cs_6_6") and hlsl.stat().st_size >= fast_limit:
         try:
             run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
                       "-Fo", output, hlsl], timeout=15)

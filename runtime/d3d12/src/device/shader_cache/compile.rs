@@ -204,7 +204,10 @@ fn request(
             progress::record(key, Shader::Unsupported);
             return None;
         }
-        if start.elapsed() >= Duration::from_secs(90) {
+        // The worker's own budget is 30 s of translation plus up to 90 s of DXC;
+        // waiting less than that turned a compile that was still running into a
+        // missing translation for the rest of the process.
+        if start.elapsed() >= Duration::from_secs(160) {
             progress::record(key, Shader::TimedOut);
             return None;
         }
