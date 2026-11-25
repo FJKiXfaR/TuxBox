@@ -42,8 +42,6 @@ guest=(p/"tools/reference/independent-shaders/compute.cpp").read_text()
 guest=replace(guest,"D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};","D3D12_DESCRIPTOR_RANGE range[]{{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1}};")
 guest=replace(guest,"table.DescriptorTable = {1, &range};","table.DescriptorTable = {2, range};")
 guest=replace(guest,"D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,","D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,")
-guest=replace(guest,'    else throw std::runtime_error("invalid UAV format");','    else if (view == "raw" && !stride) uav.Format = DXGI_FORMAT_R32_TYPELESS;\n    else throw std::runtime_error("invalid UAV format");')
-guest=replace(guest,"stride, 0, D3D12_BUFFER_UAV_FLAG_NONE};","stride, 0, D3D12_BUFFER_UAV_FLAG_RAW};")
 guest=replace(guest,"    D3D12_COMMAND_QUEUE_DESC qd{};","""    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;

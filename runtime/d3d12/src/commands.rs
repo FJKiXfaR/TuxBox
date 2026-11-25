@@ -23,6 +23,7 @@ mod enhanced;
 mod descriptors;
 mod graphics;
 mod copy_memory;
+pub(crate) mod list_memory;
 mod media;
 mod memory_wait;
 pub(crate) mod page_mapping;
@@ -1247,6 +1248,17 @@ fn write_dword(list: &List, state: &mut Recording, address: u64, value: u32) -> 
     state.prefix.push(&list.native, memory_wait::Packet::Marker(write))
 }
 
+// XboxBvhBuilder emits this when its inline packet space is exhausted, with
+// the same words it otherwise writes as a 0x4003cc00 packet: group counts X,
+// Y, Z and a flags word (0x20 or 0x8020 in the rehydrate path). The flags have
+// no desktop equivalent, so the dispatch is recorded as an ordinary one.
+unsafe extern "system" fn dispatch_flagged(list: &List, x: u32, y: u32, z: u32, flags: u32) {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || format!(
+        "slot 80 dispatch groups=({x},{y},{z}) flags={flags:#x}"));
+    unsafe { compute::dispatch(list, x, y, z) }
+}
+
 static LIST_SLOTS: Slots<149> = {
     let mut slots = child_slots::<ID3D12GraphicsCommandList, ListData, 149>();
     slots[8] = crate::slot!(get_type);
@@ -1312,6 +1324,7 @@ static LIST_SLOTS: Slots<149> = {
     slots[71] = crate::slot!(write_marker);
     slots[72] = crate::slot!(write_value64);
     slots[74] = crate::slot!(memory_wait::wait_value64);
+    slots[80] = crate::slot!(dispatch_flagged);
     slots[83] = crate::slot!(copy_texture);
     slots[84] = crate::slot!(copy_resource);
     // GTA's texture uploader uses this entry for a placed footprint to a
@@ -1328,6 +1341,8 @@ static LIST_SLOTS: Slots<149> = {
     slots[131] = crate::slot!(build_raytracing::batch);
     slots[139] = crate::slot!(reset_extended);
     slots[146] = crate::slot!(enhanced::barrier);
+    // XboxBvhBuilder's batched builds take descriptor memory from the list.
+    slots[148] = crate::slot!(list_memory::allocate_slot);
     slots
 };
 

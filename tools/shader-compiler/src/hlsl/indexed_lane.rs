@@ -60,19 +60,34 @@ pub(super) fn skip_empty_wave_fallback(insns: &mut Vec<Insn>) -> bool {
 
 /// A constant read in a converged group observes another invocation's VGPR,
 /// including lane 32 on hosts with 32-lane subgroups. Keep SGPR spills separate.
-pub(super) fn constant_reads(group: [u32; 3], insns: &mut [Insn]) -> bool {
+pub(super) fn constant_reads(group: [u32; 3], insns: &mut [Insn], allow_small_group: bool) -> bool {
     let count = group.into_iter().fold(1u32, u32::saturating_mul);
-    if count == 0 || count > 1024 || count % 64 != 0 { return false; }
+    // Up to 32 threads fit in one guest wave of either width. Only read a
+    // lane that actually launched, even when its selector comes from an SGPR.
+    let small = allow_small_group && (1..=32).contains(&count);
+    if count == 0 || count > 1024 || (!small && count % 64 != 0) { return false; }
     let Some(last) = insns.iter().rposition(|op| op.mnemonic == "v_readlane_b32") else { return false };
     let end = insns[last].offset as i64;
+    let selectors = if small {
+        super::scalar_values::at_reads(insns, super::scalar_values::Proof::UpperBound, |op| match (op.mnemonic.as_str(), op.src.get(1)) {
+            ("v_readlane_b32", Some(Opnd::Sgpr(reg))) => Some(*reg),
+            _ => None,
+        })
+    } else { Default::default() };
+    let upper_lane = |op: &Insn| match op.src.get(1)? {
+        Opnd::ConstInt(n @ 0..=63) => Some(*n as u32),
+        Opnd::Sgpr(reg) => selectors.get(&(op.offset, *reg)).copied(),
+        _ => None,
+    };
     if insns.iter().any(|op| {
         let name = op.mnemonic.as_str();
         let branch = op.enc == Enc::Sopp && Emitter::branch_cond(op.op).is_some();
         name == "v_writelane_b32" || matches!(name, "s_setpc_b64" | "s_swappc_b64" | "s_call_b64")
             || (op.offset as i64 <= end && name == "s_endpgm")
             || (name.contains("branch") && (!branch || op.aux.imm < 0))
-            || (name == "v_readlane_b32" && !matches!((&op.dst[..], &op.src[..]),
-                ([Opnd::Vgpr(_)], [Opnd::Vgpr(_), Opnd::ConstInt(0..=63), ..])))
+            || (name == "v_readlane_b32" && (!matches!((&op.dst[..], op.src.first()),
+                ([Opnd::Vgpr(_)], Some(Opnd::Vgpr(_))))
+                || !upper_lane(op).is_some_and(|n| n < count.min(64))))
     }) { return false; }
     for op in insns.iter_mut().filter(|op| op.mnemonic == "v_readlane_b32") {
         let Opnd::Vgpr(dst) = op.dst[0] else { unreachable!() };
@@ -186,6 +201,76 @@ mod tests {
     fn recognizes(words: &[u32], group: [u32; 3]) -> bool {
         let isa: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         prepare(group, &mut crate::rdna2::disassemble(&isa))
+    }
+
+    #[test]
+    fn partial_group_reads_only_proven_launched_lanes() {
+        // In a 7x3 group, registers and inline operands can select lanes 0..20.
+        const SET: u32 = 0xbe98_0394; // s_mov_b32 s24,20
+        const READ: [u32; 2] = [0xd760_001c, 0x0000_3109]; // s28,v9,s24
+        const END: u32 = 0xbf81_0000;
+        let check = |words: &[u32]| {
+            let isa: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut ops = crate::rdna2::disassemble(&isa);
+            let before = ops.iter().map(|op| op.mnemonic.clone()).collect::<Vec<_>>();
+            let accepted = constant_reads([7, 3, 1], &mut ops, true);
+            if accepted {
+                assert!(ops.iter().any(|op| op.mnemonic == "tb_indexed_readlane"));
+                assert!(!ops.iter().any(|op| op.mnemonic == "v_readlane_b32"));
+            } else {
+                assert!(ops.iter().map(|op| &op.mnemonic).eq(&before));
+            }
+            accepted
+        };
+        assert!(check(&[SET, READ[0], READ[1], END]));
+        assert!(!check(&[SET + 1, READ[0], READ[1], END]));
+        assert!(check(&[READ[0], 0x0001_2909, END])); // inline lane 20
+        assert!(!check(&[READ[0], 0x0001_2b09, END])); // inline lane 21
+        // Equal incoming values at a forward branch join prove the selector.
+        assert!(check(&[SET, 0xbf84_0001, SET, READ[0], READ[1], END]));
+        assert!(!check(&[SET, 0xbf84_0001, SET + 1, READ[0], READ[1], END]));
+        assert!(check(&[SET, 0xbf84_0001, SET - 1, READ[0], READ[1], END]));
+        // Keep the runtime selector when both CSELECT operands are in range.
+        assert!(check(&[0x8518_8a94, 0xbe99_0318, READ[0], 0x0000_3309, END]));
+        assert!(!check(&[0x8518_9594, READ[0], READ[1], END])); // 20 or 21
+        assert!(!check(&[0x8518_0594, READ[0], READ[1], END])); // 20 or unknown
+        // CMOV keeps the previous destination when SCC is clear.
+        const CMOV_20: u32 = 0xbe98_0594; // s_cmov_b32 s24,20
+        assert!(check(&[SET - 10, CMOV_20, READ[0], READ[1], END]));
+        assert!(!check(&[CMOV_20, READ[0], READ[1], END]));
+        assert!(!check(&[SET + 1, CMOV_20, READ[0], READ[1], END]));
+        assert!(!check(&[SET, CMOV_20 + 1, READ[0], READ[1], END]));
+        assert!(!check(&[SET, 0xbe98_0505, READ[0], READ[1], END])); // source s5 unknown
+        assert!(check(&[0x8718_8f05, READ[0], READ[1], END])); // s5 & 15
+        assert!(!check(&[0x8718_9f05, READ[0], READ[1], END])); // s5 & 31
+        assert!(!check(&[0x8718_8f05, 0x8018_a018, READ[0], READ[1], END])); // add 32
+        // The first read overwrites the selector with the selected VGPR value.
+        assert!(!check(&[SET, 0xd760_0018, READ[1], READ[0], READ[1], END]));
+    }
+
+    #[test]
+    fn partial_group_selector_tracks_each_word_of_a_scalar_pair() {
+        const OLD: u32 = 0xbe99_038a; // s_mov_b32 s25,10
+        const NEW: u32 = 0xbe9b_0394; // s_mov_b32 s27,20
+        const MOV: u32 = 0xbe98_041a; // s_mov_b64 s[24:25],s[26:27]
+        const CMOV: u32 = 0xbe98_061a; // conditional copy of the same pair
+        const SELECT: u32 = 0x8598_181a; // select s[26:27] or s[24:25]
+        let reads_high = |setup: &[u32]| {
+            let words = [setup, &[0xd760_001c, 0x0000_3309, 0xbf81_0000]].concat();
+            let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            constant_reads([7, 3, 1], &mut crate::rdna2::disassemble(&bytes), true)
+        };
+        assert!(reads_high(&[NEW, MOV]));
+        assert!(!reads_high(&[OLD, MOV])); // unknown source overwrites known high word
+        for op in [CMOV, SELECT] {
+            assert!(reads_high(&[OLD, NEW, op])); // low words are unknown
+            assert!(!reads_high(&[NEW, op]));
+            assert!(!reads_high(&[OLD, op]));
+            assert!(!reads_high(&[OLD, NEW + 1, op]));
+            assert!(!reads_high(&[OLD + 11, NEW, op]));
+        }
+        assert!(reads_high(&[0xbe98_0487])); // high word of inline 7 is zero
+        assert!(!reads_high(&[OLD, 0xbe98_04c1])); // high word of -1 is out of range
     }
 
     #[test]

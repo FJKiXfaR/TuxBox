@@ -265,7 +265,7 @@ impl Bindings {
         let mut storage = [None; 64]; // no root signature can consume more than 64 DWORDs
         let bases = storage.get_mut(..table.lengths.len()).ok_or(E_INVALIDARG)?;
         for (index, &length) in table.lengths.iter().enumerate().filter(|(_, len)| **len != 0) {
-            let slot = index as u32;
+            let slot = table.mirrors.iter().find(|(host, _)| *host as usize == index).map_or(index as u32, |&(_, guest)| guest);
             let bound = if COMPUTE {
                 let Some(Argument::Table(table)) = self.compute_args.get(&slot) else { return Err(E_INVALIDARG.into()); };
                 table
@@ -307,6 +307,12 @@ impl Bindings {
                 for (&slot, bound) in &self.graphics_tables {
                     let base = bases.get(slot as usize).copied().flatten().unwrap_or(bound.native);
                     list.SetGraphicsRootDescriptorTable(slot, base);
+                }
+                for &(host, guest) in &table.mirrors {
+                    if let Some(bound) = self.graphics_tables.get(&guest) {
+                        let base = bases.get(host as usize).copied().flatten().unwrap_or(bound.native);
+                        list.SetGraphicsRootDescriptorTable(host, base);
+                    }
                 }
                 if let Some((slot, address)) = index_map {
                     list.SetGraphicsRootShaderResourceView(slot, address);

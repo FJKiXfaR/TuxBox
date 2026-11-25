@@ -5,8 +5,9 @@ macro_rules! invalid_site { () => { $crate::diagnostics::invalid_site(file!(), l
 mod big_stack;
 mod clwb;
 mod clzero;
-mod sse4a;
+mod insertq;
 mod mwaitx;
+mod sse4a;
 mod commands;
 mod compile_gate;
 mod device;

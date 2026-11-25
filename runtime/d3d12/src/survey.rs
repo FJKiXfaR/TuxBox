@@ -79,8 +79,8 @@ fn early_return_distance(rva: usize, bytes: &[u8]) -> Option<usize> {
 }
 
 /// Register the vectored exception handler once. Safe to call from `DllMain`
-/// so early title code (such as `clwb` on pre-Ice Lake CPUs, or `clzero` on
-/// Intel CPUs) is covered before
+/// so early title code (such as `clwb` on pre-Ice Lake CPUs, or `clzero` and
+/// `insertq` on Intel CPUs) is covered before
 /// the first device is created.
 pub(crate) fn install_handler() -> bool {
     static INSTALL: Once = Once::new();
@@ -104,8 +104,8 @@ pub(crate) fn uninstall_handler() {
 
 /// Install the assert handler once, when the title creates its first device.
 /// Outside survey mode the handler only steps over `RECOVERABLE`, rewrites
-/// unsupported `clwb` instructions, emulates unsupported `clzero` and rewrites
-/// unsupported `monitorx`/`mwaitx` to NOPs.
+/// unsupported `clwb` instructions, emulates unsupported `clzero`, `insertq`
+/// and SSE4a, and rewrites unsupported `monitorx`/`mwaitx` to NOPs.
 /// `TUXBOX_SELF_EXIT_AT_MS=<ms>`: end the process with `ExitProcess` at that
 /// point. A normal exit runs the DLL detach handlers that merge vkd3d-proton's
 /// pipeline cache; a killed process never does, so every run would recompile.
@@ -181,6 +181,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             if crate::clwb::handle_illegal_instruction(context, start, end)
                 || crate::clzero::handle_illegal_instruction(context, start, end)
                 || crate::mwaitx::handle_illegal_instruction(context, start, end)
+                || crate::insertq::handle_illegal_instruction(context, start, end)
                 || crate::sse4a::handle_illegal_instruction(context, start, end)
             {
                 return CONTINUE_EXECUTION;

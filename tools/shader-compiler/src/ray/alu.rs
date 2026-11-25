@@ -3,21 +3,9 @@
 use super::operand;
 use crate::rdna2::{Enc, Insn, Opnd};
 
-pub(super) const HLSL: &str = r#"
+pub(super) const HLSL: &str = concat!(include_str!("../float_to_integer.hlsl"), r#"
 uint tb_ray_ballot(bool active) { return WaveActiveBallot(active)[WaveGetLaneIndex() >> 5]; }
 uint tb_ray_first_lane() { return (WaveGetLaneIndex() & ~31u) + firstbitlow(tb_ray_ballot(true)); }
-bool tb_ray_nan(uint bits) { return (bits & 0x7fffffffu) > 0x7f800000u; }
-uint tb_ray_to_uint(float x) {
-    if (!(x > 0.0) || tb_ray_nan(asuint(x))) return 0u;
-    if (x >= 4294967296.0) return 0xffffffffu;
-    return uint(x);
-}
-uint tb_ray_to_int(float x) {
-    if (tb_ray_nan(asuint(x))) return 0u;
-    if (x >= 2147483648.0) return 0x7fffffffu;
-    if (x <= -2147483648.0) return 0x80000000u;
-    return asuint(int(x));
-}
 float tb_ray_legacy_mul(float a, float b) {
     if ((asuint(a) & 0x7fffffffu) == 0u || (asuint(b) & 0x7fffffffu) == 0u) return 0.0;
     return a * b;
@@ -33,9 +21,16 @@ float tb_ray_legacy_mad(float a, float b, float c) {
     return sum;
 }
 float tb_ray_median(float a, float b, float c) {
-    if (tb_ray_nan(asuint(a)) || tb_ray_nan(asuint(b)) || tb_ray_nan(asuint(c)))
+    if (tb_nan_bits(asuint(a)) || tb_nan_bits(asuint(b)) || tb_nan_bits(asuint(c)))
         return min(min(a, b), c);
     return max(min(a, b), min(max(a, b), c));
+}
+float tb_ray_widen_half(uint bits) {
+    // f16tof32 may canonicalize NaNs on desktop GPUs. Keep the sign and
+    // payload while quieting signaling NaNs for IEEE-mode conversion.
+    if ((bits & 0x7fffu) > 0x7c00u)
+        return asfloat(((bits & 0x8000u) << 16u) | 0x7fc00000u | ((bits & 1023u) << 13u));
+    return f16tof32(bits & 65535u);
 }
 uint tb_ray_half(float value) {
     uint bits = asuint(value);
@@ -52,6 +47,23 @@ uint tb_ray_half(float value) {
     uint mid = 1u << (shift - 1u);
     uint rounded = high + uint(remainder > mid || (remainder == mid && (high & 1u) != 0u));
     return sign | (uint(max(0, exponent + 14)) * 1024u + rounded);
+}
+uint tb_ray_mul24(uint a, uint b, bool signedOperands, bool highWord, bool clampResult) {
+    a = signedOperands ? asuint(asint(a << 8) >> 8) : a & 0xffffffu;
+    b = signedOperands ? asuint(asint(b << 8) >> 8) : b & 0xffffffu;
+    uint low = a * b;
+    if (!highWord && !clampResult) return low;
+
+    // Split each operand into a low 16-bit digit and a signed or unsigned
+    // upper byte. The cross products and their sum fit in a signed dword.
+    int a0 = int(a & 65535u), b0 = int(b & 65535u);
+    int a1 = asint(a) >> 16, b1 = asint(b) >> 16;
+    int crossTerms = int((uint(a0) * uint(b0)) >> 16) + a1 * b0 + a0 * b1;
+    int high = a1 * b1 + (crossTerms >> 16);
+    if (highWord) return asuint(high);
+    if (!signedOperands) return high == 0 ? low : 0xffffffffu;
+    if (high == (asint(low) >> 31)) return low;
+    return high < 0 ? 0x80000000u : 0x7fffffffu;
 }
 uint tb_ray_perm(uint a, uint b, uint selectors) {
     uint result = 0u;
@@ -90,7 +102,7 @@ uint2 tb_ray_shift_right(uint2 pair, uint bits) {
     if (bits >= 32u) return uint2(pair.y >> (bits - 32u), 0u);
     return uint2((pair.x >> bits) | (pair.y << (32u - bits)), pair.y >> bits);
 }
-"#;
+"#, include_str!("../fract_f32.hlsl"));
 
 fn high_word(base: Opnd) -> Result<String, String> {
     match base {
@@ -100,13 +112,31 @@ fn high_word(base: Opnd) -> Result<String, String> {
     }
 }
 
+pub(super) fn sdwa_field(selector: u32) -> Option<(u32, u32)> {
+    match selector {
+        byte @ 0..=3 => Some((8, byte * 8)),
+        word @ 4..=5 => Some((16, (word - 4) * 16)),
+        6 => Some((32, 0)),
+        _ => None,
+    }
+}
+
+// Address and frame recognition may use the ordinary full-word semantics only
+// when SDWA leaves the source words and destination unchanged in width.
+pub(super) fn whole_sdwa_words(ins: &Insn) -> bool {
+    ins.aux.sdwa.is_none_or(|ext| {
+        let source_is_whole = |field: u32| matches!(field & 0x7f, 6 | 14);
+        matches!((ext >> 8) & 0xff, 6 | 14 | 22)
+            && source_is_whole(ext >> 16)
+            && (ins.src.len() < 2 || source_is_whole(ext >> 24))
+    })
+}
+
 fn sdwa_word(word: &str, field: u32) -> Result<String, String> {
-    let (width, offset) = match field & 7 {
-        sel @ 0..=3 => (8, 8 * sel),
-        sel @ 4..=5 => (16, 16 * (sel - 4)),
-        6 => return Ok(word.into()),
-        _ => return Err("reserved SDWA source selector".into()),
-    };
+    let (width, offset) = sdwa_field(field & 7).ok_or("reserved SDWA source selector")?;
+    if width == 32 {
+        return Ok(word.into());
+    }
     let mask = (1u32 << width) - 1;
     if field & 8 != 0 {
         Ok(format!(
@@ -116,6 +146,102 @@ fn sdwa_word(word: &str, field: u32) -> Result<String, String> {
         ))
     } else {
         Ok(format!("((({word}) >> {offset}u) & {mask}u)"))
+    }
+}
+
+fn widen_half(source: &Opnd, selector: u32, absolute: bool, negate: bool) -> Result<String, String> {
+    let mut word = operand(source)?;
+    if matches!(source, Opnd::ConstF32(_)) {
+        word = format!("f32tof16(asfloat({word}))");
+    }
+    let mut bits = sdwa_word(&word, selector)?;
+    if absolute {
+        bits = format!("({bits} & 0x7fffu)");
+    }
+    if negate {
+        bits = format!("({bits} ^ 0x8000u)");
+    }
+    Ok(format!("tb_ray_widen_half({bits})"))
+}
+
+// Pack the low bits of an ALU result into the selected destination field.
+fn sdwa_destination(dst: &str, value: &str, control: u32) -> Result<String, String> {
+    let unused = control >> 3;
+    if unused > 2 {
+        return Err("unsupported SDWA destination control".into());
+    }
+    let (width, shift) = sdwa_field(control & 7).ok_or("reserved SDWA destination selector")?;
+    if width == 32 {
+        return Ok(value.into());
+    }
+    let mask = (1u32 << width) - 1;
+    let placed = format!("(({value} & {mask}u) << {shift}u)");
+    Ok(match unused {
+        1 => format!(
+            "asuint(asint({value} << {}u) >> {}u)",
+            32 - width,
+            32 - width - shift
+        ),
+        2 => format!("({dst} & {:#010x}u) | {placed}", !(mask << shift)),
+        _ => placed,
+    })
+}
+
+pub(super) const SDWA_CLAMP: u32 = 1 << 5;
+
+pub(super) struct Mul24 {
+    signed: bool,
+    high: bool,
+    clamp: bool,
+}
+
+impl Mul24 {
+    pub(super) fn decode(ins: &Insn) -> Option<Self> {
+        let (signed, high) = match ins.mnemonic.as_str() {
+            "v_mul_u32_u24" => (false, false),
+            "v_mul_i32_i24" => (true, false),
+            "v_mul_hi_u32_u24" => (false, true),
+            "v_mul_hi_i32_i24" => (true, true),
+            _ => return None,
+        };
+        let clamp = match ins.enc {
+            Enc::Vop2 => ins.aux.sdwa.is_some_and(|ext| (ext >> 8) & SDWA_CLAMP != 0),
+            Enc::Vop3 => {
+                let clamp = ins.aux.imm != 0;
+                // Only the low product accepts VOP3 CLAMP. Neither form uses
+                // OP_SEL, floating source modifiers or output scaling.
+                if ins.raw[0] & 0x7800 != 0 || ins.aux.mask != 0 || ins.aux.imm2 != 0
+                    || (high && clamp)
+                {
+                    return None;
+                }
+                clamp
+            }
+            _ => return None,
+        };
+        Some(Self { signed, high, clamp })
+    }
+
+    fn hlsl(&self, a: &str, b: &str) -> String {
+        format!("tb_ray_mul24({a}, {b}, {}, {}, {})", self.signed, self.high, self.clamp)
+    }
+
+    pub(super) fn fold(&self, a: u32, b: u32) -> u32 {
+        let extend = |x: u32| if self.signed {
+            i64::from(((x << 8) as i32) >> 8)
+        } else {
+            i64::from(x & 0xffffff)
+        };
+        let product = extend(a) * extend(b);
+        if self.high {
+            (product >> 32) as u32
+        } else if self.clamp && self.signed {
+            product.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as u32
+        } else if self.clamp {
+            product.min(i64::from(u32::MAX)) as u32
+        } else {
+            product as u32
+        }
     }
 }
 
@@ -145,53 +271,97 @@ pub(super) fn vector(ins: &Insn) -> Result<String, String> {
                 "{dst} = (exec != 0u && {left} {cmp} {right}) ? ~0u : 0u;"
             ));
         }
-        if name == "v_cvt_f32_f16" && control == 6 && sdwa & 0xffc8_0000 == 0 {
-            let selected = sdwa_word(&raw(0)?, sdwa >> 16)?;
-            let mut value = format!("f16tof32({selected} & 65535u)");
-            if sdwa & (1 << 21) != 0 {
-                value = format!("abs({value})");
+        if name == "v_cvt_f32_f16" {
+            let src = source(0)?;
+            if sdwa & 0xff48_0000 != 0 || matches!(src, Opnd::Literal(_)) {
+                return Err(format!("unsupported SDWA source {sdwa:#x} for {name}"));
             }
-            if sdwa & (1 << 20) != 0 {
-                value = format!("(-{value})");
-            }
-            return Ok(format!("{dst} = asuint({value});"));
-        }
-        if name == "v_cvt_f16_f32" && control == 5 && sdwa >> 16 == 6 {
-            return Ok(format!("{dst} = tb_ray_half(asfloat({})) << 16u;", raw(0)?));
-        }
-        if matches!(name, "v_cvt_u32_f32" | "v_cvt_i32_f32") && control <= 6 && sdwa >> 16 == 6 {
-            // Full float source, UNUSED_PAD destination. Select the low bits
-            // after conversion and zero all other bytes of the destination.
-            let convert = if name == "v_cvt_i32_f32" { "tb_ray_to_int" } else { "tb_ray_to_uint" };
-            let converted = format!("{convert}(asfloat({}))", raw(0)?);
-            let packed = match control {
-                0..=3 => format!("(({converted} & 255u) << {}u)", 8 * control),
-                4 | 5 => format!("(({converted} & 65535u) << {}u)", 16 * (control - 4)),
-                _ => converted,
+            let selector = (sdwa >> 16) & 7;
+            let value = widen_half(src, selector, sdwa & (1 << 21) != 0, sdwa & (1 << 20) != 0)?;
+            let bits = if control & SDWA_CLAMP == 0 {
+                format!("asuint({value})")
+            } else if control & 7 < 4 {
+                // A widened half, including a propagated NaN, always has a zero
+                // low byte. Saturation to 0 or 1 also leaves that byte zero.
+                "0u".into()
+            } else if matches!(src, Opnd::ConstF32(_)) && selector >= 4 {
+                // Inline floating constants are normal halves, with a zero high word.
+                format!("asuint(saturate({value}))")
+            } else {
+                return Err("clamped half conversion needs the ray launch FP mode".into());
             };
+            let packed = sdwa_destination(&dst, &bits, control & !SDWA_CLAMP)?;
             return Ok(format!("{dst} = {packed};"));
         }
-        // Full DWORD destination, no saturation or floating-point modifiers.
-        if (sdwa >> 8) & 0xff != 6 || sdwa & 0x7070_0000 != 0 {
-            return Err(format!("unsupported SDWA control {sdwa:#x} for {name}"));
+        let from_f32 = match name {
+            "v_cvt_f16_f32" => Some("tb_ray_half"),
+            "v_cvt_i32_f32" => Some("tb_cvt_i32_f32"),
+            "v_cvt_u32_f32" => Some("tb_cvt_u32_f32"),
+            _ => None,
+        };
+        if let Some(convert) = from_f32 {
+            // Only source selection, ABS and NEG apply to this floating operand.
+            // SDWA has no trailing literal word.
+            if sdwa & 0xff48_0000 != 0 || matches!(source(0)?, Opnd::Literal(_)) {
+                return Err(format!("unsupported SDWA source {sdwa:#x} for {name}"));
+            }
+            let mut bits = sdwa_word(&raw(0)?, sdwa >> 16)?;
+            if sdwa & (1 << 21) != 0 {
+                bits = format!("({bits} & 0x7fffffffu)");
+            }
+            if sdwa & (1 << 20) != 0 {
+                bits = format!("({bits} ^ 0x80000000u)");
+            }
+            let value = format!("{convert}(asfloat({bits}))");
+            let packed = sdwa_destination(&dst, &value, control)?;
+            return Ok(format!("{dst} = {packed};"));
+        }
+        if matches!(name, "v_cvt_f32_i32" | "v_cvt_f32_u32") {
+            if sdwa & 0xff70_0000 != 0 || matches!(source(0)?, Opnd::Literal(_)) {
+                return Err(format!("unsupported SDWA source {sdwa:#x} for {name}"));
+            }
+            let selected = sdwa_word(&raw(0)?, sdwa >> 16)?;
+            let mut value = if name == "v_cvt_f32_i32" {
+                format!("float(asint({selected}))")
+            } else {
+                format!("float({selected})")
+            };
+            if control & SDWA_CLAMP != 0 {
+                value = format!("saturate({value})");
+            }
+            let packed = sdwa_destination(&dst, &format!("asuint({value})"), control & !SDWA_CLAMP)?;
+            return Ok(format!("{dst} = {packed};"));
+        }
+        // Integer sources can select and sign-extend a field from either register.
+        if sdwa & 0x7070_0000 != 0 || ins.src.iter().any(|src| matches!(src, Opnd::Literal(_))) {
+            return Err(format!("unsupported SDWA source {sdwa:#x} for {name}"));
         }
         let a = sdwa_word(&raw(0)?, sdwa >> 16)?;
-        if name == "v_cvt_f32_u32" {
-            return Ok(format!("{dst} = asuint(float({a}));"));
-        }
         let b = sdwa_word(&raw(1)?, sdwa >> 24)?;
-        if name == "v_lshlrev_b32" {
-            return Ok(format!("{dst} = {b} << ({a} & 31u);"));
+        if let Some(mul) = Mul24::decode(ins) {
+            let packed = sdwa_destination(&dst, &mul.hlsl(&a, &b), control & !SDWA_CLAMP)?;
+            return Ok(format!("{dst} = {packed};"));
         }
-        let op = match name {
-            "v_add_nc_u32" => "+",
-            "v_sub_nc_u32" => "-",
-            "v_xor_b32" => "^",
-            "v_and_b32" => "&",
-            "v_or_b32" => "|",
+        let value = match name {
+            "v_min_i32" => format!("asuint(min(asint({a}), asint({b})))"),
+            "v_max_i32" => format!("asuint(max(asint({a}), asint({b})))"),
+            "v_min_u32" => format!("min({a}, {b})"),
+            "v_max_u32" => format!("max({a}, {b})"),
+            "v_lshlrev_b32" => format!("({b} << ({a} & 31u))"),
+            "v_lshrrev_b32" => format!("({b} >> ({a} & 31u))"),
+            "v_ashrrev_i32" => format!("(asuint(asint({b}) >> ({a} & 31u)))"),
+            "v_add_nc_u32" => format!("({a} + {b})"),
+            "v_sub_nc_u32" => format!("({a} - {b})"),
+            "v_xor_b32" => format!("({a} ^ {b})"),
+            "v_and_b32" => format!("({a} & {b})"),
+            "v_or_b32" => format!("({a} | {b})"),
             _ => return Err(format!("unsupported ray SDWA operation {name}")),
         };
-        return Ok(format!("{dst} = {a} {op} {b};"));
+        let packed = sdwa_destination(&dst, &value, control)?;
+        return Ok(format!("{dst} = {packed};"));
+    }
+    if let Some(mul) = Mul24::decode(ins) {
+        return Ok(format!("{dst} = {};", mul.hlsl(&raw(0)?, &raw(1)?)));
     }
     if matches!(name, "v_swap_b32" | "v_movrels_b32" | "v_movreld_b32") {
         let (Opnd::Vgpr(d), Opnd::Vgpr(s)) = (dest, *source(0)?) else {
@@ -298,19 +468,19 @@ pub(super) fn vector(ins: &Insn) -> Result<String, String> {
             "gt" => format!("{left} > {right}"),
             "ge" => format!("{left} >= {right}"),
             "lg" if ty == "f32" => {
-                format!("!tb_ray_nan({a}) && !tb_ray_nan({b}) && {left} != {right}")
+                format!("!tb_nan_bits({a}) && !tb_nan_bits({b}) && {left} != {right}")
             }
             "neq" if ty == "f32" => {
-                format!("tb_ray_nan({a}) || tb_ray_nan({b}) || {left} != {right}")
+                format!("tb_nan_bits({a}) || tb_nan_bits({b}) || {left} != {right}")
             }
             "ngt" if ty == "f32" => {
-                format!("tb_ray_nan({a}) || tb_ray_nan({b}) || {left} <= {right}")
+                format!("tb_nan_bits({a}) || tb_nan_bits({b}) || {left} <= {right}")
             }
             "nge" if ty == "f32" => {
-                format!("tb_ray_nan({a}) || tb_ray_nan({b}) || {left} < {right}")
+                format!("tb_nan_bits({a}) || tb_nan_bits({b}) || {left} < {right}")
             }
             "nle" if ty == "f32" => {
-                format!("tb_ray_nan({a}) || tb_ray_nan({b}) || {left} > {right}")
+                format!("tb_nan_bits({a}) || tb_nan_bits({b}) || {left} > {right}")
             }
             _ => return Err(format!("unsupported ray comparison {name}")),
         };
@@ -376,7 +546,7 @@ pub(super) fn vector(ins: &Insn) -> Result<String, String> {
         "v_max3_f32" => Some(format!("max(max({}, {}), {})", f(0)?, f(1)?, f(2)?)),
         "v_ceil_f32" => Some(format!("ceil({})", f(0)?)),
         "v_floor_f32" => Some(format!("floor({})", f(0)?)),
-        "v_fract_f32" => Some(format!("frac({})", f(0)?)),
+        "v_fract_f32" => Some(format!("tb_fract_f32({}, 0u)", f(0)?)),
         "v_rcp_f32" | "v_rcp_iflag_f32" => Some(format!("rcp({})", f(0)?)),
         "v_sqrt_f32" => Some(format!("sqrt({})", f(0)?)),
         "v_rsq_f32" => Some(format!("rsqrt({})", f(0)?)),
@@ -390,19 +560,13 @@ pub(super) fn vector(ins: &Insn) -> Result<String, String> {
         "v_cvt_f32_u32" => Some(format!("float({})", raw(0)?)),
         "v_cvt_f32_i32" => Some(format!("float(asint({}))", raw(0)?)),
         "v_cvt_f32_f16" => {
-            let shift = if ins.enc == Enc::Vop3 && ins.raw[0] & (1 << 11) != 0 {
-                16
-            } else {
-                0
-            };
-            let mut value = format!("f16tof32(({} >> {shift}u) & 65535u)", raw(0)?);
-            if ins.aux.mask & 1 != 0 {
-                value = format!("abs({value})");
-            }
-            if ins.aux.mask & 8 != 0 {
-                value = format!("(-{value})");
-            }
-            Some(value)
+            let high = ins.enc == Enc::Vop3 && ins.raw[0] & (1 << 11) != 0;
+            Some(widen_half(
+                source(0)?,
+                if high { 5 } else { 6 },
+                ins.aux.mask & 1 != 0,
+                ins.aux.mask & 8 != 0,
+            )?)
         }
         "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
             let shift = (name.as_bytes()[name.len() - 1] - b'0') * 8;
@@ -446,9 +610,9 @@ pub(super) fn vector(ins: &Insn) -> Result<String, String> {
             };
             format!("({condition} != 0u) ? {} : {}", bits(1)?, bits(0)?)
         }
-        "v_cvt_u32_f32" => format!("tb_ray_to_uint({})", f(0)?),
-        "v_cvt_i32_f32" => format!("tb_ray_to_int({})", f(0)?),
-        "v_cvt_f16_f32" if ins.enc == Enc::Vop1 => format!("tb_ray_half({})", f(0)?),
+        "v_cvt_u32_f32" => format!("tb_cvt_u32_f32({})", f(0)?),
+        "v_cvt_i32_f32" => format!("tb_cvt_i32_f32({})", f(0)?),
+        "v_cvt_f16_f32" if ins.enc == Enc::Vop1 => format!("({dst} & 0xffff0000u) | tb_ray_half({})", f(0)?),
         "v_perm_b32" => format!("tb_ray_perm({}, {}, {})", raw(0)?, raw(1)?, raw(2)?),
         "v_and_b32" => format!("{} & {}", raw(0)?, raw(1)?),
         "v_or_b32" => format!("{} | {}", raw(0)?, raw(1)?),
@@ -468,7 +632,6 @@ pub(super) fn vector(ins: &Insn) -> Result<String, String> {
         "v_min_u32" => format!("min({}, {})", raw(0)?, raw(1)?),
         "v_max_u32" => format!("max({}, {})", raw(0)?, raw(1)?),
         "v_ffbl_b32" => format!("firstbitlow({})", raw(0)?),
-        "v_mul_u32_u24" => format!("({} & 0xffffffu) * ({} & 0xffffffu)", raw(0)?, raw(1)?),
         "v_mad_u32_u24" => format!(
             "({} & 0xffffffu) * ({} & 0xffffffu) + {}",
             raw(0)?,

@@ -1,4 +1,4 @@
-//! A Scarlett depth texture can expose its float plane as a writable UAV. On
+//! A Scarlett depth texture can expose its depth plane as a writable UAV. On
 //! desktop D3D12 the depth/stencil image and writable R32 image must be distinct.
 use super::{Backing, Device, Out, RESOURCE, wrap_pageable};
 use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER};
@@ -16,15 +16,18 @@ pub(super) fn primary(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DESC>
 }
 
 fn pair_primary(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DESC> {
+    let writable = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
     (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS
-        && matches!(desc.Flags.0 as u32, 0x0100_0006 | 0x8030_0006)
+        && (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS
+            && matches!(desc.Flags.0 as u32, 0x0100_0006 | 0x8030_0006)
+            || desc.Format == super::format::D16_UNORM_S8_UINT && desc.Flags.0 & super::format::HOST_FLAGS == writable)
         && desc.MipLevels == 1
         && desc.DepthOrArraySize == 1
         && desc.SampleDesc.Count == 1
         && desc.SampleDesc.Quality == 0
         && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN)
         .then_some(D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R32G8X24_TYPELESS,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
             ..*desc
         })

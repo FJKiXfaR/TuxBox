@@ -36,6 +36,36 @@ class RuntimeShaderLinks(unittest.TestCase):
         self.cache.mkdir()
         self.tools = ("xshader", "dxc", "dxv")
 
+    def test_invalid_persistent_dxil_falls_back_to_cli_before_publication(self):
+        data = b"synthetic compute shader"
+        key = hashlib.sha256(data).hexdigest()
+        source = self.requests / (key + ".dxbc")
+        source.write_bytes(data)
+        expected = portable_program(5, b"cli")
+        messages = []
+        calls = []
+
+        def persistent_compile(dxc, hlsl, output):
+            output.write_bytes(portable_program(0, b"wrong stage"))
+            return True
+
+        def tool(args, *, timeout):
+            calls.append(args[0])
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_text("void main() {}")
+                args[args.index("--profile-out") + 1].write_text("cs_6_0")
+            elif args[0] == "dxc":
+                output = args[args.index("-Fo") + 1]
+                self.assertFalse(output.exists())
+                output.write_bytes(expected)
+
+        persistent = SimpleNamespace(compile=persistent_compile, report=messages.append)
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=tool):
+            self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session, persistent=persistent))
+        self.assertEqual(calls, ["xshader", "dxv", "dxc", "dxv"])
+        self.assertEqual((self.session / (key + ".cso")).read_bytes(), expected)
+        self.assertIn("using the CLI", messages[0])
+
     def request(self, pixel_order, pixel=b"Xbox pixel shader"):
         inputs = {"producer.dxbc": b"Xbox geometry shader", "pixel.dxbc": pixel, "pixel.cso": pixel_order}
         key = "_".join(hashlib.sha256(data).hexdigest() for data in inputs.values())
@@ -230,6 +260,23 @@ class RuntimeShaderLinks(unittest.TestCase):
         path.symlink_to(source / "producer.dxbc")
         with self.assertRaises(OSError):
             compile_request(source, key, self.tools, self.cache, self.session)
+
+    def test_persistent_helper_has_separate_request_and_hlsl_caches(self):
+        release, dxc, snapshot, helper = (
+            self.cache / name for name in ("release", "dxc", "snapshot", "helper")
+        )
+        release.write_bytes(b"xshader")
+        dxc.write_text("#!/bin/sh\necho version\n")
+        dxc.chmod(0o700)
+        helper.write_bytes(b"helper A")
+        with patch("project_tuxbox.runtime_shaders.compiler_tools", return_value=(release, dxc, dxc)):
+            _, cli = snapshot_compiler_cache(snapshot, self.cache)
+            _, experimental = snapshot_compiler_cache(snapshot, self.cache, dxc_helper=helper)
+            helper.write_bytes(b"helper B")
+            _, replacement = snapshot_compiler_cache(snapshot, self.cache, dxc_helper=helper)
+        self.assertEqual(len({cli, experimental, replacement}), 3)
+        self.assertEqual(len({(cache / "dxil-identity").read_bytes()
+                              for cache in (cli, experimental, replacement)}), 3)
 
     def test_refusal_requires_exact_inputs_and_compiler_build(self):
         release, dxc, snapshot = (self.cache / name for name in ("release", "dxc", "snapshot"))

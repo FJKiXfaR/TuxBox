@@ -62,6 +62,43 @@ fn raw_buffer_transfers_are_emitted_one_dword_at_a_time() {
     }
 }
 
+#[test]
+fn store_beyond_a_single_srv_range_uses_only_a_corroborated_uav() {
+    use crate::meta::{RootParam, RootParamKind, RootRange};
+    // Load the descriptor at physical slot 1, then store through it.
+    let words = [0xf408_0402u32, 0xfa00_0020, 0xe070_1000, 0x8004_0405, 0xbf81_0000];
+    let isa: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let mut ex = super::mesh::heap_extract(&[[3, 8, 1, 0, 4]], 0, &isa);
+    ex.stage = Stage::Compute;
+    ex.psv_threads = Some([64, 1, 1]);
+    ex.required_features = None;
+    // The matching used-resource and PSV rows identify a raw UAV at u0.
+    let used_at = (ex.fssm.len() - 16) as u64;
+    ex.fssm[0xf0..0xf8].copy_from_slice(&used_at.to_le_bytes());
+    ex.fssm[0xfc..0x100].copy_from_slice(&1u32.to_le_bytes());
+    ex.fssm.extend([0x303u32, 8, 0, 1, 0x404].into_iter().flat_map(u32::to_le_bytes));
+    let size = (ex.fssm.len() - 16) as u32;
+    ex.fssm[8..12].copy_from_slice(&size.to_le_bytes());
+    ex.resources.push(crate::psv::PsvResource { res_type: 7, space: 0, lower: 0, upper: 0 });
+    let root = ex.root_sig.as_mut().unwrap();
+    root.version = 2;
+    root.params.push(RootParam { visibility: 0, kind: RootParamKind::Table(vec![
+        RootRange { range_type: 0, num: 1, base_register: 0, space: 0, offset_in_table: 0 },
+    ]) });
+    let hlsl = super::translate(&ex).unwrap().hlsl;
+    assert!(hlsl.contains("RWByteAddressBuffer raw_ubuf0 : register(u0)"), "{hlsl}");
+    assert!(hlsl.contains("raw_ubuf0.Store("), "{hlsl}");
+
+    // Removing the independent user-data record leaves no proof for the uncovered slot.
+    ex.fssm[0xf8..0xfc].fill(0);
+    assert!(matches!(super::translate(&ex), Err(e) if e.contains("non-UAV table")));
+    // An explicit SRV at slot 1 takes precedence even with corroborating metadata.
+    ex.fssm[0xf8..0xfc].copy_from_slice(&1u32.to_le_bytes());
+    let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[0].kind else { unreachable!() };
+    ranges[0].num = 2;
+    assert!(matches!(super::translate(&ex), Err(e) if e.contains("non-UAV table")));
+}
+
 /// Locally constructed linear SRV, followed by both indexed address forms.
 /// Encodings produced by llvm-mc -mcpu=gfx1030.
 fn indexed_fixture() -> ShaderExtract {
@@ -119,6 +156,20 @@ fn proven_byte_index_emits_addresses_without_widening_loads() {
     assert!(em.regs.contains("v3"));
     em.raw_byte_index.clear();
     assert!(em.emit_mubuf(4, &ops[4]).unwrap_err().contains("stride"));
+}
+
+#[test]
+fn byte_index_accepts_commuted_stride_one_in_descriptor_high_word() {
+    let mut ex = indexed_fixture();
+    // gfx1030: s_or_b32 s9, 0x10000, s13
+    ex.isa[16..20].copy_from_slice(&0x8809_0dffu32.to_le_bytes());
+    ex.isa_data.clone_from(&ex.isa);
+    let translated = super::translate(&ex).unwrap();
+    assert_eq!(translated.hlsl.matches("raw_sbuf0.Load(").count(), 8);
+    println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
+    ex.isa[20..24].copy_from_slice(&0x40000u32.to_le_bytes());
+    ex.isa_data.clone_from(&ex.isa);
+    assert!(super::translate(&ex).is_err());
 }
 
 #[test]

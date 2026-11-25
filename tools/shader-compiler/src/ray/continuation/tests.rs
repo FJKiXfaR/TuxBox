@@ -62,6 +62,137 @@ fn crossing_back_edges_dispatch_and_invalid_edges_fail() {
 }
 
 #[test]
+fn compact_f32_to_f16_preserves_the_upper_word() {
+    // v_cvt_f16_f32 v4,v1; v_cvt_f16_f32 v4,v4. Even with aliased
+    // operands, conversion reads the old word before replacing its low half.
+    let hlsl = lift(&[0x7e08_1501, 0x7e08_1504, RETURN]).unwrap();
+    assert!(hlsl.contains("v[4] = (v[4] & 0xffff0000u) | tb_ray_half(asfloat(v[1]));"));
+    assert!(hlsl.contains("v[4] = (v[4] & 0xffff0000u) | tb_ray_half(asfloat(v[4]));"));
+}
+
+#[test]
+fn sdwa_f32_to_f16_places_the_converted_bits_in_the_destination() {
+    let convert = |extension| lift(&[0x7e08_14f9, extension, RETURN]);
+    // BYTE_1 PRESERVE, WORD_0 SEXT, and DWORD PAD.
+    let preserve = convert(0x0006_1101).unwrap();
+    assert!(preserve.contains("(v[4] & 0xffff00ffu)"));
+    assert!(preserve.contains("(tb_ray_half(asfloat(v[1])) & 255u) << 8u"));
+    let extend = convert(0x0006_0c01).unwrap();
+    assert!(extend.contains("asint(tb_ray_half(asfloat(v[1])) << 16u) >> 16u"));
+    assert!(convert(0x0006_0601).unwrap().contains("v[4] = tb_ray_half(asfloat(v[1]));"));
+    // Reserved selector, reserved unused mode, and unhandled output modifiers.
+    for extension in [0x0006_0701, 0x0006_1801, 0x0006_2001, 0x0006_4001] {
+        assert!(convert(extension).is_err());
+    }
+}
+
+#[test]
+fn sdwa_integer_conversions_apply_float_modifiers_before_packing() {
+    // Convert -abs(v1) to signed, replacing only WORD_0 in v4.
+    let signed = lift(&[0x7e08_10f9, 0x0036_1401, RETURN]).unwrap();
+    assert!(signed.contains("(v[4] & 0xffff0000u)"));
+    assert!(signed.contains("tb_cvt_i32_f32(asfloat(((v[1] & 0x7fffffffu) ^ 0x80000000u)))"));
+    // Convert v1 to unsigned, replacing only BYTE_3 in v4.
+    let unsigned = lift(&[0x7e08_0ef9, 0x0006_1301, RETURN]).unwrap();
+    assert!(unsigned.contains("(v[4] & 0x00ffffffu)"));
+    assert!(unsigned.contains("(tb_cvt_u32_f32(asfloat(v[1])) & 255u) << 24u"));
+}
+
+#[test]
+fn sdwa_integer_to_float_extends_before_conversion_and_clamps_before_writing() {
+    // Signed WORD_1 source: a negative high half must convert to a negative float.
+    let signed = lift(&[0x7e08_0af9, 0x000d_0601, RETURN]).unwrap();
+    assert!(signed.contains("float(asint("));
+    assert!(signed.contains("asint((v[1]) << 0u) >> 16u"));
+    // Unsigned DWORD source: clamp the float, then copy its low byte to BYTE_3.
+    let unsigned = lift(&[0x7e08_0cf9, 0x0006_3301, RETURN]).unwrap();
+    assert!(unsigned.contains("(v[4] & 0x00ffffffu)"));
+    assert!(unsigned.contains("(asuint(saturate(float(v[1]))) & 255u) << 24u"));
+    assert!(lift(&[0x7e08_0cf9, 0x0006_4601, RETURN]).is_err()); // output scale
+}
+
+#[test]
+fn widening_an_inline_half_uses_half_precision_before_subword_selection() {
+    let compact = lift(&[0x7e08_16f2, RETURN]).unwrap(); // 1.0
+    assert!(compact.contains("tb_ray_widen_half(f32tof16(asfloat(0x3f800000u)))"));
+    let high = lift(&[0x7e08_16f9, 0x0085_06f2, RETURN]).unwrap();
+    assert!(high.contains("(f32tof16(asfloat(0x3f800000u))) >> 16u"));
+    let packed = lift(&[0x7e08_16f9, 0x0036_1501, RETURN]).unwrap();
+    assert!(packed.contains("(v[4] & 0x0000ffffu)"));
+    assert!(packed.contains("tb_ray_widen_half(((v[1] & 0x7fffu) ^ 0x8000u))"));
+}
+
+#[test]
+fn sdwa_clamped_half_writes_only_launch_mode_independent_results() {
+    let convert = |ext| lift(&[0x7e08_16f9, ext, RETURN]);
+    // The low byte of any widened and saturated half is zero.
+    let byte = convert(0x0006_3201).unwrap(); // BYTE_2, PRESERVE
+    assert!(byte.contains("(v[4] & 0xff00ffffu)"));
+    assert!(!byte.contains("tb_ray_widen_half"));
+    let constant = convert(0x0086_26f0).unwrap(); // 0.5, DWORD
+    assert!(constant.contains("saturate(tb_ray_widen_half("));
+    // A register can contain a NaN whose clamped result depends on DX10_CLAMP.
+    for ext in [0x0006_2601, 0x0015_3501, 0x0007_3201, 0x0006_7201] {
+        assert!(convert(ext).is_err());
+    }
+}
+
+#[test]
+fn sdwa_binary_ops_write_the_selected_byte_after_evaluating_both_sources() {
+    // v4 = op(v1, v5), BYTE_1 with UNUSED_PRESERVE.
+    for (opcode, value) in [
+        (0x3608_0af9, "v[1] & v[5]"),
+        (0x3808_0af9, "v[1] | v[5]"),
+        (0x3a08_0af9, "v[1] ^ v[5]"),
+        (0x4a08_0af9, "v[1] + v[5]"),
+        (0x4c08_0af9, "v[1] - v[5]"),
+        (0x3408_0af9, "v[5] << (v[1] & 31u)"),
+        (0x2c08_0af9, "v[5] >> (v[1] & 31u)"),
+        (0x3008_0af9, "asuint(asint(v[5]) >> (v[1] & 31u))"),
+    ] {
+        let hlsl = lift(&[opcode, 0x0606_1101, RETURN]).unwrap();
+        assert!(hlsl.contains("(v[4] & 0xffff00ffu)"));
+        assert!(hlsl.contains(&format!("(({value}) & 255u) << 8u")));
+    }
+    // Unsupported output scale and reserved source selector.
+    assert!(lift(&[0x3608_0af9, 0x0606_5101, RETURN]).is_err());
+    assert!(lift(&[0x3608_0af9, 0x0706_1101, RETURN]).is_err());
+}
+
+#[test]
+fn mul24_selects_signedness_result_word_and_saturation() {
+    for (encoding, flags) in [
+        (vec![0x1208_0b01], "true, false, false"),
+        (vec![0x1808_0b01], "false, true, false"),
+        (vec![0xd50b_8004, 0x0002_0b01], "false, false, true"),
+        (vec![0x1408_0af9, 0x0606_1101], "true, true, false"),
+    ] {
+        let mut words = encoding;
+        words.push(RETURN);
+        let shader = lift(&words).unwrap();
+        assert!(shader.contains(&format!("tb_ray_mul24(v[1], v[5], {flags})")));
+        if words[0] == 0x1408_0af9 {
+            assert!(shader.contains("v[4] & 0xffff00ffu"));
+        }
+    }
+    // VOP3 integer multiply has no output scaling.
+    assert!(lift(&[0xd50b_0004, 0x0802_0b01, RETURN]).is_err());
+}
+
+#[test]
+fn sdwa_minmax_compares_full_values_before_writing_the_selected_byte() {
+    for (opcode, expr) in [
+        (0x2208_0af9, "asuint(min(asint(v[1]), asint(v[5])))"),
+        (0x2408_0af9, "asuint(max(asint(v[1]), asint(v[5])))"),
+        (0x2608_0af9, "min(v[1], v[5])"),
+        (0x2808_0af9, "max(v[1], v[5])"),
+    ] {
+        let hlsl = lift(&[opcode, 0x0606_1101, RETURN]).unwrap();
+        assert!(hlsl.contains(&format!("(v[4] & 0xffff00ffu) | (({expr} & 255u) << 8u)")));
+    }
+}
+
+#[test]
 fn consecutive_vector_moves_share_the_guard_until_exec_changes() {
     let move_v29 = 0x7e3a_0280; // v_mov_b32 v29, 0
     let move_v45 = 0x7e5a_0280; // v_mov_b32 v45, 0

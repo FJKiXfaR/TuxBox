@@ -166,6 +166,7 @@ unsafe extern "system" fn reset_allocator(this: &Allocator) -> HRESULT {
     let status = unsafe { (host.vtable().Reset)(host.as_raw()) };
     if status.is_ok() {
         sources.clear();
+        crate::commands::list_memory::release(std::sync::Arc::as_ptr(&this.state) as usize);
     }
     status
 }

@@ -1,14 +1,14 @@
 //! Ordinary VOP3 integer forms with a 32-bit result: the signed no-carry
-//! add/subtract, the 16x16+32 multiply-add and the sums of absolute
-//! differences (SAD) over bytes, halves and words. Sources are VGPRs without
-//! modifiers. Add/subtract also accept integer immediates, and byte SAD
-//! accepts inline zero as its accumulator.
-//! Clamp (signed saturation) is refused.
-use super::{int16::half, r, Enc, Insn, Opnd};
+//! add/subtract, 16x16+32 multiply-add, saturating integer packs and sums of
+//! absolute differences over bytes, halves and words. Add/subtract and unsigned MAD
+//! accept integer immediates, and byte SAD accepts an inline zero accumulator.
+//! Signed add/subtract also support saturating arithmetic with clamp.
+use super::{int16::half, r, signed_add_overflow, Enc, Insn, Opnd};
 
 pub(super) fn handles(ins: &Insn) -> bool {
     ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
         "v_add_nc_i32" | "v_sub_nc_i32" | "v_mad_u32_u16" | "v_mad_i32_i16"
+        | "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32"
         | "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32")
 }
 
@@ -18,12 +18,14 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     }
     let mad = ins.mnemonic.starts_with("v_mad_");
     let add_sub = matches!(ins.mnemonic.as_str(), "v_add_nc_i32" | "v_sub_nc_i32");
-    let arity = if add_sub { 2 } else { 3 };
+    let pack = matches!(ins.mnemonic.as_str(), "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32");
+    let arity = if add_sub || pack { 2 } else { 3 };
     if !ins.is_complete() || ins.raw.len() < 2 || ins.src.len() < arity
         || !ins.src[..arity].iter().enumerate().all(|(index, s)| {
             matches!(s, Opnd::Vgpr(_))
                 || (add_sub && matches!(s, Opnd::ConstInt(_) | Opnd::Literal(_)))
                 || (index == 2 && ins.mnemonic == "v_sad_u8" && matches!(s, Opnd::ConstInt(0)))
+                || (index == 2 && ins.mnemonic == "v_mad_u32_u16" && matches!(s, Opnd::ConstInt(_)))
         }) {
         return Err("unsupported ordinary 32-bit integer source or encoding".into());
     }
@@ -31,10 +33,25 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     // RDNA2 ISA 6.4: op_sel bits 11 and 12 pick the 16-bit half of the two
     // multiplicands. The 32-bit addend and result take no half selection.
     let allowed_select = if mad { 0x1800 } else { 0 };
-    if w0 & 0x8700 != 0 || w0 & 0x7800 & !allowed_select != 0 || w1 >> 27 != 0 {
+    let clamped = w0 & 0x8000 != 0;
+    if (clamped && !add_sub) || w0 & 0x0700 != 0 || w0 & 0x7800 & !allowed_select != 0 || w1 >> 27 != 0 {
         return Err("unsupported ordinary 32-bit integer modifiers".into());
     }
     let (a, b) = (r(&ins.src[0])?, r(&ins.src[1])?);
+    if clamped {
+        // Use uint arithmetic so even overflowing inputs have a defined result.
+        let (result, overflow) = if ins.mnemonic == "v_add_nc_i32" {
+            let sum = format!("({a} + {b})");
+            let overflow = signed_add_overflow(&a, &b, &sum);
+            (sum, overflow)
+        } else {
+            let diff = format!("({a} - {b})");
+            let overflow = format!("((({a} ^ {b}) & ({a} ^ {diff})) >> 31)");
+            (diff, overflow)
+        };
+        // On signed overflow the first operand's sign determines which limit to use.
+        return Ok(Some(format!("({overflow} != 0u ? (0x7fffffffu + ({a} >> 31)) : {result})")));
+    }
     // |x - y| of unsigned fields, then the 32-bit accumulator S2 (modular).
     let sad = |width: u32| -> String {
         let mask = (1u64 << width) - 1;
@@ -45,6 +62,11 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         }).collect::<Vec<_>>().join(" + ")
     };
     Ok(Some(match ins.mnemonic.as_str() {
+        // Convert both full-width inputs with saturation; S0 occupies the low half.
+        "v_cvt_pk_u16_u32" => format!("(min({a}, 65535u) | (min({b}, 65535u) << 16))"),
+        "v_cvt_pk_i16_i32" => format!(
+            "((asuint(clamp(asint({a}), -32768, 32767)) & 0xffffu) | (asuint(clamp(asint({b}), -32768, 32767)) << 16))"
+        ),
         // RDNA2 ISA: SAD_U8 sums four byte differences, SAD_HI_U8 places
         // that sum in the high half, SAD_U16 sums two half differences.
         "v_sad_u8" => format!("({} + {})", sad(8), r(&ins.src[2])?),
@@ -90,8 +112,9 @@ mod tests {
             let ins = native(first, second);
             assert_eq!(ins.mnemonic, name);
             assert!(expression(&ins).unwrap().unwrap().contains(want), "{name}");
-            // clamp, abs, a scalar source and neg remain refused.
-            assert!(expression(&native(first | 0x8000, second)).is_err(), "{name} clamp");
+            if name.starts_with("v_mad_") {
+                assert!(expression(&native(first | 0x8000, second)).is_err(), "{name} clamp");
+            }
             assert!(expression(&native(first | 0x100, second)).is_err(), "{name} abs");
             assert!(expression(&native(first, (second & !511) | 4)).is_err(), "{name} sgpr");
             assert!(expression(&native(first, second | 1 << 29)).is_err(), "{name} neg");
@@ -102,6 +125,50 @@ mod tests {
         let expr = expression(&native(0xd773_1807, 0x041a_0b04)).unwrap().unwrap();
         assert_eq!(expr, "((v4 >> 16) * (v5 >> 16) + v6)");
         assert!(expression(&native(0xd77f_0807, 0x0202_0b04)).is_err());
+    }
+
+    #[test]
+    fn unsigned_mad_accepts_a_full_width_inline_integer_accumulator() {
+        // LLVM gfx1030: v_mad_u32_u16 v4, v1, v2, 7 (then -1).
+        for (sources, addend) in [(0x021e_0501, "0x7u"), (0x0306_0501, "0xffffffffu")] {
+            let expr = expression(&native(0xd773_0004, sources)).unwrap().unwrap();
+            assert_eq!(expr, format!("((v1 & 0xffffu) * (v2 & 0xffffu) + {addend})"));
+        }
+        // v_mad_u32_u16 v4, 7, v2, v3 and v_mad_i32_i16 v4, v1, v2, 7
+        assert!(expression(&native(0xd773_0004, 0x040e_0487)).is_err());
+        assert!(expression(&native(0xd775_0004, 0x021e_0501)).is_err());
+    }
+
+    #[test]
+    fn integer_packs_clamp_each_word_before_combining_halves() {
+        use crate::hlsl::float64::tests::translate;
+        use crate::Stage;
+
+        // LLVM gfx1030: v_cvt_pk_{u16_u32,i16_i32} v4, v1, v2
+        for (opcode, low, high) in [
+            (0xd76a_0004, "min(v1, 65535u)", "min(v2, 65535u)"),
+            (0xd76b_0004, "(asuint(clamp(asint(v1), -32768, 32767)) & 0xffffu)",
+                          "asuint(clamp(asint(v2), -32768, 32767))"),
+        ] {
+            let body = [opcode, 0x0002_0501];
+            let hlsl = translate(Stage::Compute, &body).unwrap();
+            assert!(hlsl.contains(&format!("({low} | ({high} << 16))")), "{hlsl}");
+            assert!(translate(Stage::Compute, &[opcode | 0x0800, body[1]]).is_err());
+            assert!(translate(Stage::Compute, &[opcode, body[1] | (1 << 29)]).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_add_and_subtract_accept_clamp() {
+        use crate::hlsl::float64::tests::translate;
+        use crate::Stage;
+
+        // LLVM gfx1030: v_add_nc_i32 / v_sub_nc_i32 v4, v1, v2 clamp
+        for (opcode, result) in [(0xd77f_8004, "(v1 + v2)"), (0xd776_8004, "(v1 - v2)")] {
+            let hlsl = translate(Stage::Compute, &[opcode, 0x0002_0501]).unwrap();
+            assert!(hlsl.contains(&format!("? (0x7fffffffu + (v1 >> 31)) : {result}")), "{hlsl}");
+            assert!(translate(Stage::Compute, &[opcode | 0x0100, 0x0002_0501]).is_err());
+        }
     }
 
     #[test]

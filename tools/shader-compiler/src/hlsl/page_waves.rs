@@ -76,26 +76,8 @@ pub(super) fn emit(em: &mut Emitter<'_>, i: usize, ins: &Insn, target: Option<us
     Ok(true)
 }
 
-pub(super) fn declarations(group: [u32; 3], branchless: bool) -> String {
-    let (words, lanes, clear, vote) = if branchless {
-        // Each of the 64 lanes clears a distinct word. Zero votes contribute
-        // zero to the OR. Omitting both branches per vote keeps the large
-        // field interpreter within the pipeline compiler's 1 MiB guest stack.
-        (64, 256, "page_bits[tid] = 0u;",
-            "InterlockedOr(page_bits[tid >> 5], uint(vote) << (tid & 31u));")
-    } else {
-        let vote = "if (vote) InterlockedOr(page_bits[tid >> 5], 1u << (tid & 31u));";
-        if group == [1024, 1, 1] {
-            (32, 1024, "if (tid < 32u) page_bits[tid] = 0u;", vote)
-        } else {
-            (8, 256, "if (tid < 8u) page_bits[tid] = 0u;", vote)
-        }
-    };
-    format!(r#"
-groupshared uint page_bits[{words}];
-groupshared uint page_lane_values[{lanes}];
-
-uint2 tb_page_ballot(uint tid, bool vote) {{
+fn ballot_function(clear: &str, vote: &str) -> String {
+    format!(r#"uint2 tb_page_ballot(uint tid, bool vote) {{
     {clear}
     GroupMemoryBarrierWithGroupSync();
     {vote}
@@ -104,7 +86,38 @@ uint2 tb_page_ballot(uint tid, bool vote) {{
     uint2 bits = uint2(page_bits[halfWave], page_bits[halfWave + 1u]);
     GroupMemoryBarrierWithGroupSync();
     return bits;
-}}
+}}"#)
+}
+
+const SET_BIT: &str = "if (vote) InterlockedOr(page_bits[tid >> 5], 1u << (tid & 31u));";
+
+pub(super) fn ballot_declarations(threads: u32) -> String {
+    let words = threads.div_ceil(64) * 2;
+    let clear = format!("if (tid < {words}u) page_bits[tid] = 0u;");
+    format!("groupshared uint page_bits[{words}];\n{}\n", ballot_function(&clear, SET_BIT))
+}
+
+pub(super) fn declarations(group: [u32; 3], branchless: bool) -> String {
+    let (words, lanes, clear, vote) = if branchless {
+        // Each of the 64 lanes clears a distinct word. Zero votes contribute
+        // zero to the OR. Omitting both branches per vote keeps the large
+        // field interpreter within the pipeline compiler's 1 MiB guest stack.
+        (64, 256, "page_bits[tid] = 0u;",
+            "InterlockedOr(page_bits[tid >> 5], uint(vote) << (tid & 31u));")
+    } else {
+        let vote = SET_BIT;
+        if group == [1024, 1, 1] {
+            (32, 1024, "if (tid < 32u) page_bits[tid] = 0u;", vote)
+        } else {
+            (8, 256, "if (tid < 8u) page_bits[tid] = 0u;", vote)
+        }
+    };
+    let ballot = ballot_function(clear, vote);
+    format!(r#"
+groupshared uint page_bits[{words}];
+groupshared uint page_lane_values[{lanes}];
+
+{ballot}
 
 uint tb_page_read(uint tid, uint value, uint lane) {{
     page_lane_values[tid] = value;

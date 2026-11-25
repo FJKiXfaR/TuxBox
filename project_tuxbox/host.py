@@ -208,10 +208,19 @@ def configure_nvidia_shader_cache(env, report=None):
     ~/.cache/nvidia/GLCache: every Wine process shares one application bucket,
     and the driver drops that bucket once it passes a small size. vkd3d can
     reuse its SPIR-V while the driver compiles the same pipelines again. A
-    prefix-local directory is the cache Steam gives each title. An explicit
-    path or a disabled disk cache is left alone.
+    prefix-local directory is the cache Steam gives each title. A disabled
+    disk cache is left alone. An explicit path is kept, and still gets room:
+    a session that exports the path without a size keeps the small default
+    cap, and the driver then drops the whole bucket part-way through a boot.
     """
-    if env.get("__GL_SHADER_DISK_CACHE") == "0" or env.get("__GL_SHADER_DISK_CACHE_PATH"):
+    if env.get("__GL_SHADER_DISK_CACHE") == "0":
+        return
+    explicit = env.get("__GL_SHADER_DISK_CACHE_PATH")
+    if explicit:
+        env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
+        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(8 << 30))
+        if report:
+            report(f"NVIDIA shader cache: {explicit} (path set by the environment)")
         return
     prefix = env.get("WINEPREFIX")
     if not prefix:

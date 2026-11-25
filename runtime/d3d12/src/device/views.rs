@@ -968,15 +968,35 @@ pub(super) unsafe extern "system" fn uav(
         .and_then(|r| r.state.depth())
     {
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+            DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
         };
         let Some(view) = (unsafe { desc.as_ref() }) else {
             fail_call(format_args!("depth UAV needs a typed plane view"));
         };
+        if pair.guest.Format == super::format::D16_UNORM_S8_UINT
+            && view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D
+            && unsafe { view.Anonymous.Texture2D.PlaneSlice } == 1
+        {
+            // The companion has no stencil. Keep the descriptor defined (null:
+            // reads return zero, writes are dropped) and report it.
+            static STENCIL_UAV: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&STENCIL_UAV, || format!(
+                "null UAV for the Scarlett stencil plane of {}x{}: view format={}",
+                pair.guest.Width, pair.guest.Height, view.Format.0
+            ));
+            let null = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV::default() },
+                ..*view
+            };
+            unsafe { device.native.CreateUnorderedAccessView(None, None, Some(&null), handle) };
+            return;
+        }
         if counter.is_some()
             || view.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D
             // Either the plane format or the float format of the depth plane.
-            || !matches!(view.Format, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS | DXGI_FORMAT_R32_FLOAT)
+            || !(matches!(view.Format, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS | DXGI_FORMAT_R32_FLOAT)
+                // The companion of a 16-bit plane holds its normalized values as floats.
+                || view.Format == DXGI_FORMAT_R16_UNORM && pair.guest.Format == super::format::D16_UNORM_S8_UINT)
             || unsafe {
                 view.Anonymous.Texture2D.MipSlice != 0 || view.Anonymous.Texture2D.PlaneSlice != 0
             }
@@ -1058,7 +1078,8 @@ pub(super) unsafe extern "system" fn dsv(
             &raw const translated
         }
         None if let Some(guest) = unsafe { super::resource_proxy(object, identity(device).as_raw()) }
-            .and_then(|p| p.state.translated()) => {
+            .and_then(|p| p.state.translated().or_else(|| p.state.depth().map(|pair| &pair.guest)
+                .filter(|guest| guest.Format == super::format::D16_UNORM_S8_UINT))) => {
             // A typeless host image needs the typed depth format the guest implied.
             let mut view = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: super::format::host_format(guest.Format), ..Default::default() };
             let layers = u32::from(guest.DepthOrArraySize);

@@ -4,6 +4,149 @@
 use super::{compute_group, wave_sum, Emitter, Enc, Insn, Opnd, ShaderExtract, Stage};
 use crate::rdna2::clobbers_scalar;
 
+pub(super) fn is_dpp8(ins: &Insn) -> bool {
+    ins.enc == Enc::Vop2
+        && ins
+            .raw
+            .first()
+            .is_some_and(|w| matches!(w & 0x1ff, 233 | 234))
+}
+
+// DPP8 stores its lane selectors in the same bits that hold DPP16 write masks.
+pub(super) fn destination_mask(ins: &Insn) -> Option<u8> {
+    if ins.enc != Enc::Vop2 || ins.raw.first()? & 0x1ff != 250 {
+        return None;
+    }
+    let mask = (ins.raw.get(1)? >> 24) as u8;
+    (mask != 0xff).then_some(mask)
+}
+
+// Choose the same logical width as the program's lane broadcasts. The physical
+// subgroup used to fetch the source operand may contain only half a guest wave.
+pub(super) fn row_index_mask(em: &Emitter<'_>, rows: u8, banks: u8) -> Result<u32, String> {
+    if (rows & 3) == (rows >> 2) || banks == 0 {
+        return Ok(3); // The effective write mask repeats in both halves.
+    }
+    let register_width = em.packed.as_ref().and_then(|p| p.register_wave_size);
+    let threads = compute_group(em.ex).into_iter().fold(1u32, u32::saturating_mul);
+    match em.fspx_wave.or(register_width) {
+        Some(32) => Ok(1),
+        Some(64) => Ok(3),
+        _ if threads <= 32 || em.resolve_wave32 || em.single_wave32 => Ok(1),
+        _ if em.indexed_lane => Ok(3),
+        _ => Err("asymmetric DPP16 row mask requires a known guest wave width".into()),
+    }
+}
+
+fn wider_exchange(ins: &Insn) -> bool {
+    if ins.enc != Enc::Vop2 || !matches!(ins.mnemonic.as_str(), "v_min_f32" | "v_max_f32") {
+        return false;
+    }
+    if is_dpp8(ins) {
+        return ins.raw.len() == 2;
+    }
+    // DPP16 rotation, mirror or quad with destination masks or source modifiers.
+    ins.src.first() == Some(&Opnd::Raw(250))
+        && ins.raw.get(1).is_some_and(|c| {
+            let control = (c >> 8) & 0x1ff;
+            c & 0x0002_0000 == 0
+                && (matches!(control, 0x121..=0x12f | 0x140)
+                    || (control <= 0xff && (destination_mask(ins).is_some() || c & 0x00f0_0000 != 0)))
+        })
+}
+
+fn supported_step(ins: &Insn, op: &str) -> bool {
+    if matches!(
+        ins.mnemonic.as_str(),
+        "v_permlanex16_b32" | "v_readlane_b32"
+    ) {
+        return true; // The existing lane exchange emitters validate the operands.
+    }
+    ins.enc == Enc::Vop2
+        && ins.mnemonic == op
+        && (wider_exchange(ins)
+            || super::is_binary_quad_perm(ins)
+            || matches!(
+                &ins.src[..],
+                [
+                    Opnd::Sgpr(_)
+                        | Opnd::Vgpr(_)
+                        | Opnd::ConstInt(_)
+                        | Opnd::ConstF32(_)
+                        | Opnd::Literal(_),
+                    Opnd::Vgpr(_)
+                ]
+            ))
+}
+
+// Keep the native reduction tree and intermediate registers intact. Its READLANE
+// instructions must still address the logical wave, including the other 32 lanes.
+pub(super) fn prepare_exchanges(ex: &ShaderExtract, code: &mut [Insn]) -> Result<bool, String> {
+    if ex.stage != Stage::Compute {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut targets = None;
+    let mut pos = 0;
+    while pos + 3 < code.len() {
+        let save = &code[pos];
+        pos += 1;
+        if save.mnemonic != "s_nand_saveexec_b64" || save.src != [Opnd::ConstInt(0)] {
+            continue;
+        }
+        let [Opnd::Sgpr(saved)] = save.dst[..] else {
+            continue;
+        };
+        let [identity, select, first, ..] = &code[pos..] else {
+            break;
+        };
+        if identity.mnemonic != "v_mov_b32"
+            || select.mnemonic != "v_cndmask_b32"
+            || select.src.get(2) != Some(&Opnd::Sgpr(saved))
+            || !matches!(first.mnemonic.as_str(), "v_min_f32" | "v_max_f32")
+        {
+            continue;
+        }
+        let body = &code[pos + 2..];
+        let count = body
+            .iter()
+            .take_while(|i| supported_step(i, &first.mnemonic))
+            .count();
+        let Some(restore) = body.get(count) else {
+            continue;
+        };
+        if restore.mnemonic != "s_mov_b64"
+            || restore.dst != [Opnd::ExecLo]
+            || restore.src != [Opnd::Sgpr(saved)]
+            || !body[..count].iter().any(wider_exchange)
+        {
+            continue;
+        }
+        // FI=0 on DPP8 relies on NAND_SAVEEXEC having enabled every source lane.
+        let targets = targets.get_or_insert_with(|| super::branch_targets(code));
+        if targets
+            .range((save.offset as i64 + 1)..(restore.offset as i64))
+            .next()
+            .is_some()
+        {
+            return Err("branch enters a saved-EXEC extrema exchange".into());
+        }
+        pos += 2;
+        for ins in &mut code[pos..pos + count] {
+            if ins.enc == Enc::Vop2 {
+                if matches!(ins.src.first(), Some(Opnd::Raw(233 | 234 | 250))) {
+                    super::lower_dpp_binary(ins);
+                } else {
+                    ins.op = super::OP_LOCAL_EXTREMA;
+                }
+            }
+        }
+        pos += count;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 pub(super) fn prepare(ex: &ShaderExtract, code: &mut [Insn]) -> bool {
     if ex.stage != Stage::Compute
         || !compute_group(ex)

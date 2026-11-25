@@ -25,6 +25,7 @@ parser.add_argument("--jobs", type=int, default=1)
 parser.add_argument("--rounds", type=int, default=1)
 parser.add_argument("--count", type=int, default=64)
 parser.add_argument("--arrival-ms", type=float, default=0)
+parser.add_argument("--dxc-helper", type=Path, help="opt-in persistent DXC helper")
 args = parser.parse_args()
 sys.path.insert(0, str(args.repo.resolve()))
 from project_tuxbox import runtime_shaders as worker
@@ -38,7 +39,10 @@ has_jobs = "jobs" in inspect.signature(worker.serve).parameters
 assert has_jobs or args.jobs == 1
 
 def hashes():
-    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in tools}
+    fingerprints = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in tools}
+    if args.dxc_helper:
+        fingerprints["dxc_helper"] = hashlib.sha256(args.dxc_helper.read_bytes()).hexdigest()
+    return fingerprints
 
 def memory_available():
     return int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines()
@@ -82,6 +86,8 @@ def run(cache, phase):
     def target():
         try:
             kwargs = {"jobs": args.jobs} if has_jobs else {}
+            if args.dxc_helper:
+                kwargs["dxc_helper"] = args.dxc_helper.resolve()
             worker.serve(session, stop, logs.append, **kwargs)
         except BaseException as exc:
             errors.append(repr(exc))

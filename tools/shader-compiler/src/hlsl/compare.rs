@@ -25,11 +25,11 @@ bool tb_class_f64(uint2 bits, uint mask) {
 }
 "#;
 
-fn sign_modifiers(mut bits: String, sign: u32, mask: u8, source: u8) -> String {
-    if mask & (1 << source) != 0 {
+pub(super) fn sign_modifiers(mut bits: String, sign: u32, absolute: bool, negate: bool) -> String {
+    if absolute {
         bits = format!("({bits} & {:#x}u)", sign - 1);
     }
-    if mask & (8 << source) != 0 {
+    if negate {
         bits = format!("({bits} ^ {sign:#x}u)");
     }
     bits
@@ -58,7 +58,7 @@ impl Emitter<'_> {
                 format!("{:#x}u", bits >> 32),
             ));
         }
-        Ok((r(operand)?, self.pair_high(operand)?))
+        Ok((self.numeric_input(operand)?, self.pair_high(operand)?))
     }
 
     pub(super) fn compare_float(&mut self, ins: &Insn, mask: u8) -> Result<String, String> {
@@ -78,7 +78,7 @@ impl Emitter<'_> {
             } else {
                 ("0u".into(), r(operand)?)
             };
-            let high = sign_modifiers(high, sign, mask, i as u8);
+            let high = sign_modifiers(high, sign, mask & (1 << i) != 0, mask & (8 << i) != 0);
             Ok(format!("uint2({low}, {high})"))
         };
         let a = source(0)?;

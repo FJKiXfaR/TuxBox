@@ -4,6 +4,7 @@
 mod image;
 mod relative;
 use super::{Bindings, local_record};
+use crate::ray::alu::{Mul24, SDWA_CLAMP, sdwa_field, whole_sdwa_words};
 use crate::rdna2::{Enc, Insn, Opnd, instructions};
 use std::{collections::BTreeMap, fmt::Write, ops::Range};
 use tuxbox_dxbc::ray::State;
@@ -66,10 +67,75 @@ impl Values {
         Some(u64::from(self.words[k]?) | (u64::from(self.words[k + 1]?) << 32))
     }
 
+    fn sdwa_alu(&self, ins: &Insn, ext: u32) -> Option<u32> {
+        if ins.enc != Enc::Vop2 || ext & 0x7070_0000 != 0 {
+            return None;
+        }
+        let read = |op: &Opnd, field: u32| {
+            let word = match op {
+                Opnd::Literal(_) => return None, // SDWA has no trailing literal word
+                Opnd::ConstF32(f) => f.to_bits(),
+                Opnd::Null => 0,
+                _ => self.get(op)?,
+            };
+            let (width, offset) = sdwa_field(field & 7)?;
+            let aligned = word << (32 - width - offset);
+            Some(if field & 8 == 0 {
+                aligned >> (32 - width)
+            } else {
+                ((aligned as i32) >> (32 - width)) as u32
+            })
+        };
+        let a = read(ins.src.first()?, ext >> 16)?;
+        let b = read(ins.src.get(1)?, ext >> 24)?;
+        let mut control = (ext >> 8) & 255;
+        let value = match ins.mnemonic.as_str() {
+            "v_min_i32" => (a as i32).min(b as i32) as u32,
+            "v_max_i32" => (a as i32).max(b as i32) as u32,
+            "v_min_u32" => a.min(b),
+            "v_max_u32" => a.max(b),
+            "v_lshlrev_b32" => b.wrapping_shl(a),
+            "v_lshrrev_b32" => b.wrapping_shr(a),
+            "v_ashrrev_i32" => (b as i32).wrapping_shr(a) as u32,
+            "v_add_nc_u32" => a.wrapping_add(b),
+            "v_sub_nc_u32" => a.wrapping_sub(b),
+            "v_and_b32" => a & b,
+            "v_or_b32" => a | b,
+            "v_xor_b32" => a ^ b,
+            _ => {
+                let mul = Mul24::decode(ins)?;
+                control &= !SDWA_CLAMP;
+                mul.fold(a, b)
+            }
+        };
+        let (width, offset) = sdwa_field((ext >> 8) & 7)?;
+        let mask = u32::MAX >> (32 - width);
+        let placed = (value & mask) << offset;
+        match control >> 3 {
+            0 => Some(placed),
+            1 => Some((((value << (32 - width)) as i32) >> (32 - width - offset)) as u32),
+            2 if width == 32 => Some(value),
+            2 => Some((self.get(ins.dst.first()?)? & !(mask << offset)) | placed),
+            _ => None,
+        }
+    }
+
     fn alu(&self, ins: &Insn) -> [Option<u32>; 2] {
+        if let Some(ext) = ins.aux.sdwa {
+            let value = self.sdwa_alu(ins, ext);
+            // Identity selectors also allow existing whole-word folds, e.g. MOV.
+            if value.is_some() || !whole_sdwa_words(ins)
+                || ins.src.iter().any(|op| matches!(op, Opnd::Literal(_)))
+            {
+                return [value, None];
+            }
+        }
         let x = ins.src.first().and_then(|x| self.get(x));
         let y = ins.src.get(1).and_then(|x| self.get(x));
         let z = ins.src.get(2).and_then(|x| self.get(x));
+        if let Some(mul) = Mul24::decode(ins) {
+            return [x.zip(y).map(|(a, b)| mul.fold(a, b)), None];
+        }
         if ins.mnemonic == "s_getpc_b64" {
             return [
                 Some(super::super::continuation::CODE_BASE + (ins.offset + ins.dwords * 4) as u32),
@@ -496,7 +562,7 @@ impl Layout {
         if let Some(k) = dst {
             regs.words.get_mut(k..k + n)?.copy_from_slice(&words[..n]);
             regs.code_address.get_mut(k..k + n)?.fill(false);
-            regs.code_address[k] = is_table_pointer;
+            regs.code_address[k] = is_table_pointer && whole_sdwa_words(ins);
         }
         Some(())
     }
@@ -656,6 +722,73 @@ mod tests {
         let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let instruction = instructions(&code).next().unwrap();
         instruction
+    }
+
+    #[test]
+    fn mul24_folds_signed_overflow_and_preserves_adjacent_bytes() {
+        let mut regs = Values::new();
+        regs.words[129] = Some(0xab80_0000); // -2^23, or +2^23 unsigned
+        regs.words[133] = Some(257);
+        regs.words[132] = Some(0xaabb_ccdd);
+        for (op, ext, expected) in [
+            (0xd509_8004, 0x0002_0b01, 0x8000_0000), // signed saturation
+            (0xd50b_8004, 0x0002_0b01, 0x8080_0000), // unsigned fits
+            (0x1408_0af9, 0x0606_1101, 0xaabb_ffdd), // signed high word
+            (0x1808_0af9, 0x0606_1101, 0xaabb_00dd), // unsigned high word
+        ] {
+            assert_eq!(regs.alu(&decode(&[op, ext]))[0], Some(expected));
+        }
+        // 65536 squared is the first value above the unsigned dword range.
+        regs.words[129] = Some(65536);
+        regs.words[133] = Some(65536);
+        assert_eq!(regs.alu(&decode(&[0xd50b_8004, 0x0002_0b01]))[0], Some(u32::MAX));
+        assert_eq!(regs.alu(&decode(&[0xd50b_0004, 0x0002_0b01]))[0], Some(0));
+    }
+
+    #[test]
+    fn sdwa_minmax_folds_using_the_instruction_signedness() {
+        let mut regs = Values::new();
+        regs.words[129] = Some(0x8000_00fe);
+        regs.words[133] = Some(0x7fff_ff01);
+        regs.words[132] = Some(0xaabb_ccdd);
+        for (opcode, expected) in [
+            (0x2208_0af9, 0xaabb_fedd), // signed minimum
+            (0x2408_0af9, 0xaabb_01dd), // signed maximum
+            (0x2608_0af9, 0xaabb_01dd), // unsigned minimum
+            (0x2808_0af9, 0xaabb_fedd), // unsigned maximum
+        ] {
+            assert_eq!(regs.alu(&decode(&[opcode, 0x0606_1101]))[0], Some(expected));
+        }
+    }
+
+    #[test]
+    fn sdwa_right_shift_preserves_the_material_descriptor_bank() {
+        let mut regs = Values::new();
+        let mut layout = Layout::default();
+        regs.words[129] = Some(33);
+        regs.words[133] = Some(0x8000_0040);
+        regs.words[132] = Some(SRV);
+        // v_lshrrev_b32 v4,v1,v5: replace only BYTE_0 of the SRV address.
+        let shift = decode(&[0x2c08_0af9, 0x0606_1001]);
+        layout.instruction(&shift, &mut regs).unwrap();
+        assert_eq!(regs.words[132], Some(SRV + 32));
+        let address = regs.words[132].unwrap();
+        assert_eq!(layout.resource(address, SRV, View::Structured).as_deref(), Some("tbSrv1"));
+        regs.words[132] = None;
+        layout.instruction(&shift, &mut regs).unwrap();
+        assert_eq!(regs.words[132], None);
+    }
+
+    #[test]
+    fn sdwa_add_does_not_carry_pointer_provenance_through_a_partial_write() {
+        let mut layout = Layout::default();
+        let mut regs = Values::new();
+        regs.code_address[129] = true;
+        let add = |ext| decode(&[0x4a08_0af9, ext]);
+        layout.instruction(&add(0x0606_0601), &mut regs).unwrap();
+        assert!(regs.code_address[132]);
+        layout.instruction(&add(0x0606_1101), &mut regs).unwrap();
+        assert!(!regs.code_address[132]);
     }
 
     #[test]

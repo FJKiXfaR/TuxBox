@@ -210,7 +210,7 @@ fn emit_op(em: &mut Emitter<'_>, idx: usize, op: &Insn) -> Result<(), String> {
         let condition = if m.ends_with("_f32") {
             em.compare_float(op, op.aux.mask)?
         } else if m.ends_with("_i32") || m.ends_with("_u32") {
-            Emitter::int_compare(m, &op.src[0], &op.src[1])?
+            em.int_compare(m, &op.src[0], &op.src[1])?
         } else {
             return Err("unsupported persistent wave comparison type".into());
         };

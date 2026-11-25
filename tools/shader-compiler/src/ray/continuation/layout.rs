@@ -1,6 +1,6 @@
 //! Validate native scheduler and stack ABI and locate the title's separately
 //! callable continuations. The trailing program word encodes its own extent.
-use super::super::fingerprint;
+use super::super::{alu::whole_sdwa_words, fingerprint};
 use super::target;
 use crate::rdna2::{Enc, Insn, Opnd, instructions};
 use std::ops::Range;
@@ -26,6 +26,9 @@ fn immediate(arg: &Opnd) -> Option<i64> {
 
 fn frame_adjustment(code: &[Insn], index: usize) -> Option<i64> {
     let ins = &code[index];
+    if !whole_sdwa_words(ins) {
+        return None;
+    }
     let [arg, base @ Opnd::Vgpr(_)] = ins.src.as_slice() else {
         return None;
     };
@@ -50,6 +53,7 @@ fn frame_adjustment(code: &[Insn], index: usize) -> Option<i64> {
                 || op.dst.contains(&Opnd::Vgpr(7))
         })?;
         if copy.mnemonic != "v_mov_b32"
+            || !whole_sdwa_words(copy)
             || copy.dst.as_slice() != [*base]
             || copy.src != [Opnd::Vgpr(7)]
             || code
@@ -372,6 +376,17 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_stack_pointer_add_is_not_a_full_frame_adjustment() {
+        let delta = |ext: u32| {
+            let bytes: Vec<_> = [0x4a0e_0ef9, ext].into_iter().flat_map(u32::to_le_bytes).collect();
+            frame_adjustment(&instructions(&bytes).collect::<Vec<_>>(), 0)
+        };
+        // v7 += 32 with DWORD and WORD_0 destinations respectively.
+        assert_eq!(delta(0x0686_16a0), Some(32));
+        assert_eq!(delta(0x0686_14a0), None);
+    }
 
     fn symbols(names: &[(&str, u32)]) -> Vec<u8> {
         let mut bytes = vec![0; 0x40 + names.len() * 24];

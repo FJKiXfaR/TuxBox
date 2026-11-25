@@ -434,6 +434,64 @@ fn with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     Some(input)
 }
 
+fn replace_mesh_root(
+    shader: &[u8],
+    root: &[u8],
+    dxbc: &tuxbox_dxbc::Dxbc,
+    embedded: &tuxbox_dxbc::Chunk,
+) -> Option<Vec<u8>> {
+    // Shift subsequent parts by a multiple of four, even for unaligned payload lengths.
+    let padding = (embedded.size % 4 + 4 - root.len() % 4) % 4;
+    let span = root.len().checked_add(padding)?;
+    let size = (shader.len() - embedded.size).checked_add(span)?;
+    if size > MAX_BYTES || root.is_empty() { return None; }
+    let mut input = Vec::with_capacity(size);
+    input.extend_from_slice(&shader[..embedded.offset - 4]);
+    input[4..20].fill(0);
+    input[24..28].copy_from_slice(&(size as u32).to_le_bytes());
+    for (index, part) in dxbc.chunks.iter().enumerate() {
+        if part.offset > embedded.offset {
+            let offset = part.offset - 8 - embedded.size + span;
+            input[32 + 4 * index..36 + 4 * index].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+    }
+    input.extend_from_slice(&(root.len() as u32).to_le_bytes());
+    input.extend_from_slice(root);
+    input.resize(embedded.offset + span, 0);
+    input.extend_from_slice(&shader[embedded.offset + embedded.size..]);
+    Some(input)
+}
+
+#[cfg(test)]
+#[test]
+fn replacing_a_mesh_root_preserves_the_other_parts_and_the_directory_order() {
+    use tuxbox_dxbc::Dxbc;
+    fn words(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+    let empty = words(&[1, 0, 0, 0, 0, 0]);
+    let constants = words(&[1, 1, 24, 0, 0, 0, 1, 7, 36, 1, 0, 4]);
+    // The root is first on disk and last in the directory.
+    let mut shader = Vec::from(*b"DXBC");
+    shader.extend_from_slice(&[1; 16]);
+    shader.extend(words(&[1, 84, 2, 72, 40]));
+    shader.extend_from_slice(b"RTS0");
+    shader.extend(words(&[24]));
+    shader.extend_from_slice(&empty);
+    shader.extend_from_slice(b"DXIL");
+    shader.extend(words(&[4, 0xd0065]));
+    for expected in [&constants, &empty] {
+        let dxbc = Dxbc::parse(&shader).unwrap();
+        shader = replace_mesh_root(&shader, expected, &dxbc, dxbc.chunk(b"RTS0").unwrap()).unwrap();
+        let parsed = Dxbc::parse(&shader).unwrap();
+        assert_eq!(parsed.digest, [0; 16]);
+        let [code, root] = parsed.chunks.as_slice() else { panic!("expected two parts") };
+        assert_eq!((code.fourcc, root.fourcc), (*b"DXIL", *b"RTS0"));
+        assert_eq!(&shader[code.offset..code.offset + code.size], 0xd0065u32.to_le_bytes());
+        assert_eq!(&shader[root.offset..root.offset + root.size], expected);
+    }
+}
+
 /// Console mesh stages always use a DXIL container. Resolve stripped programs
 /// before the host call and require portable replacements to match the stage.
 pub(super) fn mesh_stage(
@@ -444,10 +502,19 @@ pub(super) fn mesh_stage(
     match shader_code(shader) {
         Some((stage, ShaderCode::Portable)) if stage == expected => Ok(None),
         Some((stage, ShaderCode::Xbox)) if stage == expected => {
-            let rooted = root.and_then(|root| with_root(shader, root));
-            let Some(rooted) = rooted else {
+            let Some(root) = root else {
                 return translate(shader, stage).map(Some).ok_or(E_NOTIMPL);
             };
+            let dxbc = tuxbox_dxbc::Dxbc::parse(shader).map_err(|_| E_INVALIDARG)?;
+            if let Some(embedded) = dxbc.chunk(b"RTS0") {
+                if &shader[embedded.offset..embedded.offset + embedded.size] == root {
+                    return translate(shader, stage).map(Some).ok_or(E_NOTIMPL);
+                }
+                // A PSO root overrides the embedded layout. A replacement keyed only
+                // by the original shader would resolve registers against the wrong root.
+                let variant = replace_mesh_root(shader, root, &dxbc, embedded).ok_or(E_INVALIDARG)?;
+                return translate(&variant, stage).map(Some).ok_or(E_NOTIMPL);
+            }
             // Preserve explicit precompiled replacements indexed by the
             // original bytecode. On-demand answers include the pipeline root.
             if let Some(source) = source_digest(shader)
@@ -456,6 +523,7 @@ pub(super) fn mesh_stage(
                 stage.report(&source, true);
                 return Ok(Some(compiled));
             }
+            let rooted = with_root(shader, root).ok_or(E_INVALIDARG)?;
             translate(&rooted, stage).map(Some).ok_or(E_NOTIMPL)
         }
         _ => Err(E_INVALIDARG),

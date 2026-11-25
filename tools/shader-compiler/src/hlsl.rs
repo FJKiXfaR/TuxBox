@@ -26,6 +26,7 @@ mod compare;
 mod uniform_texel;
 mod pixel_quad;
 mod mubuf_offsets;
+mod scalar_values;
 mod code_offset;
 mod scalar_bits;
 #[cfg(test)]
@@ -45,6 +46,7 @@ mod micropoly;
 mod mesh;
 mod mesh_exports;
 mod exec_group;
+mod exec_snapshot;
 mod hair_cluster;
 mod hair_cluster_export;
 mod instance_cull;
@@ -232,6 +234,25 @@ float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v 
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 uint tb_f16_cvt(float x, bool rtz) { uint u = asuint(x); uint s = (u >> 16) & 0x8000u; uint a = u & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a == 0x7f800000u) return s | 0x7c00u; if (rtz) { if (a >= 0x477fe000u) return s | 0x7bffu; } else { if (a >= 0x477ff000u) return s | 0x7c00u; } if (a >= 0x38800000u) { uint r = (a >> 13) - 0x1c000u; uint rem = a & 0x1fffu; if (!rtz && (rem > 0x1000u || (rem == 0x1000u && (r & 1u) != 0u))) r += 1u; return s | r; } if (a < 0x33000000u) return s; uint e = a >> 23; uint mant = (a & 0x7fffffu) | 0x800000u; uint sh = 126u - e; uint q = mant >> sh; uint rem = mant & ((1u << sh) - 1u); uint half = 1u << (sh - 1u); if (!rtz && (rem > half || (rem == half && (q & 1u) != 0u))) q += 1u; return s | q; }
 "#;
+fn clamped_product24(ins: &Insn) -> bool {
+    matches!(ins.mnemonic.as_str(), "v_mul_u32_u24" | "v_mul_i32_i24" | "v_mad_u32_u24" | "v_mad_i32_i24")
+        && (ins.aux.imm != 0 || ins.aux.sdwa.is_some_and(|ext| ext & (1 << 13) != 0))
+}
+
+const MAD24_SAT: &str = r#"
+uint tb_mad24_sat(uint a, uint b, uint acc, bool isSigned) {
+    a = isSigned ? asuint(asint(a << 8) >> 8) : (a & 0xffffffu);
+    b = isSigned ? asuint(asint(b << 8) >> 8) : (b & 0xffffffu);
+    uint product = a * b;
+    uint low = product + acc;
+    uint carry = uint(low < product);
+    if (!isSigned) return tb_mulhi_u32(a, b) + carry == 0u ? low : 0xffffffffu;
+    // Add the sign-extended accumulator before testing the full sum for overflow.
+    int high = asint(tb_mulhi_i32(a, b)) + (asint(acc) >> 31) + int(carry);
+    if (high == (asint(low) >> 31)) return low;
+    return high < 0 ? 0x80000000u : 0x7fffffffu;
+}
+"#;
 const HALF_RNE: &str = "uint tb_f16_rne(float x) { return tb_f16_cvt(x, false); }\n";
 // The branch-free implementation keeps the driver control-flow graph small
 // when a filter applies the conversion hundreds of times per invocation.
@@ -335,6 +356,19 @@ fn name(o: &Opnd) -> Result<String, String> {
     })
 }
 
+// Return the bits of this encoded field that can be read back or updated,
+// relative to its starting offset. MODE has a gap before FP16_OVFL (bit 23).
+fn modeled_hwreg_mask(word: u32) -> u32 {
+    let known = match word & 63 {
+        1 => 0x0080_03ff,
+        20 | 21 => u32::MAX, // FLAT_SCRATCH_LO/HI
+        _ => 0,
+    };
+    let shift = (word >> 6) & 31;
+    let encoded_width = (word >> 11) & 31;
+    (known >> shift) & (u32::MAX >> (31 - encoded_width))
+}
+
 /// Operand as a `uint` rvalue expression.
 fn r(o: &Opnd) -> Result<String, String> {
     Ok(match o {
@@ -348,6 +382,56 @@ fn r(o: &Opnd) -> Result<String, String> {
 
 fn f(o: &Opnd) -> Result<String, String> {
     Ok(format!("asfloat({})", r(o)?))
+}
+
+// Selector for tb_unary_f16, constant at each translated instruction.
+fn half_unary_op(mnemonic: &str) -> Option<u8> {
+    match mnemonic {
+        "v_floor_f16" => Some(0),
+        "v_ceil_f16" => Some(1),
+        "v_trunc_f16" => Some(2),
+        "v_rndne_f16" => Some(3),
+        "v_fract_f16" => Some(4),
+        _ => None,
+    }
+}
+
+fn integer_to_half(mnemonic: &str) -> bool {
+    matches!(mnemonic, "v_cvt_f16_u16" | "v_cvt_f16_i16")
+}
+
+fn normalized_half_to_integer(mnemonic: &str) -> bool {
+    matches!(mnemonic, "v_cvt_norm_u16_f16" | "v_cvt_norm_i16_f16")
+}
+
+fn half_round_or_conversion(m: &str) -> bool {
+    half_unary_op(m).is_some() || integer_to_half(m) || half_to_integer(m)
+}
+
+// Selector 248 is the only inline float whose binary16 value differs from its binary32 value.
+fn inline_half_value(value: f32) -> f32 {
+    if value.to_bits() == 0x3e22_f983 { f32::from_bits(0x3e23_0000) } else { value }
+}
+
+fn half_operand_bits(o: &Opnd) -> Result<String, String> {
+    match o {
+        Opnd::ConstF32(_) => Ok(format!("tb_f16_rne({})", f(o)?)),
+        _ => r(o),
+    }
+}
+
+fn half_to_integer(mnemonic: &str) -> bool {
+    matches!(mnemonic, "v_cvt_u16_f16" | "v_cvt_i16_f16") || normalized_half_to_integer(mnemonic)
+}
+
+fn mul24_expr(op: &str, a: &str, b: &str) -> Option<String> {
+    Some(match op {
+        "v_mul_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu))"),
+        "v_mul_i32_i24" => format!("asuint((asint({a} << 8) >> 8) * (asint({b} << 8) >> 8))"),
+        "v_mul_hi_u32_u24" => format!("tb_mulhi_u32({a} & 0xffffffu, {b} & 0xffffffu)"),
+        "v_mul_hi_i32_i24" => format!("tb_mulhi_i32(asuint(asint({a} << 8) >> 8), asuint(asint({b} << 8) >> 8))"),
+        _ => return None,
+    })
 }
 
 /// Low `width` bits set, saturated to one word. Keep full-width shifts out of the generated code.
@@ -574,6 +658,7 @@ struct Emitter<'a> {
     compute_swizzle: bool,
     vote_defs: BTreeSet<usize>,
     vote_uses: BTreeMap<usize, usize>,
+    exec_snapshots: exec_snapshot::Snapshots,
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
     indexed_lane: bool,
@@ -687,20 +772,95 @@ impl HeapView {
 const SPACE_ALIAS: u32 = 1 << 16;
 /// Synthetic opcode of the wave-reduction instruction produced by `lower_wave_reductions`.
 const OP_WAVE_REDUCE: u32 = 0x7ff0;
-const OP_QUAD_BINARY: u32 = 0x7ff5;
+const OP_DPP_BINARY: u32 = 0x7ff5;
+const OP_LOCAL_EXTREMA: u32 = 0x7fe3;
 const OP_QUAD_MOVE: u32 = 0x7fe1;
-const OP_ROW_MIRROR: u32 = 0x7fe2;
+const OP_ROW_XOR_MOVE: u32 = 0x7fe2;
+const OP_ROW_SHARE_MOVE: u32 = 0x7fe3;
+const OP_ROW_ROR_MOVE: u32 = 0x7fe4;
+const OP_ROW_SHIFT_MOVE: u32 = 0x7fe5;
 
-fn is_quad_exchange(i: &Insn) -> bool {
-    (i.enc == Enc::Vop2 && i.op == OP_QUAD_BINARY)
-        || (i.enc == Enc::Vop1 && (i.op == OP_QUAD_MOVE || i.op == OP_ROW_MIRROR))
+fn is_row_move(i: &Insn) -> bool {
+    i.enc == Enc::Vop1 && matches!(i.op, OP_ROW_XOR_MOVE | OP_ROW_SHARE_MOVE | OP_ROW_ROR_MOVE | OP_ROW_SHIFT_MOVE)
 }
 
-fn is_bitwise_quad_exchange(i: &Insn) -> bool {
-    i.enc == Enc::Vop2 && matches!(i.mnemonic.as_str(), "v_or_b32" | "v_and_b32" | "v_xor_b32")
-        && i.src.first() == Some(&Opnd::Raw(250))
-        // Full destination masks, no source modifiers, selector within a quad.
-        && i.raw.get(1).is_some_and(|ctrl| ctrl & 0xfff3_0000 == 0xff00_0000)
+fn is_quad_exchange(i: &Insn) -> bool {
+    (i.enc == Enc::Vop2 && i.op == OP_DPP_BINARY)
+        || (i.enc == Enc::Vop1 && i.op == OP_QUAD_MOVE)
+        || is_row_move(i)
+}
+
+fn lower_dpp_binary(ins: &mut Insn) {
+    let control = ins.raw[1];
+    let selector = if group_extrema::is_dpp8(ins) { control >> 8 } else { (control >> 8) & 0x1ff };
+    ins.op = OP_DPP_BINARY;
+    ins.aux.imm = i64::from(selector);
+    ins.src[0] = Opnd::Vgpr(control as u8);
+}
+
+fn dpp_fp32_sources(ins: &Insn, first: String) -> Result<(String, String), String> {
+    // DPP8 encodes lane selectors in the same bits, and ordinary VOP2
+    // instructions can have a literal extension instead of a DPP control.
+    let flags = if ins.raw.first().is_some_and(|word| word & 0x1ff == 250) {
+        *ins.raw.get(1).ok_or("missing DPP16 controls")? >> 20
+    } else {
+        0
+    };
+    let modified = |bits, flags: u32| {
+        compare::sign_modifiers(bits, 0x8000_0000, flags & 2 != 0, flags & 1 != 0)
+    };
+    Ok((modified(first, flags), modified(r(&ins.src[1])?, flags >> 2)))
+}
+
+fn is_binary_quad_perm(i: &Insn) -> bool {
+    if i.enc != Enc::Vop2 || i.src.first() != Some(&Opnd::Raw(250)) {
+        return false;
+    }
+    let Some(control) = i.raw.get(1) else { return false };
+    // A quad selector uses eight bits. Row and bank masks govern the write.
+    if control & 0x0003_0000 != 0 {
+        return false;
+    }
+    match i.mnemonic.as_str() {
+        "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
+        | "v_cvt_pkrtz_f16_f32" | "v_min_f32" | "v_max_f32" => true,
+        "v_or_b32" | "v_and_b32" | "v_xor_b32" | "v_xnor_b32"
+        | "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32"
+        | "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32"
+        | "v_min_i32" | "v_max_i32" | "v_min_u32" | "v_max_u32"
+        | "v_mul_i32_i24" | "v_mul_hi_i32_i24" | "v_mul_u32_u24" | "v_mul_hi_u32_u24"
+        | "v_cndmask_b32" => control & 0x00f0_0000 == 0, // No FP source modifiers.
+        _ => false,
+    }
+}
+
+// VOP2 CNDMASK reads the destination lane's VCC. A vector compare writes a
+// per-invocation predicate here, while a scalar write can hold a packed mask.
+fn quad_cndmasks_with_lane_vcc(insns: &[Insn]) -> BTreeSet<usize> {
+    let targets = branch_targets(insns);
+    let mut selects = BTreeSet::new();
+    let mut lane_vcc = false;
+    for (index, ins) in insns.iter().enumerate() {
+        if targets.contains(&(ins.offset as i64)) { lane_vcc = false; }
+        if lane_vcc && ins.mnemonic == "v_cndmask_b32" && is_binary_quad_perm(ins) {
+            selects.insert(index);
+        }
+        if ins.mnemonic.starts_with("v_cmpx_") { continue; } // RDNA2 CMPX writes EXEC.
+        if ins.dst.first() == Some(&Opnd::VccLo) {
+            lane_vcc = ins.mnemonic.starts_with("v_cmp_")
+                || (ins.mnemonic == "s_mov_b64" && matches!(ins.src[..], [Opnd::ConstInt(0 | -1)]));
+        } else {
+            lane_vcc &= match ins.enc {
+                Enc::Vop1 | Enc::Vop2 => matches!(ins.dst[..], [Opnd::Vgpr(_)])
+                    && !ins.mnemonic.contains("_co_"),
+                Enc::Sop1 => matches!(ins.mnemonic.as_str(), "s_mov_b32" | "s_mov_b64" | "s_wqm_b32" | "s_wqm_b64")
+                    && !ins.dst.contains(&Opnd::VccHi),
+                Enc::Sopp => matches!(ins.mnemonic.as_str(), "s_nop" | "s_waitcnt"),
+                _ => false,
+            };
+        }
+    }
+    selects
 }
 
 /// Whole-wave reductions (HLSL `WaveActiveMin` / `WaveActiveMax`; observed in
@@ -728,50 +888,57 @@ fn is_bitwise_quad_exchange(i: &Insn) -> bool {
 fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Option<u32>, String> {
     for op in insns.iter_mut().filter(|op| op.enc == Enc::Vop1 && op.mnemonic == "v_mov_b32" && op.src == [Opnd::Raw(250)]) {
         let ctrl = *op.raw.get(1).ok_or("missing DPP16 move controls")?;
-        // DPP16 control word: [src0_reg:8][ctrl:9][neg0:1][abs0:1][bc:1][fi:1][bank_m:4][row_m:4]
-        // (see Leonida rdna2_decode.py). Accept the exact shape the GPU emits for the two
-        // moves we lower: quad_perm with FI=1 and row_mirror with FI=0.
         let src0_reg = ctrl & 0xff;
-        let ctrl_field = (ctrl >> 8) & 0x1ff;
-        let fi = (ctrl >> 18) & 1;
-        let bc = (ctrl >> 19) & 1;
+        let ctrl_field = i64::from((ctrl >> 8) & 0x1ff);
         let neg0 = (ctrl >> 20) & 1;
         let abs0 = (ctrl >> 21) & 1;
-        let bank_m = (ctrl >> 24) & 0xf;
-        let row_m = (ctrl >> 28) & 0xf;
-        if ctrl_field <= 0xff && fi == 1 && bc == 1 && neg0 == 0 && abs0 == 0 && bank_m == 0xf && row_m == 0xf {
-            op.op = OP_QUAD_MOVE;
-            op.src[0] = Opnd::Vgpr(src0_reg as u8);
-            op.aux.imm = ((ctrl >> 8) & 255) as i64;
-            continue;
+        let unsupported = || format!("unsupported DPP16 move at {:#x}", op.offset);
+        if neg0 != 0 || abs0 != 0 {
+            return Err(unsupported());
         }
-        if ctrl_field == 0x140 && fi == 0 && bc == 1 && neg0 == 0 && abs0 == 0 && bank_m == 0xf && row_m == 0xf {
-            op.op = OP_ROW_MIRROR;
-            op.src[0] = Opnd::Vgpr(src0_reg as u8);
-            op.aux.imm = 0;
-            continue;
-        }
-        return Err(format!("unsupported DPP16 move at {:#x}", op.offset));
+        let (opcode, selector) = match ctrl_field {
+            0..=0xff => (OP_QUAD_MOVE, ctrl_field),
+            0x101..=0x10f => (OP_ROW_SHIFT_MOVE, ctrl_field - 0x100), // row_shl
+            0x111..=0x11f => (OP_ROW_SHIFT_MOVE, 0x110 - ctrl_field), // row_shr
+            0x121..=0x12f => (OP_ROW_ROR_MOVE, ctrl_field - 0x120),
+            0x140 => (OP_ROW_XOR_MOVE, 15), // row_mirror
+            0x141 => (OP_ROW_XOR_MOVE, 7),  // row_half_mirror
+            0x150..=0x15f => (OP_ROW_SHARE_MOVE, ctrl_field - 0x150), // row_share
+            0x160..=0x16f => (OP_ROW_XOR_MOVE, ctrl_field - 0x160), // row_xmask
+            _ => return Err(unsupported()),
+        };
+        op.op = opcode;
+        op.src[0] = Opnd::Vgpr(src0_reg as u8);
+        op.aux.imm = selector;
     }
     let mut width = None;
+    let mut proven_cndmasks = None;
     let is_dpp = |i: &Insn| i.enc == Enc::Vop2 && matches!(i.src.first(), Some(Opnd::Raw(233 | 234 | 250)));
     let mut at = 0;
     while let Some(first) = (at..insns.len()).find(|&i| is_dpp(&insns[i])) {
         let off = insns[first].offset;
         let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
         let red = insns[first].mnemonic.clone();
-        let bitwise_quad = is_bitwise_quad_exchange(&insns[first]);
-        if bitwise_quad || (red == "v_add_f32" && insns[first].src.first() == Some(&Opnd::Raw(250))) {
-            let ctrl = *insns[first].raw.get(1).ok_or_else(|| bad("missing DPP16 control word"))?;
-            // Keep the existing FP32 add subset at FI=1 and BC=1.
-            if !bitwise_quad && ctrl & 0xffff0000 != 0xff0c0000 {
-                return Err(bad("unsupported DPP16 FP32 add controls"));
+        // A full saved-EXEC extrema reduction can begin with quad shuffles,
+        // then combine different quads. A quad followed solely by a lane read
+        // still selects within its quad and must not become a whole-wave min/max.
+        let starts_wave_extrema = matches!(red.as_str(), "v_min_f32" | "v_max_f32")
+            && first >= 3 && (insns[first - 3].enc, insns[first - 3].op) == (Enc::Sop1, 0x29)
+            && insns[first - 2].mnemonic == "v_mov_b32" && insns[first - 1].mnemonic == "v_cndmask_b32"
+            && insns[first + 1..].iter()
+                .take_while(|i| is_dpp(i) && i.mnemonic == red && i.dst == insns[first].dst)
+                .any(|i| !is_binary_quad_perm(i));
+        if is_binary_quad_perm(&insns[first]) && !starts_wave_extrema {
+            if red == "v_cndmask_b32" && !proven_cndmasks
+                .get_or_insert_with(|| quad_cndmasks_with_lane_vcc(insns)).contains(&first) {
+                return Err(bad("quad CNDMASK requires a known per-lane VCC predicate"));
             }
-            insns[first].op = OP_QUAD_BINARY;
-            insns[first].src[0] = Opnd::Vgpr(ctrl as u8);
-            insns[first].aux.imm = ((ctrl >> 8) & 255) as i64;
+            lower_dpp_binary(&mut insns[first]);
             at = first + 1;
             continue;
+        }
+        if red == "v_add_f32" && insns[first].src.first() == Some(&Opnd::Raw(250)) {
+            return Err(bad("unsupported DPP16 FP32 add controls"));
         }
         let saved_extrema = matches!(red.as_str(), "v_min_f32" | "v_max_f32")
             && (first.checked_sub(3).is_some_and(|p| matches!(insns[p].mnemonic.as_str(), "s_or_saveexec_b32" | "s_or_saveexec_b64"))
@@ -1103,7 +1270,7 @@ fn lower_local_pc_transfers(insns: &mut [Insn]) -> Result<(), String> {
 // range, restore EXEC, broadcast the atomic result and add a per-lane prefix.
 // The two register allocations differ. Match the complete regions before changing
 // a saved EXEC mask from its usual per-invocation predicate into wave-uniform data.
-fn mark_wave_allocations(insns: &mut [Insn], wave32_mask: bool) -> Result<bool, String> {
+fn mark_wave_allocations(insns: &mut [Insn], wave32_mask: bool, election: Option<ElectionLowering>) -> Result<bool, String> {
     const REGIONS: [&[u32]; 2] = [
         &[
         0xd7650007, 0x000100c1, 0xbe8e147e, 0xbe8c047e, 0xd7660007, 0x00020ec1,
@@ -1119,13 +1286,14 @@ fn mark_wave_allocations(insns: &mut [Insn], wave32_mask: bool) -> Result<bool, 
         ],
     ];
     const COUNT: usize = 18;
+    let snapshots = election.is_some() && predicate_snapshots(insns);
     let mut found = false;
     for i in 0..insns.len() {
         // Wave32 programs keep the previous lowering unless the election verifies.
         // Modes that model EXEC as a whole-wave mask already lower it directly.
         if !wave32_mask && insns[i].mnemonic == "s_ff1_i32_b32" && insns[i].src == [Opnd::ExecLo] {
             let mut trial = insns.to_vec();
-            match verify_lane_election(&mut trial, i) {
+            match verify_lane_election(&mut trial, i, election.is_some()) {
                 Ok(()) => {
                     trial[i].mnemonic = "tb_first_active_lane".into();
                     insns.clone_from_slice(&trial);
@@ -1139,7 +1307,10 @@ fn mark_wave_allocations(insns: &mut [Insn], wave32_mask: bool) -> Result<bool, 
         let region = i.checked_sub(1).and_then(|first| insns.get(first..first + COUNT))
             .filter(|region| REGIONS.iter().any(|words| region.iter().flat_map(|op| op.raw.iter()).eq(words.iter())));
         let Some(region) = region else {
-            verify_lane_election(insns, i)?;
+            if !snapshots {
+                verify_lane_election(insns, i, election.is_some())?;
+            }
+            if election == Some(ElectionLowering::Shared64) { insns[i].mnemonic = "tb_first_exec_lane".into(); }
             continue;
         };
         let first = region[0].offset;
@@ -1156,6 +1327,93 @@ fn mark_wave_allocations(insns: &mut [Insn], wave32_mask: bool) -> Result<bool, 
         found = true;
     }
     Ok(found)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElectionLowering {
+    Native32,
+    Shared64,
+}
+
+/// Select the lane geometry only for ordinary straight-line compute kernels.
+/// A group with at most 32 threads fits in one native wave even for a b64 search.
+/// Larger wave64 elections reuse the workgroup exchange across both halves.
+fn straight_election(ex: &ShaderExtract, insns: &[Insn]) -> Option<ElectionLowering> {
+    if ex.stage != Stage::Compute || ex.fspx_config.is_some() { return None; }
+    let threads = compute_group(ex).into_iter().fold(1u32, u32::saturating_mul);
+    if threads == 0 || threads > 1024 { return None; }
+    let first = insns.iter().find(|i| matches!(i.mnemonic.as_str(), "s_ff1_i32_b32" | "s_ff1_i32_b64"));
+    // A small group fits one wave of either guest width, even without FF1.
+    if first.is_none() && (threads > 32 || !insns.iter().any(exec_snapshot::captures_exec)) { return None; }
+    let (end, body) = insns.split_last()?;
+    if end.mnemonic != "s_endpgm" || !body.iter().all(|i| match i.mnemonic.as_str() {
+        "s_ff1_i32_b32" | "s_ff1_i32_b64" => first.is_some_and(|f| f.mnemonic == i.mnemonic) && i.src == [Opnd::ExecLo],
+        "s_load_dwordx4" | "s_waitcnt" | "s_nop" | "s_mov_b32" | "s_mov_b64"
+        | "s_and_saveexec_b32" | "s_and_saveexec_b64" | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32"
+        | "v_mov_b32" | "v_and_b32" | "v_lshlrev_b32" | "v_lshrrev_b32"
+        | "v_add_nc_u32" | "v_cndmask_b32" | "buffer_store_dword" => true,
+        m => m.starts_with("v_cmp_") || m.starts_with("v_cmpx_"),
+    }) { return None; }
+    Some(if threads <= 32 || first.is_some_and(|f| f.mnemonic == "s_ff1_i32_b32") {
+        ElectionLowering::Native32
+    } else {
+        ElectionLowering::Shared64
+    })
+}
+
+/// In a straight-line compute shader, a compare/save/FF1/restore sequence
+/// produces a uniform scalar value. Recognize every mask access before allowing
+/// uses other than the usual comparison against the lane index.
+fn predicate_snapshots(mut code: &[Insn]) -> bool {
+    let mask = |o: &Opnd| matches!(o, Opnd::ExecLo | Opnd::ExecHi | Opnd::VccLo | Opnd::VccHi);
+    // Numeric vector operands can read the ballot captured at SAVEEXEC. Other
+    // consumers still require proof about the representation they expect.
+    let mut saved_words = BTreeMap::new();
+    let count = code.len();
+    while let [op, rest @ ..] = code {
+        if exec_snapshot::copy_scalar_words(op, &mut saved_words) {
+            code = rest;
+            continue;
+        }
+        let numeric = exec_snapshot::numeric_sources(op) != 0;
+        if let ("v_cndmask_b32", Some(Opnd::Sgpr(lo))) = (op.mnemonic.as_str(), op.src.get(2)) {
+            let pair = [saved_words.get(lo), saved_words.get(&(lo + 1))];
+            if pair.iter().any(|w| matches!(w, Some(exec_snapshot::Word::Saved(..))))
+                && (op.enc != Enc::Vop3 || op.aux.sdwa.is_some() || pair.contains(&None))
+            {
+                return false;
+            }
+        }
+        if !numeric && saved_words.iter().any(|(&reg, word)| matches!(word, exec_snapshot::Word::Saved(..))
+            && (reads_sgpr(op, reg) || op.mnemonic.ends_with("64") && op.src.iter().any(|o| may_touch_sgpr(o, reg))))
+        {
+            return false;
+        }
+        let i = count - code.len();
+        if op.mnemonic.starts_with("v_cmp_") && op.dst == [Opnd::VccLo] {
+            let [save, search, restore, tail @ ..] = rest else { return false };
+            let [Opnd::Sgpr(saved)] = save.dst.as_slice() else { return false };
+            let [Opnd::Sgpr(result)] = search.dst.as_slice() else { return false };
+            if op.src.iter().any(mask) || save.mnemonic != "s_and_saveexec_b64" || save.src != [Opnd::VccLo]
+                || search.mnemonic != "s_ff1_i32_b64" || search.src != [Opnd::ExecLo]
+                || result == saved || u16::from(*result) == u16::from(*saved) + 1
+                || restore.mnemonic != "s_mov_b64" || restore.dst != [Opnd::ExecLo]
+                || restore.src != [Opnd::Sgpr(*saved)]
+            {
+                return false;
+            }
+            exec_snapshot::record_scalar_write(save, i + 1, &mut saved_words);
+            exec_snapshot::record_scalar_write(search, i + 2, &mut saved_words);
+            code = tail;
+        } else {
+            if op.src.iter().chain(&op.dst).any(mask) || op.mnemonic.starts_with("v_cmpx_") {
+                return false;
+            }
+            exec_snapshot::record_scalar_write(op, i, &mut saved_words);
+            code = rest;
+        }
+    }
+    true
 }
 
 /// True when `o` may name SGPR `n` as part of a 32- or 64-bit operand.
@@ -1202,7 +1460,7 @@ fn vgpr_def(insns: &[Insn], targets: &BTreeSet<i64>, at: usize, v: u8) -> Option
 /// `s_ff1_i32_b64 s, exec` (or `_b32`) compared with the full-mask `v_mbcnt` lane index. The
 /// elected lane usually adds the number of active lanes to a counter; that count
 /// reads an EXEC copy as a wave mask, so capture the copy as a ballot.
-fn verify_lane_election(insns: &mut [Insn], ff1: usize) -> Result<(), String> {
+fn verify_lane_election(insns: &mut [Insn], ff1: usize, straight_compute: bool) -> Result<(), String> {
     let at = insns[ff1].offset;
     let bad = |what: &str| format!("unverified EXEC election at {at:#x}: {what}");
     let Some(&Opnd::Sgpr(lane)) = insns[ff1].dst.first() else { return Err(bad("no scalar destination")) };
@@ -1213,7 +1471,13 @@ fn verify_lane_election(insns: &mut [Insn], ff1: usize) -> Result<(), String> {
         ins.src.iter().take(if two { 2 } else { usize::MAX }).cloned().collect::<Vec<_>>()
     };
     let cmp = (ff1 + 1..insns.len())
-        .find(|&j| sources(&insns[j]).iter().chain(&insns[j].dst).any(|o| may_touch_sgpr(o, lane)))
+        .find(|&j| {
+            let ins = &insns[j];
+            if straight_compute && ins.mnemonic == "s_mov_b32" {
+                return ins.src.iter().chain(&ins.dst).any(|o| *o == Opnd::Sgpr(lane));
+            }
+            sources(ins).iter().chain(&ins.dst).any(|o| may_touch_sgpr(o, lane))
+        })
         .ok_or_else(|| bad("unused lane"))?;
     if (ff1 + 1..=cmp).any(|j| targets.contains(&(insns[j].offset as i64))) {
         return Err(bad("branch enters the election"));
@@ -1254,6 +1518,13 @@ fn verify_lane_election(insns: &mut [Insn], ff1: usize) -> Result<(), String> {
         (cmp, restore)
     } else {
         let Some(save) = (cmp + 1..insns.len()).find(|&j| insns[j].mnemonic == format!("s_and_saveexec_{bits}")) else { return Ok(()) };
+        // A different comparison replaced VCC before SAVEEXEC. In straight-line
+        // code that save starts an independent masked region.
+        if straight_compute && c.dst == [Opnd::VccLo] && insns[save].src == [Opnd::VccLo]
+            && insns[cmp + 1..save].iter().any(|i| i.mnemonic.starts_with("v_cmp_") && i.dst == [Opnd::VccLo])
+        {
+            return Ok(());
+        }
         let Some(&Opnd::Sgpr(saved)) = insns[save].dst.first() else { return Ok(()) };
         let restore = (save + 1..insns.len())
             .find(|&j| insns[j].mnemonic == format!("s_mov_{bits}") && insns[j].dst.first() == Some(&Opnd::ExecLo)
@@ -1364,7 +1635,7 @@ fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_
     // Once this exact exchange subset is recognized, a later binding or
     // emitter error must not silently replace its collectives with copies.
     let mut original = disassemble(&ex.isa);
-    if original.iter().any(is_bitwise_quad_exchange) {
+    if original.iter().any(is_binary_quad_perm) || group_extrema::prepare_exchanges(ex, &mut original).unwrap_or(true) {
         // This standalone exchange observes its source lane even if the exact
         // translation failed elsewhere. A per-lane retry would drop that operand.
         return first;
@@ -1456,9 +1727,12 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     let fspx_wave = fspx_wave::width(ex, &insns);
     let wave_cull = fspx_wave.is_some() || hair_multisample || wave_cull::recognize(ex);
     let page_waves = page_waves::recognize(ex);
-    let allocation_wave64 = !lone_lane::on() && !wave_cull && !page_waves && mark_wave_allocations(&mut insns, resolve_wave32)?;
+    let generic_waves = !lone_lane::on() && !wave_cull && !page_waves;
+    let election = if generic_waves && !resolve_wave32 { straight_election(ex, &insns) } else { None };
+    let allocation_wave64 = generic_waves && mark_wave_allocations(&mut insns, resolve_wave32, election)?;
     if ex.stage == Stage::Pixel { wave_alloc::prepare(&mut insns); }
     let reflection = reflection_compact::prepare(ex, &mut insns);
+    group_extrema::prepare_exchanges(ex, &mut insns)?;
     let group_extrema = group_extrema::prepare(ex, &mut insns);
     let straight_exchange = ex.stage == Stage::Compute && !lone_lane::on()
         && !wave_cull && !page_waves && !resolve_wave32 && !allocation_wave64
@@ -1481,8 +1755,10 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     let uses_quad_add = insns.iter().any(is_quad_exchange);
     let scan = if wave_cull { None } else { wave_scan::prepare(ex, &mut insns)? };
     let scan_width = scan.as_ref().map(|s| s.width);
-    let indexed_lane = !resolve_wave32 && (group_extrema || ex.stage == Stage::Compute && (indexed_lane::constant_reads(compute_group(ex), &mut insns)
-        || indexed_lane::prepare(compute_group(ex), &mut insns)));
+    let ordinary_wave = !wave_cull && !page_waves && !lone_lane::on();
+    let indexed_lane = !resolve_wave32 && (election == Some(ElectionLowering::Shared64) || group_extrema || ex.stage == Stage::Compute
+        && (indexed_lane::constant_reads(compute_group(ex), &mut insns, ordinary_wave)
+            || indexed_lane::prepare(compute_group(ex), &mut insns)));
     // A uniform Sgpr lane operand is only expressible through the whole-wave
     // group read, which needs shared-memory exchange like a swizzle does.
     let has_dynamic_lane_read = insns.iter().any(|i| i.enc == Enc::Vop3
@@ -1503,6 +1779,12 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         lower_lane_spills(&mut insns, resolve_wave32, group_reads)?;
     } }
     let mut em = Emitter::new(ex, insns);
+    if let Some(mode) = election {
+        if compute_group(ex).into_iter().product::<u32>() <= 32 || em.insns.iter().any(|i| matches!(i.mnemonic.as_str(), "tb_first_exec_lane" | "s_ff1_i32_b64") && i.src == [Opnd::ExecLo]) {
+            em.exec_snapshots = exec_snapshot::analyze(&em.insns, mode);
+        }
+    }
+    let shared_mask = em.exec_snapshots.sites.values().any(|site| matches!(site, exec_snapshot::Site::Capture(ElectionLowering::Shared64)));
     em.page_waves = page_waves;
     em.wave_cull = wave_cull;
     em.fspx_wave = fspx_wave;
@@ -1580,10 +1862,31 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && em.insns.iter().all(|i| i.op != wave_sum::DPP_REDUCE || i.enc != Enc::Vop2
             || matches!(i.mnemonic.as_str(), "v_and_b32" | "v_or_b32" | "v_min_u32" | "v_max_u32" | "v_min_f32" | "v_max_f32" | "v_add_nc_u32" | "v_add_f32"));
     let required_wave_size = if em.pixel_wave { None } else { required_wave_size };
-    let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1)) || uses_bpermute || group_extrema).then_some(32));
+    let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64));
+    // With more than 32 threads, rows 2 and 3 could instead be rows 0 and 1 of
+    // a second wave. The fallback host width cannot resolve an asymmetric guest mask.
+    if uses_quad_add && required_wave_size.is_none() && !em.one_word_vector_mask()
+        && compute_group(ex).into_iter().fold(1u32, u32::saturating_mul) > 32
+        && em.insns.iter().filter(|i| is_quad_exchange(i) && i.enc == Enc::Vop1).any(|i| {
+            let rows = i.raw[1] >> 28;
+            i.raw[1] & 0x0f00_0000 != 0 && rows & 3 != rows >> 2
+        })
+    {
+        return Err("asymmetric DPP16 row mask requires a known guest wave width".into());
+    }
+    let required_wave_size = required_wave_size.or((uses_quad_add && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema).then_some(32));
+    // A ballot or minimum over active invocations also works in the final
+    // partial subgroup. Keep the full-wave requirement for every other user.
+    let partial_election = required_wave_size.is_none() && election == Some(ElectionLowering::Native32);
+    let required_wave_size = required_wave_size.or_else(|| {
+        (election == Some(ElectionLowering::Native32) && (!em.exec_snapshots.sites.is_empty() || em.insns.iter().any(|i|
+            i.mnemonic == "tb_first_active_lane" || i.mnemonic == "s_ff1_i32_b64"))).then_some(32)
+    });
     // Experimental: a wave32-only GPU cannot create a wave64 pipeline. With
     // `XSHADER_FORCE_WAVE32` the requirement is coerced so the program runs with
     // 32-lane waves; operations that depend on the 64th lane become approximate.
+    // Applied last so it covers every path that can still require a wave64
+    // program: ballots, votes, scan widths and register wave sizes.
     let required_wave_size = match required_wave_size {
         Some(64) if std::env::var_os("XSHADER_FORCE_WAVE32").is_some() => Some(32),
         other => other,
@@ -1629,7 +1932,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
             Err(reason) => return Err(reason),
         }
         let [x, y, z] = compute_group(ex);
-        if ex.stage != Stage::Compute || !x.checked_mul(y).and_then(|n| n.checked_mul(z)).is_some_and(|n| n % width == 0) {
+        if ex.stage != Stage::Compute || !x.checked_mul(y).and_then(|n| n.checked_mul(z)).is_some_and(|n| n % width == 0 || partial_election && n > 0 && n < width) {
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
     }
@@ -1755,6 +2058,9 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     }
     if light_grid { hlsl.insert_str(0, light_grid::DECLARATIONS); }
     if em.portable_wave64 { hlsl.insert_str(0, wave_sum::PORTABLE_DECLARATIONS); }
+    if shared_mask {
+        hlsl.insert_str(0, &page_waves::ballot_declarations(compute_group(ex).into_iter().product()));
+    }
     if page_waves || wave_cull {
         if fspx_wave == Some(32) {
             hlsl.insert_str(0, fspx_wave::WAVE32);
@@ -2159,6 +2465,7 @@ impl<'a> Emitter<'a> {
             compute_swizzle: false,
             vote_defs: BTreeSet::new(),
             vote_uses: BTreeMap::new(),
+            exec_snapshots: Default::default(),
             reflected_lds_words: None,
             hoisted_swizzle: None,
             indexed_lane: false,
@@ -2299,6 +2606,13 @@ impl<'a> Emitter<'a> {
         // Existing FSSM single-range layouts may address beyond the declared range.
         if let [range] = ranges {
             if range.base_register == 0 && range.space == 0 && matches!(range.offset_in_table, 0 | u32::MAX) {
+                // The runtime can append a reflected descriptor beyond a finite 1.1
+                // table. Use that binding before extrapolating the single range.
+                if index >= range.num && stride == 32 && self.ex.root_sig.as_ref().is_some_and(|r| r.version == 2) {
+                    if let Some((kind, register, space)) = self.uncovered_fssm_descriptor(sgpr, offset) {
+                        return Ok((Some(kind), register, space));
+                    }
+                }
                 return Ok((Some(range.range_type), index, 0));
             }
         }
@@ -3261,13 +3575,13 @@ impl<'a> Emitter<'a> {
     fn direct_raw_descriptor(&mut self, instructions: &[Insn], written: &BTreeSet<u16>) -> Option<(u16, u32)> {
         let [format, size, low, high] = instructions else { return None; };
         if [format, size, low].iter().any(|op| op.mnemonic != "s_mov_b32")
-            || high.mnemonic != "s_or_b32" || format.src != [Opnd::Literal(0x11014fac)]
+            || format.src != [Opnd::Literal(0x11014fac)]
             || size.src != [Opnd::ConstInt(-1)] { return None; }
         let [Opnd::Sgpr(base)] = low.dst[..] else { return None; };
         let [Opnd::Sgpr(root)] = low.src[..] else { return None; };
         if base > 124 || root > 126 || written.contains(&u16::from(root)) || written.contains(&(u16::from(root)+1))
             || format.dst != [Opnd::Sgpr(base+3)] || size.dst != [Opnd::Sgpr(base+2)]
-            || high.dst != [Opnd::Sgpr(base+1)] || high.src != [Opnd::Sgpr(root+1), Opnd::Literal(65536)] { return None; }
+            || high.dst != [Opnd::Sgpr(base+1)] || !raw_index::sets_byte_stride(high, root+1) { return None; }
         let [binding] = &self.ex.resources[..] else { return None; };
         if binding.res_type != 4 || binding.lower != binding.upper { return None; }
         let slot = binding.lower;
@@ -4018,12 +4332,16 @@ impl<'a> Emitter<'a> {
         let mut written: BTreeSet<String> = BTreeSet::new();
         let mut live: BTreeSet<(u8, u32)> = BTreeSet::new();
         for ins in &self.insns {
-            if ins.mnemonic == "v_nop" {
+            if matches!(ins.mnemonic.as_str(), "v_nop" | "s_setreg_imm32_b32") {
                 continue;
             }
-            // Packed FMAC accumulates in its destination. A subword FMA also
-            // reads that register to preserve the half outside its write mask.
-            let old_dst = (matches!(ins.mnemonic.as_str(), "v_pk_fmac_f16" | "v_fma_f16" | "v_rcp_f16") || int16::new_half(ins))
+            // Accumulators and partial writes implicitly read the old destination.
+            let keep_other_bits = ins.aux.sdwa.is_none_or(|sd| (sd >> 8) & 7 != 6 && (sd >> 11) & 3 == 2);
+            let setreg = ins.mnemonic == "s_setreg_b32";
+            let old_dst = ((setreg && modeled_hwreg_mask(ins.raw[0]) != 0)
+                || matches!(ins.mnemonic.as_str(), "v_pk_fmac_f16" | "v_fma_f16" | "v_rcp_f16")
+                || ((half_round_or_conversion(&ins.mnemonic) || ins.mnemonic == "v_cvt_f16_f32") && keep_other_bits)
+                || int16::new_half(ins))
                 .then(|| ins.dst.first()).flatten();
             for o in ins.src.iter().chain(old_dst) {
                 if let Opnd::Sgpr(n) | Opnd::Vgpr(n) = o {
@@ -4032,6 +4350,9 @@ impl<'a> Emitter<'a> {
                         live.insert((if matches!(o, Opnd::Vgpr(_)) { 1 } else { 0 }, *n as u32));
                     }
                 }
+            }
+            if setreg {
+                continue;
             }
             if let Some(high) = float64::pair_source_highs(ins) {
                 if !written.contains(&format!("v{high}")) {
@@ -4167,10 +4488,44 @@ impl<'a> Emitter<'a> {
         out
     }
 
+    fn fp32_extrema(&self, ins: &Insn, first: String) -> Result<String, String> {
+        let maximum = ins.mnemonic == "v_max_f32";
+        let mode = if self.regs.contains("tb_fp_mode") { "tb_fp_mode" } else { "0xc0u" };
+        let (first, second) = dpp_fp32_sources(ins, first)?;
+        Ok(format!("tb_quad_extrema({first}, {second}, {maximum}, {mode})"))
+    }
+
     fn push_helpers(&self, h: &mut String) {
         h.push_str(CUBE_HELPERS);
+        if self.insns.iter().any(clamped_product24) {
+            h.push_str(MAD24_SAT);
+        }
         h.push_str(if self.single_wave32 { HALF_RNE_STRAIGHT_LINE } else { HALF_RNE });
         h.push_str(HALF_HELPERS);
+        if self.insns.iter().any(|ins| matches!(ins.mnemonic.as_str(), "v_cvt_u32_f32" | "v_cvt_i32_f32")) {
+            h.push_str(include_str!("float_to_integer.hlsl"));
+        }
+        if self.insns.iter().any(|ins| ins.mnemonic == "v_fract_f32") {
+            h.push_str(include_str!("fract_f32.hlsl"));
+        }
+        if self.insns.iter().any(|i| i.op == OP_DPP_BINARY && matches!(i.mnemonic.as_str(), "v_min_f32" | "v_max_f32")) {
+            h.push_str(r#"
+uint tb_quad_extrema(uint a, uint b, bool maximum, uint mode) {
+    if ((mode & 0x10u) == 0u) {
+        if ((a & 0x7fffffffu) < 0x00800000u) a &= 0x80000000u;
+        if ((b & 0x7fffffffu) < 0x00800000u) b &= 0x80000000u;
+    }
+    // Order -0 below +0. Keep operands as bits for the non-IEEE NaN selection rule.
+    uint keyA = (a & 0x80000000u) != 0u ? ~a : a ^ 0x80000000u;
+    uint keyB = (b & 0x80000000u) != 0u ? ~b : b ^ 0x80000000u;
+    uint result = (maximum ? keyA > keyB : keyA < keyB) ? a : b;
+    if ((a & 0x7fffffffu) > 0x7f800000u) result = b;
+    else if ((b & 0x7fffffffu) > 0x7f800000u) result = a;
+    if ((mode & 0x20u) == 0u && (result & 0x7fffffffu) < 0x00800000u) result &= 0x80000000u;
+    return result;
+}
+"#);
+        }
         if self.insns.iter().any(|i| i.mnemonic.starts_with("v_cmp") && (i.mnemonic.ends_with("_f64") || i.mnemonic.ends_with("_f32") || i.mnemonic.ends_with("_f16"))) {
             h.push_str(compare::FLOAT_HELPERS);
         }
@@ -4199,7 +4554,17 @@ uint2 tb_field64(uint lo, uint hi, uint control, bool sign) {
 }
 "#);
         }
-        if self.regs.contains("tb_fp_mode") {
+        if self.insns.iter().any(|i| normalized_half_to_integer(&i.mnemonic)) {
+            h.push_str(include_str!("normalized_half.hlsl"));
+        }
+        let uses_half_unary = self.insns.iter().any(|i| half_unary_op(&i.mnemonic).is_some());
+        let uses_half_output = self.insns.iter().any(|i| {
+            let modified = (i.enc == Enc::Vop3 && (i.aux.imm != 0 || i.aux.imm2 != 0))
+                || i.aux.sdwa.is_some_and(|sd| sd & 0xe000 != 0);
+            modified && (half_unary_op(&i.mnemonic).is_some()
+                || integer_to_half(&i.mnemonic) || i.mnemonic == "v_cvt_f16_f32")
+        });
+        if self.regs.contains("tb_fp_mode") || uses_half_unary || uses_half_output {
             h.push_str(r#"
 // V_CVT_F16_F32 uses the destination round mode. Work with magnitudes
 // so tiny directed results survive the host's single-precision FTZ mode.
@@ -4207,11 +4572,33 @@ uint tb_mode_half(float value, uint mode) {
     uint bits = asuint(value), magnitude = bits & 0x7fffffffu;
     if (magnitude < 0x00800000u && (mode & 0x10u) == 0u)
         return (bits >> 16) & 0x8000u;
+    // FP16_OVFL saturates finite overflow, preserving true infinities.
+    if ((mode & 0x800000u) != 0u && magnitude > 0x477fe000u && magnitude < 0x7f800000u)
+        return ((bits >> 16) & 0x8000u) | 0x7bffu;
     uint rounding = (mode >> 2) & 3u;
     uint h = tb_f16_cvt(value, rounding != 0u);
     bool away = rounding == ((bits >> 31) != 0u ? 2u : 1u);
     if (away && magnitude < 0x7f800000u && asuint(f16tof32(h & 0x7fffu)) < magnitude) h++;
     return (h & 0x7fffu) < 0x400u && (mode & 0x80u) == 0u ? h & 0x8000u : h;
+}
+"#);
+        }
+        if uses_half_unary {
+            h.push_str(include_str!("half_unary.hlsl"));
+        }
+        if uses_half_output {
+            h.push_str(r#"
+uint tb_half_output(uint bits, uint mode, float scale, bool clampResult) {
+    // Scaling preserves NaN payloads. CLAMP clears them only in DX10 mode.
+    if ((bits & 0x7fffu) > 0x7c00u)
+        return clampResult && (mode & 0x100u) != 0u ? 0u : bits;
+    // On RDNA2, OMOD is disabled with output denormals or IEEE mode.
+    if (scale != 1.0 && (mode & 0x280u) == 0u) {
+        float x = (bits & 0x7fffu) == 0u ? 0.0 : f16tof32(bits);
+        bits = tb_mode_half(x * scale, mode);
+    }
+    if (!clampResult) return bits;
+    return (bits & 0x8000u) != 0u ? 0u : min(bits, 0x3c00u);
 }
 "#);
         }
@@ -4457,7 +4844,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.emit_compute_swizzle(i, ins, &active)?;
                 self.hoisted_swizzle = Some(i);
             }
-            if ins.mnemonic == "tb_first_exec_lane" {
+            if ins.mnemonic == "tb_first_exec_lane" && !self.exec_snapshots.sites.contains_key(&i) {
                 self.end_guard(&mut open);
                 cur.clear();
                 let mut condition=String::from("(exec_lo & 1u) != 0u");
@@ -4484,37 +4871,75 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Ok(());
             }
             if is_quad_exchange(ins) {
-                if self.loop_depth != 0 && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
+                if self.loop_depth != 0 && (!self.pixel_wave || is_row_move(ins)) {
                     return Err("DPP16 exchange inside backward control flow".into());
                 }
                 if open {
                     self.end_guard(&mut open);
                     cur.clear();
                 }
-                if self.pixel_wave && ins.op != OP_ROW_MIRROR {
+                if self.pixel_wave && !is_row_move(ins) {
                     self.emit_pixel_quad_exchange(i, ins)?;
-                } else if ins.op == OP_ROW_MIRROR {
-                    let source = r(&ins.src[0])?;
-                    // FI=0: a source lane inactive in EXEC contributes 0. row_mirror
-                    // mirrors local lanes within a 16-lane row.
-                    self.line(&format!("uint q{i}lane = WaveGetLaneIndex();"));
-                    self.line(&format!("uint q{i}src = (q{i}lane & ~15u) | (15u - (q{i}lane & 15u));"));
-                    self.line(&format!("uint q{i}act = q{i}src < 32u ? (exec_lo >> q{i}src) & 1u : (exec_hi >> (q{i}src - 32u)) & 1u;"));
-                    self.line(&format!("uint q{i} = q{i}act != 0u ? WaveReadLaneAt({source}, q{i}src) : 0u;"));
                 } else {
                     let source = r(&ins.src[0])?;
-                    // All host lanes participate before the guest destination guards.
-                    let perm = ins.aux.imm;
-                    self.line(&format!("uint q{i}lane = WaveGetLaneIndex();"));
-                    let lane = format!("(q{i}lane & ~3u) | (({perm}u >> (2u * (q{i}lane & 3u))) & 3u)");
-                    if ins.raw[1] & (1 << 18) != 0 {
-                        self.line(&format!("uint q{i} = WaveReadLaneAt({source}, {lane});"));
-                    } else if ins.raw[1] & (1 << 19) != 0 {
-                        self.line(&format!("uint q{i} = WaveReadLaneAt((exec_lo & 1u) != 0u ? {source} : 0u, {lane});"));
+                    if ins.op == OP_DPP_BINARY {
+                        // All host lanes participate before the guest destination guards.
+                        let perm = ins.aux.imm;
+                        self.line(&format!("uint q{i}lane = WaveGetLaneIndex();"));
+                        let dpp8 = group_extrema::is_dpp8(ins);
+                        let lane = if dpp8 {
+                            format!("(q{i}lane & ~7u) | (({perm}u >> (3u * (q{i}lane & 7u))) & 7u)")
+                        } else if perm == 0x140 {
+                            format!("q{i}lane ^ 15u")
+                        } else if (0x121..=0x12f).contains(&perm) {
+                            format!("(q{i}lane & ~15u) | ((q{i}lane - {}u) & 15u)", perm & 15)
+                        } else { format!("(q{i}lane & ~3u) | (({perm}u >> (2u * (q{i}lane & 3u))) & 3u)") };
+                        if dpp8 || ins.raw[1] & (1 << 18) != 0 {
+                            self.line(&format!("uint q{i} = WaveReadLaneAt({source}, {lane});"));
+                        } else if ins.raw[1] & (1 << 19) != 0 {
+                            self.line(&format!("uint q{i} = WaveReadLaneAt((exec_lo & 1u) != 0u ? {source} : 0u, {lane});"));
+                        } else {
+                            self.line(&format!("uint2 q{i}pair = WaveReadLaneAt(uint2({source}, exec_lo & 1u), {lane});"));
+                            self.line(&format!("uint q{i} = q{i}pair.x;"));
+                            self.line(&format!("bool q{i}active = q{i}pair.y != 0u;"));
+                        }
                     } else {
-                        self.line(&format!("uint2 q{i}pair = WaveReadLaneAt(uint2({source}, exec_lo & 1u), {lane});"));
-                        self.line(&format!("uint q{i} = q{i}pair.x;"));
-                        self.line(&format!("bool q{i}active = q{i}pair.y != 0u;"));
+                        let selector = ins.aux.imm;
+                        let lane = match ins.op {
+                            OP_QUAD_MOVE => {
+                                self.line(&format!("uint q{i}lane = WaveGetLaneIndex();"));
+                                format!("(q{i}lane & ~3u) | (({selector}u >> (2u * (q{i}lane & 3u))) & 3u)")
+                            }
+                            OP_ROW_SHARE_MOVE => format!("(WaveGetLaneIndex() & ~15u) | {selector}u"),
+                            OP_ROW_ROR_MOVE => format!("(WaveGetLaneIndex() & ~15u) | ((WaveGetLaneIndex() - {selector}u) & 15u)"),
+                            OP_ROW_SHIFT_MOVE => {
+                                let sign = if selector < 0 { "-" } else { "+" };
+                                self.line(&format!("uint q{i}offset = (WaveGetLaneIndex() & 15u) {sign} {}u;", selector.abs()));
+                                // Keep the wave read in range even for lanes that will discard its value.
+                                format!("(WaveGetLaneIndex() & ~15u) | (q{i}offset & 15u)")
+                            }
+                            _ => format!("WaveGetLaneIndex() ^ {selector}u"),
+                        };
+                        let fetch_inactive = ins.raw[1] & (1 << 18) != 0;
+                        let bound_ctrl = ins.raw[1] & (1 << 19) != 0;
+                        let lane = if is_row_move(ins) || !fetch_inactive {
+                            self.line(&format!("uint q{i}src = {lane};"));
+                            format!("q{i}src")
+                        } else { lane };
+                        if fetch_inactive {
+                            self.line(&format!("uint q{i} = WaveReadLaneAt({source}, {lane});"));
+                        } else if bound_ctrl {
+                            self.line(&format!("uint q{i} = WaveReadLaneAt((exec_lo & 1u) != 0u ? {source} : 0u, {lane});"));
+                        } else {
+                            // An inactive source suppresses the write to this lane's destination.
+                            let dst = r(&ins.dst[0])?;
+                            self.line(&format!("uint2 q{i}pair = WaveReadLaneAt(uint2({source}, exec_lo & 1u), {lane});"));
+                            self.line(&format!("uint q{i} = q{i}pair.y != 0u ? q{i}pair.x : {dst};"));
+                        }
+                        if ins.op == OP_ROW_SHIFT_MOVE {
+                            let fallback = if bound_ctrl { "0u".to_string() } else { r(&ins.dst[0])? };
+                            self.line(&format!("if (q{i}offset >= 16u) q{i} = {fallback};"));
+                        }
                     }
                 }
             }
@@ -4634,7 +5059,12 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         let selected = if preserve { format!("q{i}pair") } else { format!("q{i}") };
         self.line(&format!("{ty} {selected} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
         if preserve {
-            self.line(&format!("uint q{i} = q{i}pair.x; bool q{i}active = q{i}pair.y != 0u;"));
+            if ins.op == OP_QUAD_MOVE {
+                let dst = r(&ins.dst[0])?;
+                self.line(&format!("uint q{i} = q{i}pair.y != 0u ? q{i}pair.x : {dst};"));
+            } else {
+                self.line(&format!("uint q{i} = q{i}pair.x; bool q{i}active = q{i}pair.y != 0u;"));
+            }
         }
         Ok(())
     }
@@ -4676,6 +5106,13 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 leaders.insert(i + 1);
             }
         }
+        // A guest wave reaches S_BARRIER as a whole: lanes that left a loop early wait in
+        // EXEC for the rest. Here each lane follows its own blocks, so the barrier starts
+        // one that a lane enters only when its wave has caught up.
+        let barriers: Vec<usize> = (entry..n)
+            .filter(|&i| self.is_cs && self.insns[i].enc == Enc::Sopp && self.insns[i].op == 0x0a)
+            .collect();
+        leaders.extend(&barriers);
         let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
         self.loop_depth = 0;
         if entry == 0 {
@@ -4687,7 +5124,16 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         self.loop_depth += 1;
         // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
         // `switch` whose selector is assigned inside its cases).
-        self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
+        if barriers.is_empty() {
+            self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
+        } else {
+            let at = barriers.iter().map(|i| format!("tb_pc == {i}u")).collect::<Vec<_>>().join(" || ");
+            self.line(&format!("bool tb_wait = {at};"));
+            // When lanes stand at different barriers the earliest goes first.
+            self.line("bool tb_busy = WaveActiveAnyTrue(!tb_wait); uint tb_low = WaveActiveMin(tb_pc);");
+            self.line("tb_wait = tb_wait && (tb_busy || tb_pc != tb_low);");
+            self.line("uint tb_sel = tb_wait ? 0xfffffffeu : tb_pc; if (!tb_wait) tb_pc = 0xffffffffu;");
+        }
         let insns = self.insns.clone();
         for (b, &start) in starts.iter().enumerate() {
             let end = starts.get(b + 1).copied().unwrap_or(n);
@@ -4698,7 +5144,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 for o in ins.src.iter().chain(ins.dst.iter()) {
                     self.touch(o);
                 }
-                if is_quad_exchange(ins) && self.pixel_wave && ins.op != OP_ROW_MIRROR {
+                if is_quad_exchange(ins) && self.pixel_wave && !is_row_move(ins) {
                     self.emit_pixel_quad_exchange(i, ins)?;
                 }
                 let is_ctl = ins.enc == Enc::Sopp && (Self::branch_cond(ins.op).is_some() || ins.op == 1);
@@ -4754,9 +5200,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         expr
     }
 
-    /// Wrap a float result with VOP3 omod/clamp and convert to uint bits.
-    fn fres(&self, ins: &Insn, e: String) -> String {
-        let mut e = e;
+    fn float_result(ins: &Insn, mut e: String) -> String {
         if ins.enc == Enc::Vop3 {
             e = match ins.aux.imm2 {
                 1 => format!("(({e}) * 2.0)"),
@@ -4768,7 +5212,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 e = format!("saturate({e})");
             }
         }
-        format!("asuint({e})")
+        e
+    }
+
+    fn fres(&self, ins: &Insn, e: String) -> String {
+        format!("asuint({})", Self::float_result(ins, e))
     }
 
     fn pair_high(&mut self, operand: &Opnd) -> Result<String, String> {
@@ -4778,10 +5226,17 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             _ => return Err("unsupported 64-bit operand pair".into()),
         };
         self.touch(&high);
-        r(&high)
+        self.numeric_input(&high)
     }
 
-    fn int_compare(m: &str, a: &Opnd, b: &Opnd) -> Result<String, String> {
+    fn numeric_input(&self, operand: &Opnd) -> Result<String, String> {
+        match self.exec_snapshots.word(self.cur_idx, operand) {
+            Some(word) => Ok(word),
+            None => r(operand),
+        }
+    }
+
+    fn int_compare(&self, m: &str, a: &Opnd, b: &Opnd) -> Result<String, String> {
         let mut parts = m.rsplit('_');
         let ty = parts.next().unwrap_or("");
         let cc = parts.next().unwrap_or("");
@@ -4791,7 +5246,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     if matches!(o, Opnd::ConstF32(_)) {
                         return Err("inline float constant in a 16-bit integer compare".into());
                     }
-                    let bits = r(o)?;
+                    let bits = self.numeric_input(o)?;
                     Ok(if ty == "i16" {
                         format!("(asint({bits} << 16) >> 16)")
                     } else {
@@ -4800,8 +5255,8 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 };
                 (half(a)?, half(b)?)
             }
-            "i32" => (format!("asint({})", r(a)?), format!("asint({})", r(b)?)),
-            "u32" => (r(a)?, r(b)?),
+            "i32" => (format!("asint({})", self.numeric_input(a)?), format!("asint({})", self.numeric_input(b)?)),
+            "u32" => (self.numeric_input(a)?, self.numeric_input(b)?),
             other => return Err(format!("compare type {other} unsupported")),
         };
         Ok(match cc {
@@ -4832,6 +5287,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         let d = ins.dst.first().cloned();
         self.line(&format!("// {:#06x} {m}", ins.offset));
         self.cur_idx = idx;
+        if let Some(&site) = self.exec_snapshots.sites.get(&idx) {
+            if site.emit(self, idx, ins)? { return Ok(()); }
+        }
         if m == "tb_reflection_far_query" {
             reflection_far::emit(self, ins);
             return Ok(());
@@ -5395,20 +5853,24 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             Enc::Sopk => {
                 let d = d.ok_or("no dst")?;
                 let imm = format!("{:#x}u", ins.aux.imm as i32 as u32);
+                let mask = modeled_hwreg_mask(ins.raw[0]);
                 match m {
                     "s_version" => Ok(()),
                     "s_movk_i32" => self.ws(&d, &imm),
                     "s_cmovk_i32" => self.ws(&d, &format!("((scc != 0u) ? {imm} : {})", name(&d)?)),
                     "s_setreg_imm32_b32" | "s_setreg_b32" | "s_getreg_b32"
-                        if matches!(ins.raw[0] & 63, 20 | 21) || (ins.raw[0] & 63 == 1 && ((ins.raw[0] >> 6) & 31) + ((ins.raw[0] >> 11) & 31) < 8) => {
-                        // The retail setup writes FLAT_SCRATCH_LO/HI. Model the
-                        // two register words and the encoded bit slice independently.
-                        let reg = if ins.raw[0] & 63 == 1 { "tb_fp_mode".to_string() } else { format!("tb_flat_scratch{}", ins.raw[0] & 1) };
-                        self.regs.insert(reg.clone());
+                        if mask != 0 => {
+                        let id = ins.raw[0] & 63;
                         let shift = (ins.raw[0] >> 6) & 31;
                         let width = ((ins.raw[0] >> 11) & 31) + 1;
                         if shift + width > 32 { return Err("hardware register field exceeds word".into()); }
-                        let mask = u32::MAX >> (32 - width);
+                        // Reads must be known in full. Writes need only update the
+                        // intersection with the modeled register.
+                        if m == "s_getreg_b32" && mask != u32::MAX >> (32 - width) {
+                            return Err("unmodeled MODE read field".into());
+                        }
+                        let reg = if id == 1 { "tb_fp_mode".to_string() } else { format!("tb_flat_scratch{}", id & 1) };
+                        self.regs.insert(reg.clone());
                         if m == "s_getreg_b32" {
                             return self.ws(&d, &format!("(({reg} >> {shift}) & {mask:#x}u)"));
                         }
@@ -5421,8 +5883,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                         self.line(&format!("{reg} = ({reg} & ~{:#x}u) | (({value} & {mask:#x}u) << {shift});", mask << shift));
                         Ok(())
                     }
-                    // Hardware mode-register writes (rounding / denormal control) and the
-                    // counter waits have no HLSL-visible effect.
+                    // Other hardware-register writes and counter waits do not change the modeled state.
                     "s_setreg_imm32_b32" | "s_setreg_b32" | "s_waitcnt_vscnt" | "s_waitcnt_vmcnt"
                     | "s_waitcnt_expcnt" | "s_waitcnt_lgkmcnt" => Ok(()),
                     "s_addk_i32" => {
@@ -5436,7 +5897,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     "s_mulk_i32" => self.ws(&d, &format!("({} * {imm})", name(&d)?)),
                     _ if m.starts_with("s_cmpk_") => {
                         let fake = m.replace("s_cmpk_", "s_cmp_");
-                        let c = Self::int_compare(&fake, &d, &Opnd::ConstInt(ins.aux.imm))?;
+                        let c = self.int_compare(&fake, &d, &Opnd::ConstInt(ins.aux.imm))?;
                         self.line(&format!("scc = {c} ? 1u : 0u;"));
                         Ok(())
                     }
@@ -5461,7 +5922,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                         r(&hi(&s[0]))?,
                         r(&hi(&s[1]))?
                     ),
-                    _ => Self::int_compare(m, &s[0], &s[1])?,
+                    _ => self.int_compare(m, &s[0], &s[1])?,
                 };
                 self.line(&format!("scc = {c} ? 1u : 0u;"));
                 Ok(())
@@ -6272,24 +6733,83 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             } else { format!("WaveReadLaneAt({value}, {lane})") };
             return self.ws(&d, &read);
         }
+        if ins.enc == Enc::Vop2 && ins.op == OP_LOCAL_EXTREMA {
+            let value = self.fp32_extrema(ins, r(&s[0])?)?;
+            return self.wv(&d, &value);
+        }
         if is_quad_exchange(ins) {
-            if self.dispatched && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
+            if self.dispatched && (!self.pixel_wave || is_row_move(ins)) {
                 return Err("quad exchange in a block-dispatched program".into());
             }
+            if ins.op != OP_DPP_BINARY {
+                let value = format!("q{}", self.cur_idx);
+                let control = ins.raw[1];
+                if control >> 24 != 0xff {
+                    if self.ex.stage != Stage::Compute {
+                        return Err("masked DPP16 move requires a known compute wave width".into());
+                    }
+                    // Destination masks do not affect which lanes can supply the source.
+                    let rows = control >> 28;
+                    let banks = (control >> 24) & 15;
+                    let row = format!("({rows:#x}u >> (WaveGetLaneIndex() >> 4u))");
+                    let bank = format!("({banks:#x}u >> ((WaveGetLaneIndex() >> 2u) & 3u))");
+                    return self.wv(&d, &format!("(({row} & {bank} & 1u) != 0u) ? {value} : {}", r(&d)?));
+                }
+                return self.wv(&d, &value);
+            }
             let peer = format!("q{}", self.cur_idx);
-            if ins.op != OP_QUAD_BINARY { return self.wv(&d, &peer); }
             let value = match ins.mnemonic.as_str() {
-                "v_add_f32" => format!("asuint(asfloat({peer}) + {})", f(&s[1])?),
+                op @ ("v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32") => {
+                    let (a, b) = dpp_fp32_sources(ins, peer.clone())?;
+                    match op {
+                        "v_add_f32" => format!("asuint(asfloat({a}) + asfloat({b}))"),
+                        "v_sub_f32" => format!("asuint(asfloat({a}) - asfloat({b}))"),
+                        "v_subrev_f32" => format!("asuint(asfloat({b}) - asfloat({a}))"),
+                        "v_mul_f32" => format!("asuint(asfloat({a}) * asfloat({b}))"),
+                        _ => format!("asuint(tb_mull(asfloat({a}), asfloat({b})))"),
+                    }
+                }
+                "v_min_f32" | "v_max_f32" => self.fp32_extrema(ins, peer.clone())?,
+                "v_cvt_pkrtz_f16_f32" => {
+                    let (lo, hi) = dpp_fp32_sources(ins, peer.clone())?;
+                    format!("(tb_f16_rtz(asfloat({lo})) | (tb_f16_rtz(asfloat({hi})) << 16))")
+                }
                 "v_or_b32" => format!("{peer} | {}", r(&s[1])?),
                 "v_and_b32" => format!("{peer} & {}", r(&s[1])?),
                 "v_xor_b32" => format!("{peer} ^ {}", r(&s[1])?),
-                _ => return Err("unknown quad binary operation".into()),
+                "v_xnor_b32" => format!("~({peer} ^ {})", r(&s[1])?),
+                "v_cndmask_b32" => format!("(vcc_lo & 1u) != 0u ? {} : {peer}", r(&s[1])?),
+                "v_add_nc_u32" => format!("{peer} + {}", r(&s[1])?),
+                "v_sub_nc_u32" => format!("{peer} - {}", r(&s[1])?),
+                "v_subrev_nc_u32" => format!("{} - {peer}", r(&s[1])?),
+                "v_lshlrev_b32" => format!("{} << ({peer} & 31u)", r(&s[1])?),
+                "v_lshrrev_b32" => format!("{} >> ({peer} & 31u)", r(&s[1])?),
+                "v_ashrrev_i32" => format!("asuint(asint({}) >> ({peer} & 31u))", r(&s[1])?),
+                "v_min_i32" => format!("asuint(min(asint({peer}), asint({})))", r(&s[1])?),
+                "v_max_i32" => format!("asuint(max(asint({peer}), asint({})))", r(&s[1])?),
+                "v_min_u32" => format!("min({peer}, {})", r(&s[1])?),
+                "v_max_u32" => format!("max({peer}, {})", r(&s[1])?),
+                op => mul24_expr(op, &peer, &r(&s[1])?).ok_or("unknown quad binary operation")?,
             };
-            // FI=0 and BOUND_CTRL=0 suppress the entire write on an inactive source.
-            if ins.raw[1] & (3 << 18) == 0 {
-                return self.wv(&d, &format!("{peer}active ? ({value}) : {}", r(&d)?));
+            // The source exchange precedes both the destination mask and EXEC.
+            let mut guards = Vec::new();
+            if let Some(mask) = group_extrema::destination_mask(ins) {
+                if self.ex.stage != Stage::Compute {
+                    return Err("DPP16 destination masks require a logical compute lane index".into());
+                }
+                let rows = mask >> 4;
+                let banks = mask & 15;
+                if rows != 15 {
+                    let row_bits = group_extrema::row_index_mask(self, rows, banks)?;
+                    guards.push(format!("(({rows:#x}u >> ((tb_lane >> 4u) & {row_bits}u)) & 1u) != 0u"));
+                }
+                if banks != 15 { guards.push(format!("(({banks:#x}u >> ((tb_lane >> 2u) & 3u)) & 1u) != 0u")); }
             }
-            return self.wv(&d, &value);
+            if !group_extrema::is_dpp8(ins) && ins.raw[1] & (3 << 18) == 0 {
+                guards.push(format!("{peer}active"));
+            }
+            if guards.is_empty() { return self.wv(&d, &value); }
+            return self.wv(&d, &format!("{} ? ({value}) : {}", guards.join(" && "), r(&d)?));
         }
         if ins.op == OP_WAVE_REDUCE && ins.enc == Enc::Vop3 {
             // See `lower_wave_reductions`. Every invocation computes the same value; lanes
@@ -6309,7 +6829,8 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         // exactly as for f32 (see `fm` / `fres`).
         let h16 = |o: &Opnd| -> Result<String, String> {
             let mut e = match o {
-                Opnd::ConstF32(_) => f(o)?,
+                // Inline selector 248 has distinct binary16 and binary32 values.
+                Opnd::ConstF32(value) => f(&Opnd::ConstF32(inline_half_value(*value)))?,
                 _ => format!("f16tof32(({}) & 0xffffu)", r(o)?),
             };
             if ins.enc == Enc::Vop3 {
@@ -6324,21 +6845,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             Ok(e)
         };
-        let hres = |e: String| -> String {
-            let mut e = e;
-            if ins.enc == Enc::Vop3 {
-                e = match ins.aux.imm2 {
-                    1 => format!("(({e}) * 2.0)"),
-                    2 => format!("(({e}) * 4.0)"),
-                    3 => format!("(({e}) * 0.5)"),
-                    _ => e,
-                };
-                if ins.aux.imm != 0 {
-                    e = format!("saturate({e})");
-                }
-            }
-            format!("tb_f16_rne({e})")
-        };
+        let hres = |e| format!("tb_f16_rne({})", Self::float_result(ins, e));
         let half_binary = matches!(m.as_str(), "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_max_f16" | "v_min_f16");
         if ins.aux.sdwa.is_none() && half_binary {
             let (a, b) = (h16(&s[0])?, h16(&s[1])?);
@@ -6360,27 +6867,62 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let lo = format!("tb_trig_f16({bits}, {})", m == "v_cos_f16");
             return self.wv(&d, &format!("(({} & 0xffff0000u) | {lo})", r(&d)?));
         }
-        if ins.aux.sdwa.is_none() && matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_exp_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
+        let unary_op = half_unary_op(&m);
+        let modified_half_bits = || -> Result<String, String> {
+            let mut bits = half_operand_bits(&s[0])?;
+            if ins.enc == Enc::Vop3 {
+                if ins.aux.mask & 1 != 0 { bits = format!("(({bits}) & 0x7fffu)"); }
+                if ins.aux.mask & 8 != 0 { bits = format!("(({bits}) ^ 0x8000u)"); }
+            }
+            Ok(bits)
+        };
+        let half_int_src = integer_to_half(&m);
+        if ins.aux.sdwa.is_none() && (unary_op.is_some() || half_int_src) {
+            let has_mode = self.regs.contains("tb_fp_mode");
+            let mode = if has_mode { "tb_fp_mode" } else { "0xc0u" };
+            let narrow = |value| if has_mode {
+                format!("tb_mode_half({value}, {mode})")
+            } else {
+                format!("tb_f16_rne({value})")
+            };
+            let mut bits = if let Some(op) = unary_op {
+                if let Opnd::ConstF32(value) = s[0] {
+                    // Inline floats are finite normal halves. Only 1/(2*pi)
+                    // has a distinct rounded value in the half-precision ROM.
+                    let mut value = inline_half_value(value);
+                    if ins.enc == Enc::Vop3 {
+                        if ins.aux.mask & 1 != 0 { value = value.abs(); }
+                        if ins.aux.mask & 8 != 0 { value = -value; }
+                    }
+                    let x = f(&Opnd::ConstF32(value))?;
+                    format!("tb_finite_unary_f16({x}, {mode}, {op}u)")
+                } else {
+                    format!("tb_unary_f16({}, {mode}, {op}u)", modified_half_bits()?)
+                }
+            } else {
+                let raw = half_operand_bits(&s[0])?;
+                let integer = if m == "v_cvt_f16_i16" {
+                    format!("(asint(({raw}) << 16) >> 16)")
+                } else {
+                    format!("(({raw}) & 0xffffu)")
+                };
+                narrow(format!("(float){integer}"))
+            };
+            if ins.enc == Enc::Vop3 && (ins.aux.imm2 != 0 || ins.aux.imm != 0) {
+                let scale = ["1.0", "2.0", "4.0", "0.5"][ins.aux.imm2 as usize];
+                let clamp = ins.aux.imm != 0;
+                bits = format!("tb_half_output({bits}, {mode}, {scale}, {clamp})");
+            }
+            return self.wv(&d, &format!("(({} & 0xffff0000u) | {bits})", r(&d)?));
+        }
+        if ins.aux.sdwa.is_none() && matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_exp_f16") {
             let a = h16(&s[0])?;
             let e = match m.as_str() {
                 "v_rcp_f16" => format!("1.0 / {a}"),
                 "v_sqrt_f16" => format!("sqrt({a})"),
                 "v_rsq_f16" => format!("rsqrt({a})"),
-                "v_exp_f16" => format!("exp2({a})"),
-                "v_floor_f16" => format!("floor({a})"),
-                "v_ceil_f16" => format!("ceil({a})"),
-                "v_trunc_f16" => format!("trunc({a})"),
-                "v_rndne_f16" => format!("round({a})"),
-                _ => format!("frac({a})"),
+                _ => format!("exp2({a})"),
             };
-            if m == "v_fract_f16" {
-                // The result stays below 1.0: a fraction that rounds up to 1.0 in half
-                // precision gives the largest half below 1 (0x3bff), as for D3D frc.
-                let t = self.tmp;
-                self.tmp += 1;
-                self.line(&format!("uint t{t} = {};", hres(e)));
-                return self.wv(&d, &format!("(t{t} == 0x3c00u ? 0x3bffu : t{t})"));
-            }
             // The compact reciprocal updates the low half. The FSPX shader first
             // writes the high reciprocal via SDWA, then fills the low half here.
             if m == "v_rcp_f16" && ins.enc == Enc::Vop1 && matches!(d, Opnd::Vgpr(_)) {
@@ -6388,21 +6930,27 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             return self.wv(&d, &hres(e));
         }
-        if m == "v_cvt_f16_u16" {
-            return self.wv(&d, &format!("tb_f16_rne((float)(({}) & 0xffffu))", r(&s[0])?));
+        let half_int_result = half_to_integer(&m);
+        if normalized_half_to_integer(&m) && ins.aux.sdwa.is_none() {
+            let bits = modified_half_bits()?;
+            let mode = if self.regs.contains("tb_fp_mode") { "tb_fp_mode" } else { "0xc0u" };
+            let signed = m == "v_cvt_norm_i16_f16";
+            return self.wv(&d, &format!("(({} & 0xffff0000u) | tb_norm_f16({bits}, {mode}, {signed}))", r(&d)?));
         }
-        if m == "v_cvt_f16_i16" {
-            return self.wv(&d, &format!("tb_f16_rne((float)(asint(({}) << 16) >> 16))", r(&s[0])?));
-        }
-        if m == "v_cvt_u16_f16" {
-            // Truncating, saturating; NaN converts to 0 (tested on the 16-bit pattern: the
-            // compiler may assume float values are never NaN).
-            let x = r(&s[0])?;
-            return self.wv(&d, &format!("((({x}) & 0x7fffu) > 0x7c00u ? 0u : (uint)clamp({}, 0.0, 65535.0))", h16(&s[0])?));
-        }
-        if m == "v_cvt_i16_f16" {
-            let x = r(&s[0])?;
-            return self.wv(&d, &format!("((({x}) & 0x7fffu) > 0x7c00u ? 0u : (asuint((int)clamp({}, -32768.0, 32767.0)) & 0xffffu))", h16(&s[0])?));
+        if half_int_result && ins.aux.sdwa.is_none() {
+            let x = h16(&s[0])?;
+            // Truncate after saturating. CLAMP controls the inexact exception,
+            // independently of the integer value produced by the conversion.
+            let mut value = if m == "v_cvt_u16_f16" {
+                format!("(uint)clamp({x}, 0.0, 65535.0)")
+            } else {
+                format!("(asuint((int)clamp({x}, -32768.0, 32767.0)) & 0xffffu)")
+            };
+            if !matches!(s[0], Opnd::ConstF32(_)) {
+                // Test NaN on its stored bits before DXC can assume a finite float.
+                value = format!("((({}) & 0x7fffu) > 0x7c00u ? 0u : {value})", r(&s[0])?);
+            }
+            return self.wv(&d, &format!("(({} & 0xffff0000u) | {value})", r(&d)?));
         }
         if matches!(m.as_str(), "v_fmaak_f16" | "v_fmamk_f16") {
             // The trailing literal dword carries the half-float constant K in its low bits.
@@ -6715,6 +7263,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 match (ins.raw[0] >> 8) & 0x7f {
                     c @ 0..=105 => Opnd::Sgpr(c as u8),
                     106 => Opnd::VccLo,
+                    125 if ins.raw[1] >> 27 == 0 => Opnd::Null,
                     c => return Err(format!("carry-out register code {c} unsupported")),
                 }
             } else {
@@ -6737,7 +7286,8 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             let t = self.tmp;
             self.tmp += 1;
-            if m.starts_with("v_add") {
+            let add = m.starts_with("v_add");
+            if add {
                 self.line(&format!(
                     "uint t{t}c = ({cin}) & 1u; uint t{t}a = {a} + {b}; uint t{t} = t{t}a + t{t}c; uint t{t}o = ((t{t}a < {a}) || (t{t} < t{t}a)) ? 1u : 0u;"
                 ));
@@ -6746,7 +7296,14 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     "uint t{t}c = ({cin}) & 1u; uint t{t}a = {a} - {b}; uint t{t} = t{t}a - t{t}c; uint t{t}o = (({b} > {a}) || (t{t}c > t{t}a)) ? 1u : 0u;"
                 ));
             }
+            if vop3f && ins.raw[0] & 0x8000 != 0 {
+                // Clamp the vector result only. SDST reports the original carry or borrow.
+                let limit = if add { "0xffffffffu" } else { "0u" };
+                self.line(&format!("if (t{t}o != 0u) t{t} = {limit};"));
+            }
             self.wv(&d, &format!("t{t}"))?;
+            // A null SDST discards the outgoing flag after the incoming mask has been read.
+            if cout == Opnd::Null { return Ok(()); }
             self.touch(&cout);
             if self.persistent_queue {
                 self.line(&format!("uint2 carry{t} = tb_ballot((exec_lo & t{t}o) != 0u);"));
@@ -6773,16 +7330,30 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             let mut c = ins.clone();
             c.aux.sdwa = None;
-            // The selected half operands now occupy the low word. Apply the
-            // floating modifiers through the ordinary VOP3 half-float path.
-            let half_alu = half_binary || matches!(m.as_str(), "v_rcp_f16" | "v_exp_f16");
-            if half_alu {
+            if clamped_product24(ins) {
+                if sd & 0xc000 != 0 || (sd >> 11) & 3 == 3 {
+                    return Err("unsupported SDWA destination control for 24-bit multiply".into());
+                }
+                c.aux.imm = 1; // Saturate the full result before packing the destination.
+            }
+            // Reuse VOP3 floating modifiers after source selection and before destination packing.
+            let half_alu = half_binary || half_int_result || unary_op.is_some() || matches!(m.as_str(), "v_rcp_f16" | "v_exp_f16" | "v_cvt_f32_f16");
+            let float_alu = half_alu || matches!(m.as_str(),
+                "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
+                | "v_min_f32" | "v_max_f32" | "v_fract_f32" | "v_trunc_f32" | "v_ceil_f32"
+                | "v_rndne_f32" | "v_floor_f32");
+            // Integer conversions accept floating output modifiers but keep integer source rules.
+            let int_to_float = matches!(m.as_str(),
+                "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_off_f32_i4" | "v_cvt_f32_ubyte0"
+                | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3");
+            let float_source_modifiers = float_alu || m == "v_cvt_f16_f32";
+            if float_source_modifiers || int_to_float || half_int_src {
                 c.enc = Enc::Vop3;
                 c.aux.imm = i64::from((sd >> 13) & 1);
                 c.aux.imm2 = i64::from((sd >> 14) & 3);
             }
             if sd & 0x3030_0000 != 0 {
-                if !(half_alu || (is_cmp && (m.ends_with("_f16") || m.ends_with("_f32"))))
+                if !(float_source_modifiers || (is_cmp && (m.ends_with("_f16") || m.ends_with("_f32"))))
                     || (m.contains("_class_") && sd & 0x3000_0000 != 0)
                 {
                     return Err("unsupported SDWA neg/abs for this operand type".into());
@@ -6804,8 +7375,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     continue;
                 }
                 let mut x = r(&c.src[i])?;
-                if (is_cmp || half_alu) && m.ends_with("_f16") && (i == 0 || !m.contains("_class_"))
-                    && matches!(c.src[i], Opnd::ConstF32(_))
+                let half_constant = half_int_src || ((is_cmp || half_alu) && m.ends_with("_f16")
+                    && (i == 0 || !m.contains("_class_")));
+                if half_constant && matches!(c.src[i], Opnd::ConstF32(_))
                 {
                     // The inline constant ROM supplies binary16 before byte/word selection.
                     x = format!("tb_f16_rne(asfloat({x}))");
@@ -6825,19 +7397,23 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.line(&format!("uint tb_s{t} = {e};"));
                 c.src[i] = Opnd::Temp(t as u16);
             }
-            if dst_sel == 6 {
+            if dst_sel == 6 && !half_round_or_conversion(&m) && m != "v_cvt_f16_f32" {
                 return self.emit_vec(&c);
             }
             // Partial destination: compute into a temporary, then place the selected
             // byte/word into the register. DST_UNUSED (bits 12:11): 0 = pad with zeros,
             // 1 = sign-extend upwards, 2 = keep the other bits of the destination.
-            let (bits, lsb) = if dst_sel <= 3 { (8u32, dst_sel * 8) } else { (16, (dst_sel - 4) * 16) };
-            let mask = (1u32 << bits) - 1;
             let t = self.tmp;
             self.tmp += 1;
             self.line(&format!("uint tb_s{t} = 0u;"));
             c.dst = vec![Opnd::Temp(t as u16)];
             self.emit_vec(&c)?;
+            if dst_sel == 6 {
+                // SDWA DWORD writes the entire zero-extended 16-bit result.
+                return self.wv(&d, &format!("tb_s{t}"));
+            }
+            let (bits, lsb) = if dst_sel <= 3 { (8u32, dst_sel * 8) } else { (16, (dst_sel - 4) * 16) };
+            let mask = (1u32 << bits) - 1;
             let val = format!("(tb_s{t} & {mask:#x}u)");
             let e = match (sd >> 11) & 3 {
                 0 => format!("({val} << {lsb})"),
@@ -6860,7 +7436,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             } else if m.ends_with("_f64") || m.ends_with("_f32") || m.ends_with("_f16") {
                 self.compare_float(ins, mask)?
             } else {
-                Self::int_compare(&m, &s[0], &s[1])?
+                self.int_compare(&m, &s[0], &s[1])?
             };
             if self.resolve_wave32 {
                 let vote = format!("WaveActiveBallot((exec_lo & tb_lane_bit) != 0u && {c}).x");
@@ -6986,8 +7562,17 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         let fa = || self.fm(ins, 0);
         let fb = || self.fm(ins, 1);
         let fc = || self.fm(ins, 2);
-        let (a, b) = (r(&s[0])?, s.get(1).map(r).transpose()?.unwrap_or_default());
+        let a = self.numeric_input(&s[0])?;
+        let b = s.get(1).map(|operand| self.numeric_input(operand)).transpose()?.unwrap_or_default();
         let c = s.get(2).map(|o| r(o)).transpose().unwrap_or(None).unwrap_or_default();
+        if clamped_product24(ins) {
+            if vop3 && (ins.raw[0] & 0x7800 != 0 || ins.aux.mask != 0 || ins.aux.imm2 != 0) {
+                return Err("unsupported modifiers for clamped 24-bit multiply".into());
+            }
+            let acc = if m.starts_with("v_mad_") { c.as_str() } else { "0u" };
+            let signed = m.ends_with("_i24");
+            return self.wv(&d, &format!("tb_mad24_sat({a}, {b}, {acc}, {signed})"));
+        }
         // `v_mul_legacy_f32` / `v_mad_legacy_f32`: DX9 multiply rules — the product is 0 when
         // either operand is 0, even against infinity or NaN (`tb_mull`). A plain multiply
         // only matched under fast-math; with exact arithmetic it produced NaN positions.
@@ -7024,8 +7609,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             "v_cvt_f32_ubyte1" => Some(format!("(float)(({a} >> 8) & 0xffu)")),
             "v_cvt_f32_ubyte2" => Some(format!("(float)(({a} >> 16) & 0xffu)")),
             "v_cvt_f32_ubyte3" => Some(format!("(float)(({a} >> 24) & 0xffu)")),
-            "v_cvt_f32_f16" => Some(format!("f16tof32({a})")),
-            "v_fract_f32" => Some(format!("frac({})", fa()?)),
+            "v_cvt_f32_f16" => Some(h16(&s[0])?),
+            "v_fract_f32" => {
+                let mode = if self.regs.contains("tb_fp_mode") { "tb_fp_mode" } else { "0u" };
+                Some(format!("tb_fract_f32({}, {mode})", fa()?))
+            }
             "v_trunc_f32" => Some(format!("trunc({})", fa()?)),
             "v_ceil_f32" => Some(format!("ceil({})", fa()?)),
             "v_rndne_f32" => Some(format!("round({})", fa()?)),
@@ -7047,7 +7635,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let e = self.fres(ins, e);
             return self.wv(&d, &e);
         }
-        let mask = if self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
+        let mask = if matches!(self.exec_snapshots.sites.get(&self.cur_idx), Some(exec_snapshot::Site::LaneMask(..))) {
+            format!("select_mask{}", self.cur_idx)
+        } else if self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
             let upper = if self.required_wave_size == Some(64) {
                 r(&hi(&s[2]))?
             } else { "0u".into() };
@@ -7073,6 +7663,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             "v_lshrrev_b32" => format!("({b} >> ({a} & 31u))"),
             "v_lshlrev_b32" => format!("({b} << ({a} & 31u))"),
             "v_ashrrev_i32" => format!("asuint(asint({b}) >> ({a} & 31u))"),
+            // Unsigned VOP3 clamp limits the operand before the operation can wrap.
+            "v_add_nc_u32" if vop3 && ins.aux.imm != 0 => format!("(min({a}, ~{b}) + {b})"),
+            "v_sub_nc_u32" if vop3 && ins.aux.imm != 0 => format!("(max({a}, {b}) - {b})"),
+            "v_subrev_nc_u32" if vop3 && ins.aux.imm != 0 => format!("(max({b}, {a}) - {a})"),
             "v_add_nc_u32" => format!("({a} + {b})"),
             "v_sub_nc_u32" => format!("({a} - {b})"),
             "v_subrev_nc_u32" => format!("({b} - {a})"),
@@ -7080,8 +7674,6 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             "v_max_u32" => format!("max({a}, {b})"),
             "v_min_i32" => format!("asuint(min(asint({a}), asint({b})))"),
             "v_max_i32" => format!("asuint(max(asint({a}), asint({b})))"),
-            "v_mul_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu))"),
-            "v_mul_i32_i24" => format!("asuint((asint({a} << 8) >> 8) * (asint({b} << 8) >> 8))"),
             "v_mul_lo_u32" => format!("({a} * {b})"),
             // Count the mask bits below this lane in the selected 32-bit word.
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
@@ -7117,8 +7709,6 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 format!("({b} + t{t})")
             }
             "v_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
-            "v_mul_hi_u32_u24" => format!("tb_mulhi_u32({a} & 0xffffffu, {b} & 0xffffffu)"),
-            "v_mul_hi_i32_i24" => format!("tb_mulhi_i32(asuint(asint({a} << 8) >> 8), asuint(asint({b} << 8) >> 8))"),
             // Leading bits equal to the sign bit, from the MSB; -1 when all bits are equal.
             "v_ffbh_i32" => format!("(((asint({a}) < 0) ? ~({a}) : ({a})) == 0u ? 0xffffffffu : (31u - firstbithigh((asint({a}) < 0) ? ~({a}) : ({a}))))"),
             // {S0:S1} >> (8 * S2[1:0]), low 32 bits.
@@ -7159,14 +7749,33 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             "v_alignbit_b32" => format!(
                 "((({c}) & 31u) == 0u ? {b} : (({b} >> (({c}) & 31u)) | ({a} << (32u - (({c}) & 31u)))))"
             ),
-            "v_cvt_u32_f32" => format!("(uint)max({}, 0.0)", fa()?),
-            "v_cvt_i32_f32" => format!("asuint((int){})", fa()?),
+            "v_cvt_u32_f32" => format!("tb_cvt_u32_f32({})", fa()?),
+            "v_cvt_i32_f32" => format!("tb_cvt_i32_f32({})", fa()?),
             "v_cvt_flr_i32_f32" => format!("asuint((int)floor({}))", fa()?),
-            "v_cvt_rpi_i32_f32" => format!("asuint((int)floor({} + 0.5))", fa()?),
-            // Round to nearest even. HLSL f32tof16's rounding is the driver's choice
-            // (observed: truncation on the development GPU), so it is not used.
-            "v_cvt_f16_f32" if self.regs.contains("tb_fp_mode") => format!("tb_mode_half({}, tb_fp_mode)", fa()?),
-            "v_cvt_f16_f32" => format!("tb_f16_rne({})", fa()?),
+            "v_cvt_rpi_i32_f32" => {
+                let x = fa()?;
+                let t = self.tmp;
+                self.tmp += 1;
+                // Adding 0.5 first can round an already integral f32 to the next integer.
+                // Start with nearest-even and raise only the ties that rounded down.
+                self.line(&format!("float t{t} = round({x});"));
+                format!("(asuint((int)t{t}) + (uint)(({x} - t{t}) == 0.5))")
+            }
+            "v_cvt_f16_f32" => {
+                let source = Self::select_source(ins, a, 0);
+                let modified = vop3 && (ins.aux.imm != 0 || ins.aux.imm2 != 0);
+                let mode = if self.regs.contains("tb_fp_mode") { "tb_fp_mode" } else { "0xc0u" };
+                let mut bits = if modified || self.regs.contains("tb_fp_mode") {
+                    format!("tb_mode_half(asfloat({source}), {mode})")
+                } else {
+                    format!("tb_f16_rne(asfloat({source}))")
+                };
+                if modified {
+                    let scale = ["1.0", "2.0", "4.0", "0.5"][ins.aux.imm2 as usize];
+                    bits = format!("tb_half_output({bits}, {mode}, {scale}, {})", ins.aux.imm != 0);
+                }
+                format!("(({dn} & 0xffff0000u) | {bits})")
+            }
             // Round toward zero (ISA: "ignore the current rounding mode"): finite values never
             // become infinity (|x| >= 65504 gives 65504).
             "v_cvt_pkrtz_f16_f32" => format!("(tb_f16_rtz({}) | (tb_f16_rtz({}) << 16))", fa()?, fb()?),
@@ -7175,7 +7784,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             "v_sat_pk_u8_i16" => format!(
                 "((uint)clamp(asint({a} << 16) >> 16, 0, 255) | ((uint)clamp(asint({a}) >> 16, 0, 255) << 8))"
             ),
-            _ => return Err("unsupported vector op".into()),
+            op => mul24_expr(op, &a, &b).ok_or("unsupported vector op")?,
         };
         self.wv(&d, &e)
     }
@@ -9231,7 +9840,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             if self.page_waves || self.wave_cull {
                 writeln!(h, "    uint tb_wave_tid = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
-            if self.compute_swizzle || self.indexed_lane || self.single_wave32 {
+            let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
+            if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp {
                 writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             if self.resolve_wave32 {
@@ -9648,7 +10258,10 @@ fn pixel_heap_base(ex: &ShaderExtract, class: u32) -> Option<u8> {
         return None;
     }
     if let Some(root) = ex.root_sig.as_ref() {
-        if class != 5 || root.flags & 0x400 == 0 || sampler_heap::resource_base(ex).is_some() {
+        // Class 5 needs CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400), class 6
+        // SAMPLER_HEAP_DIRECTLY_INDEXED (0x800).
+        let indexed = match class { 5 => root.flags & 0x400 != 0, 6 => root.flags & 0x800 != 0, _ => false };
+        if !indexed || sampler_heap::resource_base(ex).is_some() {
             return None;
         }
     }
@@ -9686,6 +10299,255 @@ fn compute_heap_base(ex: &ShaderExtract) -> Option<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn vector_add_sub_can_discard_the_carry_destination() {
+        use super::float64::tests::translate;
+
+        // gfx1030 VOP3B add, sub and subrev with SDST=null; the _ci_ forms read VCC.
+        for (opcode, sources) in [
+            (0xd70f_7d04, 0x0002_0501), (0xd710_7d04, 0x0002_0501),
+            (0xd719_7d04, 0x0002_0501), (0xd528_7d04, 0x01aa_0501),
+            (0xd529_7d04, 0x01aa_0501), (0xd52a_7d04, 0x01aa_0501),
+        ] {
+            let hlsl = translate(Stage::Compute, &[opcode, sources]).unwrap();
+            assert!(hlsl.contains("v4 = t"), "{hlsl}");
+            assert!(!hlsl.lines().any(|line| {
+                let stmt = line.trim_start();
+                stmt.starts_with("vcc_lo =") || stmt.starts_with("vcc_hi =") || stmt.starts_with("nul =")
+            }), "{hlsl}");
+            assert!(translate(Stage::Compute, &[opcode, sources | (1 << 29)]).is_err());
+        }
+    }
+
+    #[test]
+    fn vector_carry_clamp_saturates_the_result_and_keeps_the_overflow_flag() {
+        use super::float64::tests::translate;
+
+        for (opcode, limit) in [(0xd70f_ea04, "0xffffffffu"), (0xd710_ea04, "0u")] {
+            // gfx1030: v_{add,sub}_co_u32 v4, vcc_lo, v1, v2 clamp
+            let hlsl = translate(Stage::Compute, &[opcode, 0x0002_0501]).unwrap();
+            assert!(hlsl.contains(&format!("if (t0o != 0u) t0 = {limit};")), "{hlsl}");
+            assert!(hlsl.lines().any(|line| line.trim_start().starts_with("vcc_lo =") && line.contains("t0o")));
+        }
+
+        // In e32 the same bit belongs to the source register v66.
+        let hlsl = translate(Stage::Compute, &[0x5008_8501]).unwrap();
+        assert!(!hlsl.contains("if (t0o != 0u)"), "{hlsl}");
+    }
+
+    #[test]
+    fn unsigned_no_carry_clamp_is_specific_to_the_long_encoding() {
+        use super::float64::tests::translate;
+        // LLVM gfx1030: v_{add,sub,subrev}_nc_u32_e64 v4, v1, v2 clamp.
+        for (opcode, saturated, wrapping) in [
+            (0xd525_8004, "(min(v1, ~v2) + v2)", "(v1 + v2)"),
+            (0xd526_8004, "(max(v1, v2) - v2)", "(v1 - v2)"),
+            (0xd527_8004, "(max(v2, v1) - v1)", "(v2 - v1)"),
+        ] {
+            let hlsl = translate(Stage::Compute, &[opcode, 0x0002_0501]).unwrap();
+            assert!(hlsl.contains(saturated), "{hlsl}");
+            let hlsl = translate(Stage::Compute, &[opcode & !0x8000, 0x0002_0501]).unwrap();
+            assert!(hlsl.contains(wrapping), "{hlsl}");
+        }
+        // In e32 the same bit is part of the second source register (v66).
+        assert!(translate(Stage::Compute, &[0x4a08_8501]).unwrap().contains("(v1 + v66)"));
+    }
+
+    #[test]
+    fn mul24_clamps_the_full_product_plus_accumulator_before_packing() {
+        for (words, args) in [
+            ([0xd50b_8004, 0x0002_0501], "v1, v2, 0u, false"), // unsigned MUL
+            ([0xd542_8004, 0x040e_0501], "v1, v2, v3, true"), // signed MAD
+            ([0xd543_8004, 0x040e_0501], "v1, v2, v3, false"), // unsigned MAD
+            ([0x1208_04f9, 0x0606_3201], "v1, v2, 0u, true"), // signed MUL, BYTE_2
+        ] {
+            let shader = translate_valu_probe(&words, 5).unwrap();
+            assert!(shader.contains(&format!("= tb_mad24_sat({args});")));
+            if words[0] == 0x1208_04f9 {
+                assert!(shader.contains("0xff00ffffu"));
+            }
+        }
+        let ordinary = translate_valu_probe(&[0xd50b_0004, 0x0002_0501], 5).unwrap();
+        assert!(!ordinary.contains("tb_mad24_sat"));
+        // Integer products have no floating output scale; SDWA DST_UNUSED=3 is reserved.
+        for words in [
+            [0xd50b_8004, 0x0802_0501],
+            [0x1208_04f9, 0x0606_7201],
+            [0x1208_04f9, 0x0606_3a01],
+        ] {
+            assert!(translate_valu_probe(&words, 5).is_err());
+        }
+    }
+
+    #[test]
+    fn half_rounding_reads_the_entry_destination_and_obeys_fp_mode() {
+        // s_denorm_mode 4; v_floor_f16_e64 v6,-|v1| mul:2
+        let hlsl = float64::tests::translate(
+            Stage::Compute, &[0xbfa5_0004, 0xd5db_0106, 0x2800_0101],
+        ).unwrap();
+        assert!(hlsl.lines().next().unwrap().split_whitespace().any(|word| word == "v6"));
+        let write = hlsl.lines().find(|line| line.contains("v6 & 0xffff0000u")).unwrap();
+        assert!(write.contains("tb_unary_f16(") && write.contains("tb_fp_mode, 0u)"));
+        assert!(write.contains("tb_half_output(tb_unary_f16(") && write.contains("tb_fp_mode, 2.0, false"));
+    }
+
+    #[test]
+    fn half_conversion_only_reads_destination_for_partial_writes() {
+        // Both directions, signed and unsigned: convert v1.h into v6.h.
+        for opcode in [0x7e0c_a0f9, 0x7e0c_a2f9, 0x7e0c_a4f9, 0x7e0c_a6f9, 0x7e0c_c6f9, 0x7e0c_c8f9] {
+            for (extension, preserve) in [(0x51501, true), (0x50501, false), (0x50d01, false), (0x51601, false)] {
+                let hlsl = float64::tests::translate(Stage::Compute, &[opcode, extension]).unwrap();
+                let inputs = hlsl.lines().next().unwrap();
+                assert_eq!(inputs.split_whitespace().any(|word| word == "v6"), preserve);
+            }
+        }
+    }
+
+    #[test]
+    fn fract_f16_applies_the_mode_and_modifiers_to_the_low_half() {
+        // s_denorm_mode 4; v_fract_f16_e64 v4,-|v1| mul:2 (gfx1030).
+        let hlsl = float64::tests::translate(
+            Stage::Compute, &[0xbfa5_0004, 0xd5df_0104, 0x2800_0101],
+        ).unwrap();
+        assert!(hlsl.contains("v4 & 0xffff0000u"));
+        assert!(hlsl.contains("tb_fp_mode, 4u), tb_fp_mode, 2.0, false)"));
+        // An unwritten v6 supplies the high half through the entry ABI.
+        let first_write = float64::tests::translate(Stage::Compute, &[0x7e0c_bf04]).unwrap();
+        assert!(first_write.lines().next().unwrap().split_whitespace().any(|word| word == "v6"));
+    }
+
+    #[test]
+    fn fract_f32_uses_the_guest_denormal_mode() {
+        // gfx1030: v_fract_f32 v8, v4, optionally preceded by s_denorm_mode 3.
+        let fract = 0x7e10_4104;
+        for (code, mode) in [(vec![fract], "0u"), (vec![0xbfa5_0003, fract], "tb_fp_mode")] {
+            let hlsl = float64::tests::translate(Stage::Compute, &code).unwrap();
+            assert!(hlsl.contains(&format!("tb_fract_f32(asfloat(v4), {mode})")));
+            assert!(hlsl.contains("float tb_fract_f32("));
+        }
+    }
+
+    #[test]
+    fn conversion_overflow_bit_can_be_set_cleared_and_read() {
+        // MODE[23] is FP16_OVFL. Reads including reserved bits remain unsupported.
+        let get = 0xb91a_05c1;
+        let hlsl = float64::tests::translate(Stage::Compute, &[
+            0xba80_05c1, 1, get, 0xba80_05c1, 0, get,
+        ]).unwrap();
+        assert!(hlsl.contains("((tb_fp_mode >> 23) & 0x1u)"));
+        assert!(hlsl.contains("((0x1u & 0x1u) << 23)") && hlsl.contains("((0x0u & 0x1u) << 23)"));
+        assert!(float64::tests::translate(Stage::Compute, &[get | (1 << 11)]).is_err());
+    }
+
+    #[test]
+    fn single_to_half_reads_the_old_destination_only_for_partial_writes() {
+        // v_cvt_f16_f32 v6,v1 and SDWA with DWORD source.
+        for (words, preserves) in [
+            (vec![0x7e0c_1501], true),
+            (vec![0x7e0c_14f9, 0x0006_1501], true),  // WORD_1, PRESERVE
+            (vec![0x7e0c_14f9, 0x0006_0501], false), // WORD_1, PAD
+            (vec![0x7e0c_14f9, 0x0006_1601], false), // DWORD
+        ] {
+            let hlsl = float64::tests::translate(Stage::Compute, &words).unwrap();
+            let incoming = hlsl.lines().next().unwrap().split_whitespace().any(|word| word == "v6");
+            assert_eq!(incoming, preserves);
+        }
+    }
+
+    #[test]
+    fn reads_all_mode_fields_through_ieee() {
+        // s_getreg_b32 s26, hwreg(MODE, shift, width).
+        for shift in 0..10 {
+            for width in 1..=10 - shift {
+                let get = 0xb91a_0001 | (shift << 6) | ((width - 1) << 11);
+                let hlsl = float64::tests::translate(Stage::Compute, &[get]).unwrap();
+                let mask = (1u32 << width) - 1;
+                assert!(hlsl.contains(&format!("((tb_fp_mode >> {shift}) & {mask:#x}u)")));
+            }
+        }
+        // LOD_CLAMPED (bit 10) is updated by texture instructions.
+        for get in [0xb91a_0281, 0xb91a_0a41] {
+            assert!(float64::tests::translate(Stage::Compute, &[get]).is_err());
+        }
+    }
+
+    #[test]
+    fn wide_mode_writes_update_readable_bits() {
+        // Write MODE[9:0] from s5, overwrite MODE[10:6] with 9, read bit 8.
+        let hlsl = float64::tests::translate(Stage::Compute,
+            &[0xb985_4801, 0xba80_2181, 9, 0xb91a_0201]).unwrap();
+        assert!(hlsl.lines().next().unwrap().split_whitespace().any(|reg| reg == "s5"));
+        assert!(hlsl.contains("((s5 & 0x3ffu) << 0)"));
+        assert!(hlsl.contains("((0x9u & 0xfu) << 6)"));
+        // The immediate form's encoding has a zero in the SGPR field, but
+        // leaves the entry value of s0 available to the following v_mov.
+        let hlsl = float64::tests::translate(Stage::Compute,
+            &[0xba80_2181, 9, 0x7e08_0200]).unwrap();
+        assert!(hlsl.lines().next().unwrap().split_whitespace().any(|reg| reg == "s0"));
+    }
+
+    #[test]
+    fn sdwa_f32_applies_modifiers_before_preserving_unselected_bits() {
+        use super::float64::tests::translate;
+        // gfx1030: v_add_f32_sdwa v4, -|v1|, v2 clamp mul:2 dst_sel:WORD_1
+        // dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD
+        let hlsl = translate(Stage::Compute, &[0x0608_04f9, 0x0636_7501]).unwrap();
+        assert!(hlsl.contains("saturate((((-abs(asfloat(v1))) + asfloat(v2)) * 2.0))"), "{hlsl}");
+        assert!(hlsl.contains("(v4) & 0xffffu"), "{hlsl}");
+    }
+
+    #[test]
+    fn sdwa_f32_scales_a_full_word_without_source_modifiers() {
+        use super::float64::tests::translate;
+        // gfx1030: v_mul_f32_sdwa v4, v1, v2 div:2 (all selectors DWORD).
+        let hlsl = translate(Stage::Compute, &[0x1008_04f9, 0x0606_d601]).unwrap();
+        assert!(hlsl.contains("v4 = asuint(((asfloat(v1) * asfloat(v2)) * 0.5))"), "{hlsl}");
+    }
+
+    #[test]
+    fn sdwa_f32_rounding_applies_input_and_output_modifiers() {
+        use super::float64::tests::translate;
+        // gfx1030: v_<op>_f32_sdwa v4, -|v1| mul:2, both selectors DWORD.
+        for (opcode, intrinsic) in [
+            (0x7e08_40f9, "tb_fract_f32"), (0x7e08_42f9, "trunc"), (0x7e08_44f9, "ceil"),
+            (0x7e08_46f9, "round"), (0x7e08_48f9, "floor"),
+        ] {
+            let hlsl = translate(Stage::Compute, &[opcode, 0x0036_5601]).unwrap();
+            let mode = if intrinsic == "tb_fract_f32" { ", 0u" } else { "" };
+            let result = format!("asuint((({intrinsic}((-abs(asfloat(v1))){mode})) * 2.0))");
+            assert!(hlsl.contains(&result), "{hlsl}");
+        }
+    }
+
+    #[test]
+    fn sdwa_integer_to_float_has_float_output_and_integer_input_modifiers() {
+        use super::float64::tests::translate;
+        // gfx1030: signed/unsigned dword, signed nibble offset, then unsigned bytes 0..3.
+        // Each writes v4 from v1 with clamp mul:4 and both selectors DWORD.
+        let sdwa = 0x0006_b601;
+        for opcode in [0x7e08_0af9, 0x7e08_0cf9, 0x7e08_1cf9, 0x7e08_22f9,
+                       0x7e08_24f9, 0x7e08_26f9, 0x7e08_28f9] {
+            let hlsl = translate(Stage::Compute, &[opcode, sdwa]).unwrap();
+            assert!(hlsl.lines().any(|line| line.contains("v4 = asuint(saturate(")
+                && line.ends_with(" * 4.0)));")), "{hlsl}");
+            // SRC0_NEG is invalid for an integer input.
+            let error = translate(Stage::Compute, &[opcode, sdwa | (1 << 20)]).unwrap_err();
+            assert!(error.contains("unsupported SDWA neg/abs"), "{error}");
+        }
+    }
+
+    #[test]
+    fn widen_f16_reads_a_half_precision_source_before_applying_modifiers() {
+        use super::float64::tests::translate;
+        // gfx1030: v_cvt_f32_f16_e32 v4, 1/(2*pi) (inline selector 248).
+        let hlsl = translate(Stage::Compute, &[0x7e08_16f8]).unwrap();
+        assert!(hlsl.contains("asfloat(0x3e230000u)"), "{hlsl}");
+        // v_cvt_f32_f16_sdwa v4, -|v1| clamp mul:2 dst_sel:DWORD src0_sel:WORD_1
+        let hlsl = translate(Stage::Compute, &[0x7e08_16f9, 0x0035_7601]).unwrap();
+        assert!(hlsl.contains("((v1 >> 16) & 0xffffu)"), "{hlsl}");
+        assert!(hlsl.contains("saturate((((-abs(f16tof32("), "{hlsl}");
+    }
+
     fn dpp16_word(src0_reg: u32, ctrl: u32, fi: u32, bc: u32, bank_m: u32, row_m: u32) -> u32 {
         // [src0_reg:8][ctrl:9][fi:1][bc:1][bank_m:4][row_m:4]
         src0_reg | (ctrl << 8) | (fi << 18) | (bc << 19) | (bank_m << 24) | (row_m << 28)
@@ -9706,12 +10568,15 @@ mod tests {
     }
 
     #[test]
-    fn dpp16_row_mirror_fi0_is_accepted_as_row_mirror_move() {
-        let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x140, 0, 1, 0xf, 0xf))];
-        lower_wave_reductions(&mut insns).expect("row_mirror accepted");
-        assert_eq!(insns[0].op, OP_ROW_MIRROR);
-        assert_eq!(insns[0].src, vec![Opnd::Vgpr(2)]);
-        assert_eq!(insns[0].aux.imm, 0);
+    fn dpp16_row_moves_select_the_source_lane_by_xor() {
+        let mirrors = [(0x141, 7), (0x140, 15)];
+        for (ctrl, mask) in mirrors.into_iter().chain((0..16).map(|mask| (0x160 + mask, mask))) {
+            let mut insns = [dpp16_move_insn(dpp16_word(2, ctrl, 0, 1, 0xf, 0xf))];
+            lower_wave_reductions(&mut insns).unwrap();
+            assert_eq!(insns[0].op, OP_ROW_XOR_MOVE);
+            assert_eq!(insns[0].src, [Opnd::Vgpr(2)]);
+            assert_eq!(insns[0].aux.imm, i64::from(mask));
+        }
     }
 
     #[test]
@@ -9724,17 +10589,9 @@ mod tests {
     }
 
     #[test]
-    fn dpp16_row_mirror_with_fi1_is_refused() {
-        // row_mirror with FI=1 reads the pre-existing value; not the accepted shape.
-        let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x140, 1, 1, 0xf, 0xf))];
-        let err = lower_wave_reductions(&mut insns).expect_err("refused");
-        assert!(err.contains("unsupported DPP16 move"));
-    }
-
-    #[test]
     fn dpp16_unimplemented_control_is_refused() {
-        // row_half_mirror, and quad_perm with a negation modifier.
-        let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x141, 0, 1, 0xf, 0xf))];
+        // Zero is outside the row_ror range. Quad moves with negation are also unsupported.
+        let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x120, 0, 1, 0xf, 0xf))];
         assert!(lower_wave_reductions(&mut insns).is_err());
         let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x0, 1, 1, 0xf, 0xf) | (1u32 << 20))];
         assert!(lower_wave_reductions(&mut insns).is_err());
@@ -10206,20 +11063,50 @@ mod election_order_regression {
         Insn { offset, dwords: 1, enc, op: 0, raw: vec![0], mnemonic: name.into(), dst, src, aux: Default::default() }
     }
     #[test]
+    fn election_ignores_independent_single_word_moves() {
+        let mut ops = vec![
+            op("v_mbcnt_lo_u32_b32", Enc::Vop3, vec![Opnd::Vgpr(2)], vec![Opnd::ConstInt(-1), Opnd::ConstInt(0)], 0),
+            op("s_ff1_i32_b32", Enc::Sop1, vec![Opnd::Sgpr(7)], vec![Opnd::ExecLo], 4),
+            op("s_mov_b32", Enc::Sop1, vec![Opnd::Sgpr(8)], vec![Opnd::Sgpr(6)], 8),
+            op("v_cmp_eq_u32", Enc::Vop3, vec![Opnd::VccLo], vec![Opnd::Vgpr(2), Opnd::Sgpr(7)], 12),
+        ];
+        assert!(verify_lane_election(&mut ops, 1, true).is_ok());
+        ops[2].mnemonic = "s_mov_b64".into(); // s[6:7] reads the elected lane.
+        assert!(verify_lane_election(&mut ops, 1, true).is_err());
+        ops[2].mnemonic = "s_mov_b32".into();
+        ops[2].dst = vec![Opnd::Sgpr(7)];
+        assert!(verify_lane_election(&mut ops, 1, true).is_err());
+    }
+
+    #[test]
+    fn later_saveexec_uses_the_redefined_vcc() {
+        let mut ops = vec![
+            op("v_mbcnt_lo_u32_b32", Enc::Vop3, vec![Opnd::Vgpr(2)], vec![Opnd::ConstInt(-1), Opnd::ConstInt(0)], 0),
+            op("s_ff1_i32_b32", Enc::Sop1, vec![Opnd::Sgpr(7)], vec![Opnd::ExecLo], 4),
+            op("v_cmp_eq_u32", Enc::Vopc, vec![Opnd::VccLo], vec![Opnd::Sgpr(7), Opnd::Vgpr(2)], 8),
+            op("v_cmp_eq_u32", Enc::Vopc, vec![Opnd::VccLo], vec![Opnd::ConstInt(0), Opnd::Vgpr(4)], 12),
+            op("s_and_saveexec_b32", Enc::Sop1, vec![Opnd::Sgpr(20)], vec![Opnd::VccLo], 16),
+        ];
+        assert!(verify_lane_election(&mut ops, 1, true).is_ok());
+        ops.remove(3);
+        assert!(verify_lane_election(&mut ops, 1, true).is_err());
+    }
+
+    #[test]
     fn symmetric_equality_still_requires_full_lane_count() {
         let mut ops = vec![
             op("v_mbcnt_lo_u32_b32", Enc::Vop3, vec![Opnd::Vgpr(2)], vec![Opnd::ConstInt(-1), Opnd::ConstInt(0)], 0),
             op("s_ff1_i32_b32", Enc::Sop1, vec![Opnd::Sgpr(7)], vec![Opnd::ExecLo], 4),
             op("v_cmp_eq_u32", Enc::Vop3, vec![Opnd::VccLo], vec![Opnd::Vgpr(2), Opnd::Sgpr(7)], 8),
         ];
-        assert!(verify_lane_election(&mut ops, 1).is_ok());
+        assert!(verify_lane_election(&mut ops, 1, true).is_ok());
         ops[2].src.swap(0, 1);
-        assert!(verify_lane_election(&mut ops, 1).is_ok());
+        assert!(verify_lane_election(&mut ops, 1, true).is_ok());
         ops[2].mnemonic = "v_cmp_ne_u32".into();
-        assert!(verify_lane_election(&mut ops, 1).is_err());
+        assert!(verify_lane_election(&mut ops, 1, true).is_err());
         ops[2].mnemonic = "v_cmp_eq_u32".into();
         ops[0].src[0] = Opnd::ConstInt(0);
-        assert!(verify_lane_election(&mut ops, 1).is_err());
+        assert!(verify_lane_election(&mut ops, 1, true).is_err());
     }
 }
 
@@ -10278,6 +11165,35 @@ mod reduction_execz_regression {
             let error = translate(&shader).err().expect("bypassed wave vote refused");
             assert!(error.contains("divergent control flow"), "{error}");
         }
+    }
+
+    #[test]
+    fn dispatched_lanes_wait_for_their_wave_at_a_barrier() {
+        let op = |offset, op, mnemonic: &str, imm| Insn {
+            offset, dwords: 1, enc: Enc::Sopp, op, raw: vec![0xbf80_0000 | op << 16], mnemonic: mnemonic.into(),
+            dst: Vec::new(), src: Vec::new(), aux: tuxbox_dxbc::rdna2::InsnAux { imm, ..Default::default() },
+        };
+        let emit = |barrier: bool| {
+            let shader = guarded_shader(32, &[]);
+            // A lane leaves the loop at its first EXECZ and may reach the barrier before the others.
+            let mut emitter = Emitter::new(&shader, vec![
+                op(0, 8, "s_cbranch_execz", 1),
+                op(4, 2, "s_branch", -2),
+                if barrier { op(8, 0x0a, "s_barrier", 0) } else { op(8, 0, "s_nop", 0) },
+                op(12, 1, "s_endpgm", 0),
+            ]);
+            emitter.emit_body_dispatch(false, 0).unwrap();
+            emitter.body
+        };
+        let body = emit(true);
+        assert!(body.contains("bool tb_wait = tb_pc == 2u;"), "{body}");
+        let block = body.find("if (tb_sel == 2u) {").expect("the barrier starts a block");
+        let wait = body.find("WaveActiveAnyTrue(!tb_wait)").expect("waits for its wave");
+        let sync = body.find("GroupMemoryBarrierWithGroupSync();").unwrap();
+        assert!(wait < block && block < sync, "{body}");
+        assert!(body.contains("uint tb_sel = tb_wait ? 0xfffffffeu : tb_pc;"), "{body}");
+        let body = emit(false);
+        assert!(!body.contains("tb_wait") && body.contains("uint tb_sel = tb_pc;"), "{body}");
     }
 
     #[test]

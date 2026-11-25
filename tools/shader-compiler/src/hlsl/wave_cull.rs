@@ -216,7 +216,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, i: &Insn, target: Option<us
             }
         }
         "v_readfirstlane_b32" => {
-            if !em.hoist_wave_exchanges { em.line(&first_read(idx, i, false)?); }
+            if !em.hoist_wave_exchanges { em.line(&first_read(idx, i)?); }
             em.ws(&i.dst[0], &format!("first_value{idx}"))?;
         }
         "s_mov_b32" if matches!(i.dst.first(), Some(Opnd::ExecLo | Opnd::ExecHi)) => {
@@ -254,20 +254,17 @@ pub(super) fn exchange(idx: usize, i: &Insn, mesh: bool) -> Result<Option<String
         "s_cbranch_vccnz" | "s_cbranch_vccz" if i.op == 7 || mesh =>
             Ok(Some(format!("uint2 page_vcc{idx} = tb_page_ballot(tb_wave_tid, (vcc_lo & 1u) != 0u);"))),
         "v_permlanex16_b32" => Ok(Some(cross_row(idx, i)?)),
-        "v_readfirstlane_b32" => Ok(Some(first_read(idx, i, mesh)?)),
+        "v_readfirstlane_b32" => Ok(Some(first_read(idx, i)?)),
         "v_add_nc_u32" | "v_max_u32" | "v_add_f32" if matches!(i.src.first(), Some(Opnd::Raw(233 | 250))) => Ok(Some(dpp_read(idx, i)?.0)),
         _ => super::page_waves::rendezvous(idx, i),
     }
 }
 
-fn first_read(idx: usize, i: &Insn, empty_mask_reads_lane_zero: bool) -> Result<String, String> {
+fn first_read(idx: usize, i: &Insn) -> Result<String, String> {
     let value = r(&i.src[0])?;
-    let upper = format!("32u + uint(firstbitlow(first_mask{idx}.y))");
-    let upper = if empty_mask_reads_lane_zero {
-        format!("first_mask{idx}.y != 0u ? {upper} : 0u")
-    } else { upper };
+    // RDNA2 selects lane zero when EXEC is empty, even for a scalar write in compute.
     Ok(format!("uint2 first_mask{idx} = tb_page_ballot(tb_wave_tid, (exec_lo & 1u) != 0u);
-uint first_lane{idx} = first_mask{idx}.x != 0u ? uint(firstbitlow(first_mask{idx}.x)) : {upper};
+uint first_lane{idx} = first_mask{idx}.x != 0u ? uint(firstbitlow(first_mask{idx}.x)) : first_mask{idx}.y != 0u ? 32u + uint(firstbitlow(first_mask{idx}.y)) : 0u;
 uint first_value{idx} = tb_page_read(tb_wave_tid, {value}, first_lane{idx});"))
 }
 
@@ -297,4 +294,19 @@ fn dpp_read(idx: usize, i: &Insn) -> Result<(String, String), String> {
         _ => return Err("unrecognized cull DPP control".into()),
     };
     Ok((format!("uint shifted{idx} = tb_page_read(tb_wave_tid, {src}, {lane});"), valid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readfirstlane_selects_lane_zero_when_both_exec_words_are_empty() {
+        // v_readfirstlane_b32 s28, v9
+        let ops = crate::rdna2::disassemble(&0x7e38_0509u32.to_le_bytes());
+        for mesh in [false, true] {
+            let code = exchange(0, &ops[0], mesh).unwrap().unwrap();
+            assert!(code.contains("first_mask0.y != 0u ? 32u + uint(firstbitlow(first_mask0.y)) : 0u"), "{code}");
+        }
+    }
 }

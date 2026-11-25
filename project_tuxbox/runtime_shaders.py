@@ -1,5 +1,5 @@
 """Compile Xbox shaders and link raster stages requested by a running Proton game."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from .prefix_paths import runtime_prefix
 import errno
@@ -17,6 +17,7 @@ from time import monotonic, sleep
 
 from .dxil_store import DxilStore, write_identity
 from .inspect import digest
+from .persistent_dxc import PersistentDxc
 from .shader_diagnostics import refusal_line
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 
@@ -282,7 +283,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     return validated_dxil(dxv, output, stage)
 
 
-def compile_request(source, key, tools, cache, session, *, remember=None):
+def compile_request(source, key, tools, cache, session, *, remember=None, persistent=None):
     linked = source.suffix == ".link"
     xshader, dxc, dxv = tools
     with TemporaryDirectory(dir=cache) as tmp:
@@ -389,7 +390,17 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
             data = bounded_shader(output) if store and store.fetch(content, output) else None
             if data is None or portable_stage(data) != target_stage:
                 output.unlink(missing_ok=True)
-                data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
+                data = None
+                if (persistent is not None and target == "cs_6_0"
+                        and not (store and store.is_slow(key, target))
+                        and persistent.compile(dxc, hlsl, output)):
+                    try:
+                        data = validated_dxil(dxv, output, target_stage)
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
+                        output.unlink(missing_ok=True)
+                if data is None:
+                    data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
                 if store:
                     store.save(content, output)
             stamp = work / "sha256"
@@ -413,11 +424,21 @@ def remove_request(path):
         path.unlink(missing_ok=True)
 
 
-def serve(session, stop, report, archive=None, jobs=1):
+def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
     with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as wait:
-        _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs)
+        pinned = None
+        if dxc_helper:
+            try:
+                helper = Path(tmp) / "dxc-worker"
+                shutil.copyfile(Path(dxc_helper).expanduser(), helper)
+                helper.chmod(0o700)
+                pinned = helper
+            except OSError as error:
+                report(f"Could not stage persistent DXC, using the CLI: {error}")
+        with PersistentDxc(pinned, jobs, report) if pinned else nullcontext() as persistent:
+            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent)
 
 
 @contextmanager
@@ -460,13 +481,18 @@ TRANSLATOR_CACHE_VERSION = ("tuxbox-xshader-output-unoptimised"
                         else "tuxbox-xshader-output-2")
 
 
-def snapshot_compiler_cache(xshader, cache_root):
+def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     """Pin the executable used for all requests under this toolchain fingerprint."""
     compiler, dxc, dxv = compiler_tools()
     shutil.copyfile(compiler, xshader)
     xshader.chmod(0o700)
     tools = (xshader, dxc, dxv)
     version = subprocess.check_output([dxc, "--version"], timeout=10)
+    # A persistent-DXC helper changes the DXIL that comes back, so its identity
+    # belongs in the fingerprint even though the executables do not: hashing the
+    # binaries made every rebuild start from an empty cache directory.
+    if dxc_helper is not None:
+        version += b"\npersistent-dxc:" + digest(dxc_helper).encode("ascii")
     fingerprint = hashlib.sha256(TRANSLATOR_CACHE_VERSION.encode())
     fingerprint.update(version)
     cache = cache_root / "runtime" / fingerprint.hexdigest()
@@ -555,9 +581,10 @@ def ordered_requests(directory):
     return [source for _, _, source in sorted(entries)]
 
 
-def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1):
+def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, persistent=None):
     def bind_cache():
-        tools, cache = snapshot_compiler_cache(xshader, session.parent)
+        options = {"dxc_helper": persistent.helper} if persistent is not None else {}
+        tools, cache = snapshot_compiler_cache(xshader, session.parent, **options)
         # Publish only after the exact compiler used by this worker is pinned.
         pending = session / "compiler-id.tmp"
         pending.write_text(cache.name, encoding="ascii")
@@ -588,9 +615,10 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1):
     def compile_one(source, key, bound_tools, bound_cache):
         # Only this job owns the source. Archive publication is separately
         # serialized; compiler temporary directories are private per request.
-        if record_requests:
-            return compile_request(source, key, bound_tools, bound_cache, session, remember=remember)
-        return compile_request(source, key, bound_tools, bound_cache, session)
+        options = {"remember": remember} if record_requests else {}
+        if persistent is not None:
+            options["persistent"] = persistent
+        return compile_request(source, key, bound_tools, bound_cache, session, **options)
 
     def complete(source, key, future=None, error=None):
         nonlocal refused, cached_refusals
@@ -692,8 +720,10 @@ def shader_session(cache, env, report, *, archive=None):
         (session / "requests").mkdir()
         env["TUXBOX_SHADER_SESSION"] = session.name
         stop = Event()
+        helper = env.get("TUXBOX_PERSISTENT_DXC")
+        options = {"dxc_helper": helper} if helper else {}
         worker = Thread(target=serve, args=(session, stop, report, archive, runtime_jobs(env, report)),
-                        name="shader-compiler", daemon=True)
+                        kwargs=options, name="shader-compiler", daemon=True)
         worker.start()
         try:
             yield

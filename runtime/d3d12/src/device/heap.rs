@@ -878,9 +878,9 @@ pub(super) unsafe extern "system" fn committed_layout(
     let packed = super::allocation::packed_uav_formats(desc.Format, desc.Flags);
     let castable = if count == 0 { (!packed.is_empty()).then_some(packed) }
         else { Some(unsafe { std::slice::from_raw_parts(formats, count as usize) }) };
-    // Only the format translation applies here; a float depth plane with a
-    // writable companion is not created through this entry point.
-    let translated = super::depth::primary(desc).filter(|_| !super::depth::paired(desc));
+    // A float depth plane with a writable companion is not created through this entry point.
+    let paired = super::depth::paired(desc);
+    let translated = super::depth::primary(desc).filter(|_| !paired || desc.Format == super::format::D16_UNORM_S8_UINT);
     let initial = super::format::host_initial_layout(desc, initial);
     let host_clear = super::format::host_clear(clear);
     let clear = host_clear.as_ref().map_or(clear, core::ptr::from_ref);
@@ -920,6 +920,11 @@ pub(super) unsafe extern "system" fn committed_layout(
             "display surface res={:#x} at {:#x}+{:#x}", native.as_raw() as usize, memory.address, plane.size));
         let address = super::views::TextureAddress::at(device, &native, memory.address, false, Some(memory));
         super::Backing::Addressed(address, *desc)
+    } else if let Some(primary) = translated.as_ref().filter(|_| paired) {
+        match super::depth::Pair::new(&device.native, heap, desc, primary) {
+            Ok(pair) => super::Backing::Depth(Box::new(pair)),
+            Err(error) => return error.code(),
+        }
     } else if translated.is_some() {
         super::Backing::Translated(*desc)
     } else {

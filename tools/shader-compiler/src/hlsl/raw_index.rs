@@ -1,6 +1,12 @@
 //! Proof for indexed reads of a locally constructed linear byte descriptor.
 use crate::rdna2::{Insn, Opnd, clobbers_scalar};
 
+pub(super) fn sets_byte_stride(ins: &Insn, address_high: u8) -> bool {
+    ins.mnemonic == "s_or_b32" && matches!(ins.src.as_slice(),
+        [Opnd::Sgpr(reg), Opnd::Literal(0x10000)] | [Opnd::Literal(0x10000), Opnd::Sgpr(reg)]
+            if *reg == address_high)
+}
+
 /// The existing DirectRaw binding recognizer proves the root SRV. For IDXEN,
 /// additionally require its complete stride-one construction in the same
 /// basic block and no intervening overwrite of any of its four words.
@@ -24,9 +30,8 @@ pub(super) fn local_byte_descriptor(ops: &[Insn], base: u16) -> bool {
         && size.src == [Opnd::ConstInt(-1)]
         && low.mnemonic == "s_mov_b32"
         && low.dst == [Opnd::Sgpr(base)]
-        && high.mnemonic == "s_or_b32"
         && high.dst == [Opnd::Sgpr(base + 1)]
-        && high.src == [Opnd::Sgpr(root + 1), Opnd::Literal(65536)]
+        && sets_byte_stride(high, root + 1)
         && ops[end + 1..].iter().all(|i| {
             !(base..=base+3).any(|reg| clobbers_scalar(i, reg))
         })

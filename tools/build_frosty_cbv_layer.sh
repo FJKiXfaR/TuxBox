@@ -5,11 +5,18 @@ repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 src="$repo/tools/reference/cbv-layer"
 out="${1:-$repo/build/frosty-cbv-layer}"
 include=()
+# Ask the compiler instead of testing /usr/include, so headers it finds through
+# CPATH or a toolchain wrapper (NixOS, Guix, a custom prefix) count as installed.
+compiler_finds_headers() {
+    printf '#include <vulkan/vk_layer.h>\n' | "${CC:-cc}" -E -x c - >/dev/null 2>&1
+}
 if [[ -n "${VULKAN_HEADERS_INCLUDE:-}" ]]; then
     include=(-I "$VULKAN_HEADERS_INCLUDE")
-elif [[ ! -f /usr/include/vulkan/vk_layer.h && -f "$repo/build/vulkan-headers/usr/include/vulkan/vk_layer.h" ]]; then
+elif compiler_finds_headers; then
+    :
+elif [[ -f "$repo/build/vulkan-headers/usr/include/vulkan/vk_layer.h" ]]; then
     include=(-I "$repo/build/vulkan-headers/usr/include")
-elif [[ ! -f /usr/include/vulkan/vk_layer.h ]]; then
+else
     echo "The TuxBox constant-buffer Vulkan layer needs vulkan/vk_layer.h." \
          "Install the Vulkan headers (vulkan-headers on Arch and Fedora, libvulkan-dev on Debian and Ubuntu)," \
          "or set VULKAN_HEADERS_INCLUDE to a Vulkan-Headers include directory." >&2

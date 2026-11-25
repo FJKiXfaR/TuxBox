@@ -17,7 +17,7 @@ CHECKS = [
     ("launcher: preparation uses the real prefix", "project_tuxbox/scarlett_prep.py", "runtime_prefix(host.env)"),
     ("launcher: live worker uses the real prefix", "project_tuxbox/runtime_shaders.py", "runtime_prefix(env)"),
     ("d3d12: console-native compute guard", "runtime/d3d12/src/device/compute.rs", "host_compatible(bytes)"),
-    ("d3d12: refused translated DXIL list", "runtime/d3d12/src/device/compute.rs", "DRIVER_REFUSED_DXIL"),
+    ("d3d12: learned refused translated DXIL prefixes", "runtime/d3d12/src/device/compute.rs", "DRIVER_REFUSED_PREFIXES"),
     ("d3d12: oversized host code limit", "runtime/d3d12/src/device/compute.rs", "TUXBOX_MAX_HOST_CODE_BYTES"),
     ("d3d12: console-native stream stage guard", "runtime/d3d12/src/device/stream.rs", "console_native_stage"),
     ("d3d12: owned pipeline stream for background compile", "runtime/d3d12/src/device/stream.rs", "OwnedStream"),
@@ -35,6 +35,12 @@ CHECKS = [
     ("d3d12: SSE4a EXTRQ/INSERTQ emulation", "runtime/d3d12/src/sse4a.rs", "INSERTQ"),
     ("gameinput: synthetic pad", "runtime/gameinput/src/sample.rs", "TUXBOX_SYNTH_PAD_A_MS"),
     ("xshader: forced wave32 knob", "tools/shader-compiler/src/hlsl.rs", "XSHADER_FORCE_WAVE32"),
+    ("launcher: refusal retry switch", "project_tuxbox/runtime_shaders.py", "TUXBOX_RETRY_REFUSALS"),
+    ("launcher: cache seeding opt-out", "project_tuxbox/runtime_shaders.py", "TUXBOX_CACHE_NO_SEED"),
+    ("launcher: compile-policy DXIL split", "project_tuxbox/dxil_store.py", "dxil-unoptimised"),
+    ("d3d12: present scans several targets", "runtime/d3d12/src/present.rs", "TUXBOX_SCAN_TARGETS"),
+    ("d3d12: title RVA in diagnostics", "runtime/d3d12/src/survey.rs", "fn title_rva"),
+    ("xgameruntime: API trace switch", "runtime/xgameruntime/src/services.rs", "TUXBOX_TRACE_API"),
 ]
 
 missing = []

@@ -13,6 +13,9 @@ pub(crate) struct ComputeTable {
     pub(crate) lengths: Vec<u32>,
     pub(crate) accessed_views: Vec<(usize, std::ops::Range<u32>)>,
     pub(crate) index_map: Option<IndexMapBinding>,
+    /// LOCAL: appended host parameters that bind the same guest table
+    /// (host index, guest slot), e.g. a pixel-only copy of a mesh-rewritten table.
+    pub(crate) mirrors: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -268,6 +271,7 @@ pub(super) fn reflected(
             lengths: lengths.into(),
             accessed_views,
             index_map,
+            mirrors: Vec::new(),
         })))
     }
 }
@@ -368,6 +372,7 @@ fn append_corroborated_ranges(
             lengths,
             accessed_views,
             index_map: None,
+            mirrors: Vec::new(),
         })))
     }
 }
