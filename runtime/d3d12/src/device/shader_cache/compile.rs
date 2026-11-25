@@ -204,10 +204,15 @@ fn request(
             progress::record(key, Shader::Unsupported);
             return None;
         }
-        // The worker's own budget is 30 s of translation plus up to 90 s of DXC;
-        // waiting less than that turned a compile that was still running into a
-        // missing translation for the rest of the process.
-        if start.elapsed() >= Duration::from_secs(160) {
+        // The worker's own budget is up to 120 s of translation plus up to
+        // 120 s of DXC; waiting less turned a compile that was still running
+        // into a permanently missing translation. `TUXBOX_SHADER_WAIT_SECS`
+        // overrides the wait for experiments.
+        let limit = std::env::var("TUXBOX_SHADER_WAIT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(250, |value| value.max(10));
+        if start.elapsed() >= Duration::from_secs(limit) {
             progress::record(key, Shader::TimedOut);
             return None;
         }

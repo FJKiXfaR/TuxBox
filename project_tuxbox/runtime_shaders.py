@@ -215,7 +215,7 @@ def archive_request(archive, source, inputs):
 # Unoptimised DXC is the last resort for a shader. The largest ProjectScarlett
 # compute program (CS_Emit_Dynamic_Model_Edge, 7,813 instructions) needs
 # about 18 s at -O0, so a 15 s cap refused it on every boot.
-O0_TIMEOUT = 90
+O0_TIMEOUT = 120
 
 
 def validated_dxil(dxv, output, stage):
@@ -332,7 +332,13 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
             if linked:
                 run_tool([dxv, order], timeout=10)
             try:
-                run_tool([xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile], timeout=30)
+                # Large programs take far longer to decode and emit; the fixed
+                # 30 s cap turned them into a refusal while the emitter was
+                # still working.
+                size = cooked.stat().st_size
+                translate_timeout = 30 if size < (128 << 10) else 120
+                run_tool([xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile],
+                         timeout=translate_timeout)
             except ToolFailure as error:
                 # xshader reserves this status for the in-process HLSL emitter. DXC, DXV,
                 # input parsing, tool startup and filesystem failures remain retryable.
