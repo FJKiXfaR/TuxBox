@@ -84,6 +84,42 @@ class DiagnosisTests(unittest.TestCase):
         self.assertEqual(report["sessions"][0]["findings"],[])
         self.assertEqual(report["sessions"][0]["terminal"]["line"],3)
 
+    def test_driver_and_cumulative_counters_are_not_summed(self):
+        k, j = "a"*64, "b"*64
+        s=self.report([
+            D3D+"substituted null compute pipeline for an untranslated shader (8 so far)",
+            D3D+"substituted null compute pipeline for an untranslated shader (16 so far)",
+            D3D+"substituted null compute pipeline for an untranslated shader (4 so far)",
+            D3D+"shader cache skipped 512 requests with known unsupported translations",
+            D3D+"shader cache skipped 1024 requests with known unsupported translations",
+            D3D+f"slot 86 pipeline stage failure #1 0x80070057 linked=false VS={k}(prepared) PS={j}(prepared)",
+            D3D+f"slot 86 pipeline stage failure #2 0x80070057 linked=true VS={k}(prepared) PS={j}(prepared)",
+            "1:warn:vkd3d-proton:vkd3d_try_allocate_device_memory: Failed to allocate 131072 bytes on memory type 10, vr -1.",
+            "2:warn:vkd3d-proton:vkd3d_try_allocate_device_memory: Failed to allocate 131072 bytes on memory type 5, vr -1.",
+            "3:warn:vkd3d-proton:vkd3d_import_host_memory: Failed to import host memory, hr 0x8007000e.",
+            "4:warn:vkd3d-proton:vkd3d_validate_shader_io_signatures: Input signature element COLOR0 not compatible with COLOR0.",
+            "5:warn:vkd3d-proton:vkd3d_compile_shader_stage: Failed to compile shader, vkd3d result -3.",
+            "6:fixme:vkd3d-proton:d3d12_validate_resource_flags: Unknown resource flags 0x300000.",
+            "err:winevulkan:signaller_worker wait timed out with non-empty poll list.",
+            D3D+"recorded DrawIndexedInstanced list=0x1234 indices=30 instances=1"
+        ])["sessions"][0]
+        c=s["runtime_counters"]
+        self.assertEqual(c["null_pipeline_reported_lower_bounds"], {"compute":16})
+        self.assertEqual(c["cached_unsupported_skip_lower_bound"],1024)
+        self.assertEqual(c["sampled_stage_link_status"],{"unlinked":1,"linked":1})
+        self.assertEqual(c["sampled_distinct_stage_pairs"],1)
+        self.assertEqual(sum(row["count"] for row in c["allocation_attempts_by_type_and_result"]),2)
+        self.assertEqual(c["unknown_resource_flag_events"],{"0x300000":1})
+        counts={f["last"]["kind"]:f["count"] for f in s["findings"]}
+        self.assertEqual(counts["device_memory_allocation_failure"],2)
+        self.assertEqual(counts["host_memory_import_failure"],1)
+        self.assertEqual(counts["shader_signature_mismatch"],1)
+        self.assertEqual(counts["driver_shader_compile_failure"],1)
+        self.assertEqual(counts["signaller_timeout"],1)
+        self.assertEqual(s["last_milestone"],"raster_draw")
+        self.assertEqual(s["outcome"],"incomplete_log_no_exit_record")
+        self.assertNotIn(k,json.dumps(s))
+
     def test_link_and_stencil_keys_do_not_collide(self):
         k="a"*64
         s=self.report([STAMP+f"Compiled Xbox shader {k}",

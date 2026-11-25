@@ -28,7 +28,7 @@ MILESTONES = (
     ("first_present", r"^PresentX presented first frame \(\d+x\d+\)"),
     ("first_pipeline_stream", r"^created pipeline from Xbox slot 86 stream"),
     ("page_mapping", r"^CopyPageMappingsBatchX mapped \d+ batches"),
-    ("raster_draw", r"^recorded raster draw "),
+    ("raster_draw", r"^recorded (?:raster draw |DrawIndexedInstanced )"),
 )
 # Do not treat ordinary SEH dispatch, Wine fixme, or shader refusals as fatal.
 FAULTS = (
@@ -56,6 +56,11 @@ GUIDANCE = {
     "unsupported_vtable_slot": "Inspect the guest ABI call site and slot. This survey event is not proof of the final stop.",
     "unhandled_wine_exception": "Inspect the terminal exception and same-thread unwind. A module-relative address requires matching image metadata.",
     "device_loss_report": "Check matching driver/kernel diagnostics from this launch; device loss alone does not identify its cause.",
+    "host_memory_import_failure": "Inspect heap import size, alignment, memory type and adapter budget; an import failure does not prove exhausted VRAM.",
+    "device_memory_allocation_failure": "Compare memory type and requested size against budget at the failure; repeated attempts are not independent allocations.",
+    "shader_signature_mismatch": "Compare producer and consumer signatures and exact linked variants before modifying layout.",
+    "driver_shader_compile_failure": "Separate driver compilation failures from emitter refusals; compare the exact portable shader and root signature.",
+    "signaller_timeout": "Inspect queue and fence progress; this warning alone does not establish a hang.",
     "missing_import_library": "Inspect the explicitly named import and the staged provider or library dependencies.",
 }
 UNHANDLED = re.compile(r"^wine: (?:Unhandled exception (0x[0-9a-fA-F]+)|Unhandled page fault\b|Unimplemented function\b)")
@@ -100,6 +105,12 @@ class Session:
         self.shaders = {}
         self.shader_events = Counter()
         self.terminal = None
+        self.null_pipeline_lower_bounds = {}
+        self.cached_skip_lower_bound = 0
+        self.stage_link_status = Counter()
+        self.stage_pairs = set()
+        self.allocation_sizes = Counter()
+        self.resource_flags = Counter()
 
     def mark(self, ev):
         self.milestones.setdefault(ev["kind"], ev)
@@ -147,6 +158,14 @@ class Session:
                 found = re.match(pattern, detail)
                 if found:
                     self.finding(event(kind, number, time, code=found[1].lower() if found.lastindex else None))
+            if m := re.match(r"substituted null (compute|raster stream) pipeline for an untranslated shader \(\d+ so far\)", detail):
+                count = int(re.search(r"\d+", m[0])[0])
+                self.null_pipeline_lower_bounds[m[1]] = max(count, self.null_pipeline_lower_bounds.get(m[1], 0))
+            if m := re.match(r"shader cache skipped (\d+) requests with known unsupported translations", detail):
+                self.cached_skip_lower_bound = max(int(m[1]), self.cached_skip_lower_bound)
+            if m := re.match(r"slot 86 pipeline stage failure #\d+ 0x[0-9a-fA-F]{8} linked=(true|false) VS=([0-9a-f]{64})\([a-z_]+\) PS=([0-9a-f]{64})\([a-z_]+\)", detail):
+                self.stage_link_status["linked" if m[1] == "true" else "unlinked"] += 1
+                self.stage_pairs.add((m[2], m[3]))
             for kind, pattern in SURVEY:
                 if found := pattern.match(detail):
                     if kind == "unsupported_vtable_slot":
@@ -154,6 +173,22 @@ class Session:
                     else:
                         data = {"rva": found[1], "reported_hit": int(found[2])}
                     self.finding(event(kind, number, time, data))
+        # Exact driver function names distinguish these from arbitrary log text.
+        if m := re.search(r":vkd3d-proton:vkd3d_try_allocate_device_memory: Failed to allocate (\d{1,20}) bytes on memory type (\d{1,3}), vr (-?\d{1,10})\.", line):
+            size, memtype, result = map(int, m.groups())
+            self.allocation_sizes[(memtype, result)] += 1
+            self.finding(event("device_memory_allocation_failure", number, time,
+                               {"requested_bytes": size, "memory_type": memtype, "vk_result": result}))
+        if m := re.search(r":vkd3d-proton:vkd3d_import_host_memory: Failed to import host memory, hr (0x[0-9a-fA-F]{8})\.", line):
+            self.finding(event("host_memory_import_failure", number, time, code=m[1].lower()))
+        if ":vkd3d-proton:vkd3d_validate_shader_io_signatures: Input signature element " in line and " not compatible with " in line:
+            self.finding(event("shader_signature_mismatch", number, time))
+        if m := re.search(r":vkd3d-proton:vkd3d_compile_shader_stage: Failed to compile shader, vkd3d result (-?\d{1,10})\.", line):
+            self.finding(event("driver_shader_compile_failure", number, time, {"driver_result": int(m[1])}))
+        if m := re.search(r":vkd3d-proton:d3d12_validate_resource_flags: Unknown resource flags (0x[0-9a-fA-F]{1,8})\.", line):
+            self.resource_flags[hex(int(m[1],16))] += 1
+        if line == "err:winevulkan:signaller_worker wait timed out with non-empty poll list.":
+            self.finding(event("signaller_timeout", number, time))
         if unhandled := UNHANDLED.search(line):
             site, thread = EXCEPTION_SITE.search(line), EXCEPTION_THREAD.search(line)
             data = {}
@@ -194,7 +229,17 @@ class Session:
                 "last_milestone":ordered[-1]["kind"] if ordered else None,
                 "findings":findings, "investigation_order":investigation, "shader_events":dict(self.shader_events),
                 "last_observed_shader_status":dict(Counter(self.shaders.values())),
-                "unique_shader_requests":len(self.shaders)}
+                "unique_shader_requests":len(self.shaders),
+                "runtime_counters": {
+                    "null_pipeline_reported_lower_bounds": dict(self.null_pipeline_lower_bounds),
+                    "cached_unsupported_skip_lower_bound": self.cached_skip_lower_bound,
+                    "sampled_stage_link_status": dict(self.stage_link_status),
+                    "sampled_distinct_stage_pairs": len(self.stage_pairs),
+                    "allocation_attempts_by_type_and_result": [
+                        {"memory_type": k[0], "vk_result": k[1], "count": v}
+                        for k,v in sorted(self.allocation_sizes.items())],
+                    "unknown_resource_flag_events": dict(self.resource_flags),
+                }}
 
 
 def analyze(path):

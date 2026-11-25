@@ -667,3 +667,22 @@ public log fingerprint, controlled diagnostic outcomes and six 4K pairs
 (identical, one changed pixel, local defect, black, tolerated one-level
 changes, and swapped color channels). These are CPU-side checks, not real
 title rendering comparisons.
+
+
+The offline diagnosis also counts driver allocation attempts by memory type
+and Vulkan result, host-memory import failures, shader interface mismatch
+messages, driver compiler failures, and signaller timeouts. It tracks the
+maximum reported cumulative null-pipeline and cache-skip counters rather than
+summing their samples, and reports sampled stage-pair counts and link status
+without disclosing shader identifiers. These are observed log events, not
+independent allocations or confirmed causes. A missing exit record remains
+an incomplete log, not proof of a crash or hang.
+
+Applied to the public issue #39 retest log (SHA256
+`9d728e2e9d8374702a094e973be03f6528d6c63e906e416594df1188543a5b34`),
+this distinguishes 262 failed memory-allocation attempts from 131 host-memory
+import failures, 12 shader interface mismatch messages, 32 sampled unlinked
+stage failures and three signaller timeouts. The last recorded draw does not
+establish a visible frame or gameplay. The recorded maximum counters are
+1,024 compute and 2,048 raster-stream substitute pipelines; not exact final
+totals or distinct shaders. No retail inputs were used locally.
