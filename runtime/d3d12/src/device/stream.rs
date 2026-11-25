@@ -331,6 +331,32 @@ unsafe fn create(
         original[i] = Some((source, Some(stages.len())));
         stages.push(compiled);
     }
+    if let Some(cs_ptr) = fields[5] {
+        // SAFETY: `fields[5]` points into `storage`, which stays live for this call.
+        let cs = unsafe { &*cs_ptr };
+        if !cs.pShaderBytecode.is_null() && cs.BytecodeLength != 0 && cs.BytecodeLength <= 64 << 20 {
+            let code = unsafe { slice::from_raw_parts(cs.pShaderBytecode.cast::<u8>(), cs.BytecodeLength) };
+            if let Some(refusal) = compute::unsupported_wave_size(device, code) {
+                let guest_cs = original[5].map_or(code, |(guest, _)| guest);
+                crate::diagnostics::compute_wave_failure(guest_cs, &refusal.detail);
+                crate::failures::refusal("CS", &refusal.tag);
+                let hashes = original.map(|stage| {
+                    stage.and_then(|(bytes, prepared)| {
+                        shader_cache::source_digest(bytes).map(|hash| (hash, prepared.is_some()))
+                    })
+                });
+                let native_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: size,
+                    pPipelineStateSubobjectStream: output.cast(),
+                };
+                // SAFETY: `storage` and `fields` stay live throughout `null_pipeline`.
+                return unsafe {
+                    null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes)
+                }
+                .unwrap_or_else(|| Err(E_INVALIDARG.into()));
+            }
+        }
+    }
     if let Some((code, Some(index))) = original[5]
         && let Some(root) =
             super::compute_scene::private_root(&device.native, code, &stages[index], guest_root, node_mask)?

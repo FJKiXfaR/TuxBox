@@ -146,14 +146,29 @@ pub(super) fn presented(width: u64, height: u32) {
     });
 }
 
-/// A shader's container ID and chunk types let the package tools locate the
-/// original program without copying shader bytecode into the game log.
-pub(super) fn compute_failure(shader: &[u8], status: i32) {
-    // Each distinct program is worth one line; repeats of the same ID add nothing.
-    static FAILURES: Seen<Option<[u8; 16]>> = Seen::new(64);
+fn describe_dxbc(shader: &[u8], id: Option<[u8; 16]>) -> String {
+    let Some(id) = id else {
+        return "unrecognized shader container".to_owned();
+    };
+    let count = u32::from_le_bytes([shader[28], shader[29], shader[30], shader[31]]) as usize;
+    let mut chunks = Vec::new();
+    for entry in shader[32..].as_chunks::<4>().0.iter().take(count.min(16)) {
+        let offset = u32::from_le_bytes(*entry) as usize;
+        if let Some(tag) = shader.get(offset..).and_then(|rest| rest.get(..4))
+            && tag.iter().all(u8::is_ascii_alphanumeric)
+            && let Ok(name) = std::str::from_utf8(tag)
+        {
+            chunks.push(name);
+        }
+    }
+    let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    format!("DXBC {id}, chunks {}", chunks.join("/"))
+}
+
+fn log_compute_failure(seen: &Seen<Option<[u8; 16]>>, shader: &[u8], reason: &str) {
     let id = (shader.starts_with(b"DXBC") && shader.len() >= 32)
         .then(|| <[u8; 16]>::try_from(&shader[4..20]).unwrap());
-    match FAILURES.sight(&id) {
+    match seen.sight(&id) {
         Sighting::Repeat => return,
         Sighting::Full => {
             return log_once(&Once::new(), || {
@@ -164,29 +179,27 @@ pub(super) fn compute_failure(shader: &[u8], status: i32) {
         Sighting::New => {}
     }
     log_once(&Once::new(), || {
-        let description = if let Some(id) = id {
-            let count =
-                u32::from_le_bytes([shader[28], shader[29], shader[30], shader[31]]) as usize;
-            let mut chunks = Vec::new();
-            for entry in shader[32..].as_chunks::<4>().0.iter().take(count.min(16)) {
-                let offset = u32::from_le_bytes(*entry) as usize;
-                if let Some(tag) = shader.get(offset..).and_then(|rest| rest.get(..4))
-                    && tag.iter().all(u8::is_ascii_alphanumeric)
-                    && let Ok(name) = std::str::from_utf8(tag)
-                {
-                    chunks.push(name);
-                }
-            }
-            let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
-            format!("DXBC {id}, chunks {}", chunks.join("/"))
-        } else {
-            "unrecognized shader container".to_owned()
-        };
+        let description = describe_dxbc(shader, id);
         format!(
-            "compute pipeline creation failed ({status:#010x}, {} bytes, {description})",
+            "compute pipeline creation failed ({reason}, {} bytes, {description})",
             shader.len()
         )
     });
+}
+
+/// A shader's container ID and chunk types let the package tools locate the
+/// original program without copying shader bytecode into the game log.
+pub(super) fn compute_failure(shader: &[u8], status: i32) {
+    // Each distinct program is worth one line; repeats of the same ID add nothing.
+    static FAILURES: Seen<Option<[u8; 16]>> = Seen::new(64);
+    log_compute_failure(&FAILURES, shader, &format!("{status:#010x}"));
+}
+
+/// Log a compute shader skipped before driver compilation because the host
+/// device's supported wave range excludes the shader's required `[WaveSize]`.
+pub(crate) fn compute_wave_failure(shader: &[u8], reason: &str) {
+    static WAVE_FAILURES: Seen<Option<[u8; 16]>> = Seen::new(64);
+    log_compute_failure(&WAVE_FAILURES, shader, reason);
 }
 
 pub(super) fn pipeline_stream(bytes: usize, error: Option<i32>) {

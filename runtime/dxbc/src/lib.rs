@@ -20,7 +20,7 @@ pub mod rootsig;
 mod signature;
 
 pub use container::{Chunk, Dxbc};
-pub use fspx::{Fspx, compute_threads, parse_fspx};
+pub use fspx::{Fspx, compute_threads, parse_fspx, wave_lane_range};
 pub use raster::{
     exports_stencil_reference, has_packing_mismatch, pixel_input_order, raster_outputs,
 };

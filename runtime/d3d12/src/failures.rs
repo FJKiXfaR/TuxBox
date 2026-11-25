@@ -66,17 +66,25 @@ pub(crate) fn begin() {
     STAND_IN.set(false);
 }
 
+fn push_note(item: String) {
+    LOOKUPS.with_borrow_mut(|lookups| {
+        if lookups.len() < KEYS && !lookups.contains(&item) {
+            lookups.push(item);
+        }
+    });
+}
+
 /// Note a translation this thread asked for. The key names the recorded
 /// request and its cached output or refusal reason; it differs from the guest
 /// shader digest when a root signature is part of the request.
 pub(crate) fn lookup(stage: &str, key: &str, found: bool) {
     let kind = if found { "used" } else { "missing" };
-    LOOKUPS.with_borrow_mut(|lookups| {
-        let item = format!("{stage}.{kind}={key}");
-        if lookups.len() < KEYS && !lookups.contains(&item) {
-            lookups.push(item);
-        }
-    });
+    push_note(format!("{stage}.{kind}={key}"));
+}
+
+/// Note why a pipeline stage was refused locally before reaching the host driver.
+pub(crate) fn refusal(stage: &str, reason: &str) {
+    push_note(format!("{stage}.refused={reason}"));
 }
 
 /// Note one guest shader. The bytes must stay readable until `finish`.
@@ -240,5 +248,22 @@ mod tests {
         let text = std::fs::read_to_string(&file).unwrap();
         let _ = std::fs::remove_file(&file);
         assert!(text.contains("1\t0xffffffff\tslot62\tCS=len6 CS.used=key\n"), "{text}");
+    }
+
+    #[test]
+    fn wave_refusal_records_stage_reason() {
+        let code = *b"shader";
+        begin();
+        stage("CS", code.as_ptr(), code.len());
+        lookup("CS", "key", true);
+        refusal("CS", "host-lacks-wave64");
+        stand_in();
+        // SAFETY: `code` stays live across `finish`.
+        let _ = unsafe { finish("slot62", 0, |bytes| Some(format!("len{}", bytes.len()))) };
+        let rendered = RECORD.lock().unwrap_or_else(|e| e.into_inner()).render();
+        assert!(
+            rendered.contains("stand-in\tslot62\tCS=len6 CS.used=key CS.refused=host-lacks-wave64\n"),
+            "{rendered}"
+        );
     }
 }

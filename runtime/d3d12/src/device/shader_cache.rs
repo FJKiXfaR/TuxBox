@@ -324,6 +324,16 @@ pub(super) fn portable_library(bytes: &[u8]) -> bool {
     shader_code(bytes) == Some((Stage::Library, ShaderCode::Portable))
 }
 
+/// Wave lane range `(min, max)` required by a portable DXIL container's `PSV0` chunk.
+pub(super) fn portable_wave_range(shader: &[u8]) -> Option<(u32, u32)> {
+    let (_, ShaderCode::Portable) = shader_code(shader)? else {
+        return None;
+    };
+    let dxbc = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
+    let part = dxbc.chunk(b"PSV0")?;
+    tuxbox_dxbc::wave_lane_range(shader.get(part.offset..part.offset.checked_add(part.size)?)?)
+}
+
 pub(super) fn ray_library(bytes: &[u8], source: &str) -> Option<Vec<u8>> {
     let library = read_portable("by_source", source, Stage::Library)
         .or_else(|| compile::on_demand(bytes, source, Stage::Library));
@@ -490,6 +500,59 @@ fn replacing_a_mesh_root_preserves_the_other_parts_and_the_directory_order() {
         assert_eq!(&shader[code.offset..code.offset + code.size], 0xd0065u32.to_le_bytes());
         assert_eq!(&shader[root.offset..root.offset + root.size], expected);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn portable_wave_range_ignores_xbox_and_unconstrained_shaders() {
+    fn container(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::from(*b"DXBC");
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        out.resize(32 + parts.len() * 4, 0);
+        for (i, (tag, body)) in parts.iter().enumerate() {
+            let offset = out.len() as u32;
+            out[32 + 4 * i..36 + 4 * i].copy_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(*tag);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(body);
+        }
+        let len = out.len() as u32;
+        out[24..28].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+    fn dxil_part(xbox: bool) -> Vec<u8> {
+        let mut dxil = vec![0u8; 28];
+        dxil[0..4].copy_from_slice(&((5u32 << 16) | 0x66).to_le_bytes());
+        dxil[4..8].copy_from_slice(&(7u32).to_le_bytes());
+        dxil[8..12].copy_from_slice(b"DXIL");
+        dxil[16..20].copy_from_slice(&16u32.to_le_bytes());
+        dxil[20..24].copy_from_slice(&4u32.to_le_bytes());
+        dxil[24..28].copy_from_slice(if xbox { b"XDAT" } else { b"BC\xc0\xde" });
+        if xbox {
+            dxil.extend_from_slice(b"NOBC");
+            dxil[4..8].copy_from_slice(&(8u32).to_le_bytes());
+            dxil[16..20].copy_from_slice(&20u32.to_le_bytes());
+        }
+        dxil
+    }
+    fn psv_part(min: u32, max: u32) -> Vec<u8> {
+        let mut psv = 52u32.to_le_bytes().to_vec();
+        let mut rt = vec![0u8; 52];
+        rt[16..20].copy_from_slice(&min.to_le_bytes());
+        rt[20..24].copy_from_slice(&max.to_le_bytes());
+        rt[24] = 5;
+        psv.extend_from_slice(&rt);
+        psv
+    }
+    let wave64 = container(&[(b"DXIL", &dxil_part(false)), (b"PSV0", &psv_part(64, 64))]);
+    assert_eq!(portable_wave_range(&wave64), Some((64, 64)));
+    let plain = container(&[(b"DXIL", &dxil_part(false)), (b"PSV0", &psv_part(0, u32::MAX))]);
+    assert_eq!(portable_wave_range(&plain), None);
+    let xbox = container(&[(b"DXIL", &dxil_part(true)), (b"PSV0", &psv_part(64, 64))]);
+    assert_eq!(portable_wave_range(&xbox), None);
 }
 
 /// Console mesh stages always use a DXIL container. Resolve stripped programs

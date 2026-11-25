@@ -86,3 +86,43 @@ pub fn compute_threads(psv: &[u8]) -> Option<[u32; 3]> {
     let xyz = words::<3>(runtime.get(36..)?).ok()?;
     (!xyz.contains(&0)).then_some(xyz)
 }
+
+/// Expected wave lane count bounds `(min, max)` from DXBC `PSV0` `PSVRuntimeInfo0`.
+///
+/// Returns `None` when `PSV0` lacks `PSVRuntimeInfo0`, leaves the wave range
+/// unconstrained (`(0, 0)` or `(0, u32::MAX)`), or encodes `min > max`.
+pub fn wave_lane_range(psv: &[u8]) -> Option<(u32, u32)> {
+    let (length, tail) = psv.split_first_chunk::<4>()?;
+    let runtime = tail.get(..u32::from_le_bytes(*length) as usize)?;
+    let [min, max] = words::<2>(runtime.get(16..)?).ok()?;
+    (!(min == 0 && matches!(max, 0 | u32::MAX)) && min <= max).then_some((min, max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn psv_with_wave_range(runtime_len: usize, min: u32, max: u32) -> Vec<u8> {
+        let mut psv = (runtime_len as u32).to_le_bytes().to_vec();
+        let mut runtime = vec![0u8; runtime_len];
+        if runtime_len >= 24 {
+            runtime[16..20].copy_from_slice(&min.to_le_bytes());
+            runtime[20..24].copy_from_slice(&max.to_le_bytes());
+        }
+        psv.extend_from_slice(&runtime);
+        psv
+    }
+
+    #[test]
+    fn extracts_non_trivial_wave_lane_bounds_from_psv0() {
+        assert_eq!(wave_lane_range(&psv_with_wave_range(52, 0, u32::MAX)), None);
+        assert_eq!(wave_lane_range(&psv_with_wave_range(24, 0, 0)), None);
+        assert_eq!(wave_lane_range(&psv_with_wave_range(24, 64, 64)), Some((64, 64)));
+        assert_eq!(wave_lane_range(&psv_with_wave_range(52, 32, 32)), Some((32, 32)));
+        assert_eq!(wave_lane_range(&psv_with_wave_range(52, 32, 64)), Some((32, 64)));
+        assert_eq!(wave_lane_range(&psv_with_wave_range(52, 0, 64)), Some((0, 64)));
+        assert_eq!(wave_lane_range(&psv_with_wave_range(52, 64, 32)), None);
+        assert_eq!(wave_lane_range(&psv_with_wave_range(20, 64, 64)), None);
+        assert_eq!(wave_lane_range(&psv_with_wave_range(24, 64, 64)[..20]), None);
+    }
+}
