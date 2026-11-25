@@ -328,8 +328,11 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         screen = tools.compile(src / "screen.cpp", objects)
         controls = tools.compile(src / "input.cpp", objects)
         game = tools.compile(src / "game.cpp", objects)
+        subprocess.run([sys.executable, str(src / "shader_fixture.py"), "xbox_shader.h"], cwd=objects, check=True)
+        selftest = tools.compile(src / "selftest.cpp", objects, f"/I{objects}")
         xmem, d3d, gameinput = OUTPUT / "xmem-smoke", OUTPUT / "d3d12-smoke", OUTPUT / "gameinput"
-        tools.link(objects / "lanes.exe", course, screen, controls, game, xmem / "xmem.lib", d3d / "d3d12_xs.lib",
+        tools.link(objects / "lanes.exe", course, screen, controls, game, selftest, xmem / "xmem.lib",
+                   d3d / "d3d12_xs.lib",
                    gameinput / "guest-gameinput.lib", "onecore_apiset.lib", "/nodefaultlib:kernel32.lib")
         for source in (objects / "lanes.exe", xmem / "xmem.dll", xmem / "tuxbox_xhttp.dll", d3d / "d3d12_xs.dll",
                        gameinput / "GameInput.dll", src / "MicrosoftGame.config"):

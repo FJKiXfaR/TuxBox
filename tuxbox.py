@@ -23,6 +23,7 @@ from project_tuxbox.inspect import binary_file, image, launch_target, package, p
 from project_tuxbox.d3d12_status import d3d12_table
 from project_tuxbox.progress_map import library_table, shader_table, write_map
 from project_tuxbox.shader_prep import prepare_for_launch
+from project_tuxbox.check import run_checks
 from project_tuxbox.symbols import lookup_symbols
 from project_tuxbox.verify import SUITES, verify, status
 
@@ -120,7 +121,11 @@ def main():
     check.add_argument("--output", required=True, type=Path)
     check.add_argument("--only", choices=SUITES, action="append", help="restrict checks to the given suite (repeatable)")
     check.add_argument("--adapter", help="select a hardware graphics adapter by PCI vendor:device")
-    for cmd in (run, check):
+    gate = subs.add_parser("check", help="run every check a change needs before it can be merged")
+    gate.add_argument("--no-gpu", action="store_true",
+                      help="run only the checks CI runs; the change still needs a GPU run before merging")
+    gate.add_argument("--adapter", help="select a hardware graphics adapter by PCI vendor:device")
+    for cmd in (run, check, gate):
         cmd.add_argument("--backend", choices=("native", "proton", "wine"))
         cmd.add_argument("--proton", help="installed Valve or GE-Proton directory")
         cmd.add_argument("--prefix", type=Path, help="Linux prefix directory for this provider")
@@ -131,6 +136,12 @@ def main():
     status_format.add_argument("--d3d12-xs", action="store_true", help="show checked Xbox D3D12 interface slots")
     status_format.add_argument("--shaders", action="store_true", help="show packaged and requested shaders by stage")
     args = parser.parse_args()
+    if args.command == "check":
+        options = []
+        for name in ("adapter", "backend", "proton", "prefix"):
+            if getattr(args, name) is not None:
+                options += [f"--{name}", str(getattr(args, name))]
+        return run_checks(gpu=not args.no_gpu, host_options=options)
     if args.command == "status":
         evidence = Path(__file__).resolve().parent / "evidence"
         if args.svg:

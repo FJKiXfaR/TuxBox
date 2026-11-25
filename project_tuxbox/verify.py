@@ -2,6 +2,7 @@
 from contextlib import contextmanager, nullcontext
 import ctypes
 import ctypes.util
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -20,12 +21,74 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
 OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.dll"}
 SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
+# The scenarios of `lanes.exe --selftest`, one gate each.
+LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture")
+
+
+def lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work):
+    """Load the Lanes console shader from a prepared cache, then from the runtime worker.
+
+    The prepared gate translates it before launch, as shader preparation does.
+    The runtime gates start with it uncached: the first launch must have the
+    host worker compile it, and the second must reuse that result.
+    """
+    from examples.lanes.shader_fixture import shader
+    from .runtime_shaders import compile_request, shader_session
+    from .shader_prep import SOURCE_CACHE, compiler_tools
+
+    data = shader()
+    key = hashlib.sha256(data).hexdigest()
+    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+    root = sources.parent
+
+    def forget():
+        # Only this synthetic shader's entries; a prefix may hold a title cache.
+        for path in [*sources.glob(f"{key}.*"), *root.glob(f"runtime/*/{key}.*")]:
+            path.unlink()
+
+    saved = {name: host.env.get(name) for name in ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
+    host.env.pop("TUXBOX_SHADER_SESSION", None)
+    loaded = f"prepared compute shader loaded, source SHA-256 {key}"
+
+    def expect_loaded(output):
+        return None if loaded in output else "the provider did not load the translated shader"
+
+    def launch(name, log_check):
+        return check(name, "lanes/lanes.exe", ["--selftest", "xbox-shader", *gpu_args, "--report"],
+                     rf"lanes-selftest PASS pci={pci} scenario=xbox-shader passed=1",
+                     providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                     config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=log_check)
+
+    try:
+        forget()
+        sources.mkdir(parents=True, exist_ok=True)
+        request = work / f"{key}.dxbc"
+        request.write_bytes(data)
+        compile_request(request, key, compiler_tools(), sources, None)
+        launch("lanes-shader-cache-prepared", expect_loaded)
+
+        forget()
+        for name, compiles in (("lanes-shader-cache-compiled", 1), ("lanes-shader-cache-reused", 0)):
+            messages = []
+            with shader_session(root, host.env, messages.append):
+                launch(name, lambda output, messages=messages, compiles=compiles: expect_loaded(output) or (
+                    None if sum(f"Compiled Xbox shader {key}" in line for line in messages) == compiles
+                    else f"expected {compiles} worker compiles, saw: {messages}"))
+        forget()
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
 
 
 def cpu_model():
@@ -209,7 +272,8 @@ def verify(host, output, adapter, selected=None, samples=1):
                 builds[relative] = digest(dest)
             return dest
 
-        def check(name, binary, arguments, match, expected_code=0, providers=None, config=None, device_factory=None, dependencies=()):
+        def check(name, binary, arguments, match, expected_code=0, providers=None, config=None, device_factory=None,
+                  dependencies=(), log_check=None):
             row = {"gate": name, "passed": False}
             cases.append(row)
             folder = work / str(len(cases))
@@ -251,6 +315,10 @@ def verify(host, output, adapter, selected=None, samples=1):
                 row.update(exit_code=proc.returncode, receipt=text)
                 row["passed"] = (proc.returncode == expected_code and
                                  (text is None if match is None else text is not None and re.fullmatch(match, text) is not None))
+                if row["passed"] and log_check:
+                    problem = log_check(proc.stdout.decode(errors="replace"))
+                    if problem:
+                        row.update(passed=False, error=problem)
                 if not row["passed"]:
                     print(proc.stdout[-2000:].decode(errors="replace"))
             except (OSError, ValueError, subprocess.TimeoutExpired) as error:
@@ -480,6 +548,16 @@ def verify(host, output, adapter, selected=None, samples=1):
                   providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
                              "lanes/d3d12_xs.dll": (*graphics_symbols, "D3D12XboxCreateDevice")},
                   config="lanes/MicrosoftGame.config", device_factory="xbox")
+        if "lanes-selftest" in selected:
+            for scenario in LANES_SCENARIOS:
+                check(f"lanes-selftest-{scenario}", "lanes/lanes.exe",
+                      ["--selftest", scenario, *gpu_args, "--report"],
+                      rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
+                      providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                 "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                      config="lanes/MicrosoftGame.config", device_factory="xbox")
+        if "lanes-shader-cache" in selected and host.backend == "proton":
+            lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work)
         if "cpu-benchmark" in selected:
             readings = []
             for _ in range(samples):
@@ -570,6 +648,15 @@ GATE_LABELS = {
     "guest-command-errors": "Guest command rejection, fence isolation and list recovery",
     "guest-present": "Xbox PresentX and two screen-verified frames",
     "lanes-xbox-replay": "Lanes Xbox imports, course, board readback and gameplay replay",
+    "lanes-selftest-labels": "Bottom-of-pipe label writes with and without a flush",
+    "lanes-selftest-cross-queue": "Compute and direct queues waiting on each other's labels",
+    "lanes-selftest-compute-frame": "Compute queue frame submission",
+    "lanes-selftest-skipped-command": "A skipped command leaving its list and fence write intact",
+    "lanes-selftest-copy-memory": "CopyMemoryToMemoryX direction and contents",
+    "lanes-selftest-shared-texture": "A waiting queue reading a texture another queue writes",
+    "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
+    "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",
+    "lanes-shader-cache-reused": "The worker's translation reused on the next launch without compiling",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 
