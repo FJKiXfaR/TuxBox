@@ -490,6 +490,16 @@ fn owned_compile(
     // SAFETY: `shader` and `descriptor.pRootSignature` stay alive until this
     // call returns. `device` is an AddRef held by this thread.
     let result = unsafe { device.CreateComputePipelineState(&descriptor) };
+    if std::env::var_os("TUXBOX_TRACE_PIPELINES").is_some() {
+        // A matching "owned compile" line without this one is still in flight,
+        // which identifies the program the native compiler faulted on.
+        let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        crate::diagnostics::log(&format!(
+            "owned compiled tid={tid} digest={} hr={:#010x}",
+            &digest[..digest.len().min(16)],
+            result.as_ref().err().map_or(0, |error| error.code().0)
+        ));
+    }
     unsafe { ManuallyDrop::drop(&mut descriptor.pRootSignature) };
     result
 }
