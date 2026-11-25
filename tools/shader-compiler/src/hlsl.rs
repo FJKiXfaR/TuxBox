@@ -440,6 +440,11 @@ fn low_mask(width: &str) -> String {
 }
 
 /// Signed addition overflows when both operands have the same sign and the sum changes it.
+/// SCC of `s_lshl<n>_add_u32`: set when `(a << shift) + b` exceeds 32 bits.
+fn shift_add_carry(a: &str, b: &str, result: &str, shift: u32) -> String {
+    format!("((({a}) >> {}) != 0u || {result} < {b}) ? 1u : 0u", 32 - shift)
+}
+
 fn signed_add_overflow(a: &str, b: &str, sum: &str) -> String {
     format!("((~({a} ^ {b}) & ({a} ^ {sum})) >> 31)")
 }
@@ -5638,7 +5643,12 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 let scc = match m {
                     "s_add_i32" => Some(signed_add_overflow(&a, &b, &result)),
                     "s_sub_i32" => Some(format!("((({a} ^ {b}) & ({a} ^ {result})) >> 31)")),
-                    "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => Some(format!("({result} < {b})")),
+                    // The carry is of the full sum, so bits the shift moves past
+                    // bit 31 set it as well as a wrapped addition.
+                    "s_lshl1_add_u32" => Some(shift_add_carry(&a, &b, &result, 1)),
+                    "s_lshl2_add_u32" => Some(shift_add_carry(&a, &b, &result, 2)),
+                    "s_lshl3_add_u32" => Some(shift_add_carry(&a, &b, &result, 3)),
+                    "s_lshl4_add_u32" => Some(shift_add_carry(&a, &b, &result, 4)),
                     "s_add_u32" => Some(format!("(({a} + {b}) < {a}) ? 1u : 0u")),
                     "s_addc_u32" => Some(format!("((({a} + {b}) < {a}) || (({a} + {b} + (scc & 1u)) < ({a} + {b}))) ? 1u : 0u")),
                     "s_subb_u32" => Some(format!("(({b} > {a}) || ((scc & 1u) > ({a} - {b}))) ? 1u : 0u")),
