@@ -34,7 +34,9 @@ CHECKS = [
     ("d3d12: SSE4a emulation registered", "runtime/d3d12/src/survey.rs", "crate::sse4a::handle_illegal_instruction"),
     ("d3d12: SSE4a EXTRQ/INSERTQ emulation", "runtime/d3d12/src/sse4a.rs", "INSERTQ"),
     ("gameinput: synthetic pad", "runtime/gameinput/src/sample.rs", "TUXBOX_SYNTH_PAD_A_MS"),
-    ("xshader: forced wave32 knob", "tools/shader-compiler/src/hlsl.rs", "XSHADER_FORCE_WAVE32"),
+    # The translator was split into modules by upstream 9e491ff; the wave-size
+    # decision now lives in hlsl/driver/pipeline.rs.
+    ("xshader: forced wave32 knob", "tools/shader-compiler/src/hlsl/driver/pipeline.rs", "XSHADER_FORCE_WAVE32"),
     ("launcher: refusal retry switch", "project_tuxbox/runtime_shaders.py", "TUXBOX_RETRY_REFUSALS"),
     ("launcher: cache seeding opt-out", "project_tuxbox/runtime_shaders.py", "TUXBOX_CACHE_NO_SEED"),
     ("launcher: compile-policy DXIL split", "project_tuxbox/dxil_store.py", "dxil-unoptimised"),
