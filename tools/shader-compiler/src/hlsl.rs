@@ -57,7 +57,6 @@ mod compute_swizzle;
 #[cfg(test)]
 #[path = "tests/hlsl/sat_pk_u8_i16.rs"]
 mod sat_pk_u8_i16;
-mod cpu_oracle;
 mod fssm_bindings;
 mod micropoly;
 mod mesh;
