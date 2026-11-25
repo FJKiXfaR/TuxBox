@@ -271,6 +271,24 @@ fn bounded_runtime_code_offset_uses_real_table_index_without_modulo() {
     assert_eq!(super::code_offset::prove(&bad,3,24,40),None);
 }
 
+#[test]
+fn scalar_or_indexes_an_embedded_table_only_when_all_words_fit() {
+    // getpc s[8:9]; and s10,s12,12; or s10,s10,16;
+    // load s16 from PC + 20 + s10. The possible byte offsets are 16, 20, 24 and 28.
+    let mut words = [0xbe881f00, 0x870a8c0c, 0x880a900a, 0xf4000404, 0x14000014, 0xbf810000];
+    let translate = |words: &[u32], table_words: usize| {
+        let mut ex = compute_extract(words);
+        ex.isa_data.extend((0..table_words as u32).flat_map(u32::to_le_bytes));
+        super::translate(&ex)
+    };
+    assert!(translate(&words, 8).is_ok());
+    assert!(translate(&words, 7).is_err());
+    words[2] = 0x880a810a; // OR 1 makes the address unaligned.
+    assert!(translate(&words, 8).is_err());
+    words[2] = 0x880a0d0a; // OR s13 can set arbitrary bits.
+    assert!(translate(&words, 8).is_err());
+}
+
 fn bounded_cbv_fixture() -> ShaderExtract {
     // gfx1030: and s10,s8,1; lshl s10,s10,5; load descriptor s[16:19]
     // from s[4:5]+s10; buffer_load s20; endpgm.
