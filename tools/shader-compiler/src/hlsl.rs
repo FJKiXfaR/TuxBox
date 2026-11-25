@@ -41,6 +41,7 @@ mod heap_resinfo;
 mod compute_swizzle;
 #[cfg(test)]
 mod sat_pk_u8_i16;
+mod cpu_oracle;
 mod fssm_bindings;
 mod micropoly;
 mod mesh;
