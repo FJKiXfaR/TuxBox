@@ -150,3 +150,29 @@ class BrunoLogRegressionTests(unittest.TestCase):
                          [{"hresult":"0x80070057","log_events":3,"distinct_dxbc_hashes":2}])
         self.assertNotIn(h,json.dumps(session))
         self.assertNotIn(k,json.dumps(session))
+
+class PipelineEvidenceTests(unittest.TestCase):
+    def test_aggregate_signature_and_memory_shapes_without_identifiers(self):
+        a, b = "a" * 64, "b" * 64
+        lines = [
+            D3D + f"slot 86 pipeline stage failure #1 0x80070057 linked=false VS={a}(prepared) PS={b}(private_state)",
+            "x:vkd3d-proton:vkd3d_validate_shader_io_signatures: Input signature element COLOR0 (reg 0, mask 0x4) not compatible with COLOR0 (reg 1, mask 0x1).",
+            "x:vkd3d-proton:vkd3d_validate_shader_io_signatures: Input signature element PRIVATE (reg 5, mask 0x8) not compatible with PRIVATE (reg 5, mask 0x1).",
+            "x:vkd3d-proton:vkd3d_try_allocate_device_memory: Failed to allocate 131072 bytes on memory type 5, vr -1.",
+            "x:vkd3d-proton:vkd3d_try_allocate_device_memory: Failed to allocate 182452224 bytes on memory type 10, vr -1.",
+            "x:vkd3d-proton:vkd3d_compile_shader_stage: Failed to compile shader, vkd3d result -3.",
+            "x:vkd3d-proton:vkd3d_compile_shader_stage: Failed to compile shader, vkd3d result -3.",
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.log"
+            path.write_text("\n".join(lines))
+            c = analyze(path)["sessions"][0]["runtime_counters"]
+        self.assertEqual(c["signature_mismatch_shapes"], {"mask_only": 1, "register_and_mask": 1})
+        self.assertEqual(c["allocation_attempt_min_bytes"], 131072)
+        self.assertEqual(c["allocation_attempt_max_bytes"], 182452224)
+        self.assertEqual(c["allocation_attempt_size_bands"], {"below_1_mib": 1, "128_to_1024_mib": 1})
+        self.assertEqual(c["driver_compile_result_events"], {"-3": 2})
+        self.assertEqual(c["sampled_stage_failure_states"],
+            [{"link": "unlinked", "hresult": "0x80070057", "vs": "prepared", "ps": "other", "count": 1}])
+        for secret in (a, b, "private_state", "PRIVATE"):
+            self.assertNotIn(secret, json.dumps(c))

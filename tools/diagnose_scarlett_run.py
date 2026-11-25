@@ -113,6 +113,12 @@ class Session:
         self.stage_link_status = Counter()
         self.stage_pairs = set()
         self.allocation_sizes = Counter()
+        self.allocation_bands = Counter()
+        self.allocation_min = None
+        self.allocation_max = None
+        self.driver_results = Counter()
+        self.signature_shapes = Counter()
+        self.stage_states = Counter()
         self.resource_flags = Counter()
 
     def mark(self, ev):
@@ -172,9 +178,14 @@ class Session:
                 self.null_pipeline_lower_bounds[m[1]] = max(count, self.null_pipeline_lower_bounds.get(m[1], 0))
             if m := re.match(r"shader cache skipped (\d+) requests with known unsupported translations", detail):
                 self.cached_skip_lower_bound = max(int(m[1]), self.cached_skip_lower_bound)
-            if m := re.match(r"slot 86 pipeline stage failure #\d+ 0x[0-9a-fA-F]{8} linked=(true|false) VS=([0-9a-f]{64})\([a-z_]+\) PS=([0-9a-f]{64})\([a-z_]+\)", detail):
-                self.stage_link_status["linked" if m[1] == "true" else "unlinked"] += 1
-                self.stage_pairs.add((m[2], m[3]))
+            if m := re.match(r"slot 86 pipeline stage failure #\d+ (0x[0-9a-fA-F]{8}) linked=(true|false) VS=([0-9a-f]{64})\(([a-z_]+)\) PS=([0-9a-f]{64})\(([a-z_]+)\)", detail):
+                linked = "linked" if m[2] == "true" else "unlinked"
+                self.stage_link_status[linked] += 1
+                self.stage_pairs.add((m[3], m[5]))
+                # Never export arbitrary tokens or shader identifiers.
+                states = {"prepared", "translated", "cached", "original", "unsupported", "missing", "failed", "unknown"}
+                vs, ps = (v if v in states else "other" for v in (m[4], m[6]))
+                self.stage_states[(linked, m[1].lower(), vs, ps)] += 1
             for kind, pattern in SURVEY:
                 if found := pattern.match(detail):
                     if kind == "unsupported_vtable_slot":
@@ -186,14 +197,31 @@ class Session:
         if m := re.search(r":vkd3d-proton:vkd3d_try_allocate_device_memory: Failed to allocate (\d{1,20}) bytes on memory type (\d{1,3}), vr (-?\d{1,10})\.", line):
             size, memtype, result = map(int, m.groups())
             self.allocation_sizes[(memtype, result)] += 1
+            self.allocation_min = size if self.allocation_min is None else min(self.allocation_min, size)
+            self.allocation_max = size if self.allocation_max is None else max(self.allocation_max, size)
+            band = next((label for limit, label in ((1<<20, "below_1_mib"), (16<<20, "1_to_16_mib"),
+                         (128<<20, "16_to_128_mib"), (1<<30, "128_to_1024_mib")) if size < limit), "at_least_1_gib")
+            self.allocation_bands[band] += 1
             self.finding(event("device_memory_allocation_failure", number, time,
                                {"requested_bytes": size, "memory_type": memtype, "vk_result": result}))
         if m := re.search(r":vkd3d-proton:vkd3d_import_host_memory: Failed to import host memory, hr (0x[0-9a-fA-F]{8})\.", line):
             self.finding(event("host_memory_import_failure", number, time, code=m[1].lower()))
         if ":vkd3d-proton:vkd3d_validate_shader_io_signatures: Input signature element " in line and " not compatible with " in line:
             self.finding(event("shader_signature_mismatch", number, time))
+            if m := re.search(r"Input signature element ([a-zA-Z0-9_]{1,80}) \(reg (\d{1,5}), mask (0x[0-9a-fA-F]{1,2})\) not compatible with ([a-zA-Z0-9_]{1,80}) \(reg (\d{1,5}), mask (0x[0-9a-fA-F]{1,2})\)", line):
+                same = m[1].upper() == m[4].upper()
+                register = int(m[2]) != int(m[5])
+                mask = int(m[3], 16) != int(m[6], 16)
+                kind = "semantic_difference" if not same else (
+                    "register_and_mask" if register and mask else "register_only" if register else
+                    "mask_only" if mask else "other")
+                self.signature_shapes[kind] += 1
+            else:
+                self.signature_shapes["unparsed"] += 1
         if m := re.search(r":vkd3d-proton:vkd3d_compile_shader_stage: Failed to compile shader, vkd3d result (-?\d{1,10})\.", line):
-            self.finding(event("driver_shader_compile_failure", number, time, {"driver_result": int(m[1])}))
+            result = int(m[1])
+            self.driver_results[result if -128 <= result <= 128 else "other"] += 1
+            self.finding(event("driver_shader_compile_failure", number, time, {"driver_result": result}))
         if m := re.search(r":vkd3d-proton:d3d12_validate_resource_flags: Unknown resource flags (0x[0-9a-fA-F]{1,8})\.", line):
             self.resource_flags[hex(int(m[1],16))] += 1
         if line == "err:winevulkan:signaller_worker wait timed out with non-empty poll list.":
@@ -251,6 +279,14 @@ class Session:
                     "allocation_attempts_by_type_and_result": [
                         {"memory_type": k[0], "vk_result": k[1], "count": v}
                         for k,v in sorted(self.allocation_sizes.items())],
+                    "sampled_stage_failure_states": [
+                        {"link": k[0], "hresult": k[1], "vs": k[2], "ps": k[3], "count": v}
+                        for k,v in sorted(self.stage_states.items())],
+                    "signature_mismatch_shapes": dict(sorted(self.signature_shapes.items())),
+                    "driver_compile_result_events": {str(k): v for k,v in self.driver_results.items()},
+                    "allocation_attempt_size_bands": dict(sorted(self.allocation_bands.items())),
+                    "allocation_attempt_min_bytes": self.allocation_min,
+                    "allocation_attempt_max_bytes": self.allocation_max,
                     "unknown_resource_flag_events": dict(self.resource_flags),
                 }}
 
