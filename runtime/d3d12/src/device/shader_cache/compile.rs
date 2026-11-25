@@ -1,11 +1,12 @@
 //! Submit unprofiled console shaders to the running launcher's compiler.
 use super::{Stage, read_portable_file, source_digest};
 use crate::progress::{self, Shader};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 mod request_locks;
 use request_locks::RequestLocks;
@@ -27,6 +28,36 @@ fn session() -> Option<&'static PathBuf> {
         })
         .as_ref()
 }
+
+/// The names in a directory, listed once and then extended by this process.
+///
+/// Wine matches names without regard to case. Opening an absent one therefore
+/// reads the whole directory to look for another spelling of it, and the cache
+/// holds tens of thousands of files. A name the host added after the listing
+/// only costs a request, which the host answers from its cache.
+struct Names(OnceLock<Mutex<HashSet<String>>>);
+
+impl Names {
+    const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    fn of(&self, directory: &Path) -> MutexGuard<'_, HashSet<String>> {
+        self.0
+            .get_or_init(|| {
+                let entries = fs::read_dir(directory).into_iter().flatten().flatten();
+                let names = entries.filter_map(|entry| entry.file_name().into_string().ok());
+                Mutex::new(names.collect())
+            })
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// Files of the compiler's cache.
+static CACHED: Names = Names::new();
+/// Replies published in this session.
+static REPLIES: Names = Names::new();
 
 fn read_digest(path: &Path) -> Option<[u8; 64]> {
     let mut file = fs::File::open(path).ok()?;
@@ -61,6 +92,9 @@ fn compiler_cache(session: &Path) -> Option<&'static PathBuf> {
 }
 
 fn cached_translation(cache: &Path, key: &str, stage: Stage) -> Option<Vec<u8>> {
+    if !CACHED.of(cache).contains(&format!("{key}.sha256")) {
+        return None;
+    }
     let file = cache.join(format!("{key}.cso"));
     let expected = read_digest(&file.with_extension("sha256"))?;
     let bytes = read_portable_file(&file, stage)?;
@@ -73,6 +107,9 @@ fn cached_refusal(cache: &Path, key: &str) -> bool {
     // `TUXBOX_RETRY_REFUSALS=1` asks for one pass that re-translates programs an
     // earlier translator refused: the current translator may accept them.
     if std::env::var_os("TUXBOX_RETRY_REFUSALS").is_some_and(|value| value == "1") {
+        return false;
+    }
+    if !CACHED.of(cache).contains(&format!("{key}.unsupported")) {
         return false;
     }
     let Ok(file) = fs::File::open(cache.join(format!("{key}.unsupported"))) else {
@@ -139,8 +176,13 @@ fn request(
     submit: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> Option<Vec<u8>> {
     let dir = session()?;
-    let result = dir.join(format!("{key}.cso"));
-    if let Some(bytes) = read_portable_file(&result, stage) {
+    let name = format!("{key}.cso");
+    let result = dir.join(&name);
+    let reply = || {
+        let known = REPLIES.of(dir).contains(&name);
+        if known { read_portable_file(&result, stage) } else { None }
+    };
+    if let Some(bytes) = reply() {
         progress::record(key, Shader::Cached);
         return Some(bytes);
     }
@@ -149,7 +191,7 @@ fn request(
     static LOCKS: LazyLock<RequestLocks> = LazyLock::new(RequestLocks::default);
     let lock = LOCKS.for_key(key);
     let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(bytes) = read_portable_file(&result, stage) {
+    if let Some(bytes) = reply() {
         progress::record(key, Shader::Cached);
         return Some(bytes);
     }
@@ -157,13 +199,6 @@ fn request(
     let pending = dir.join(format!("{key}.{}.tmp", std::process::id()));
     if let Some(cache) = compiler_cache(dir) {
         if let Some(bytes) = cached_translation(cache, key, stage) {
-            // Later PSOs in this session can use the verified reply directly.
-            if fs::write(&pending, &bytes)
-                .and_then(|()| fs::rename(&pending, &result))
-                .is_err()
-            {
-                let _ = fs::remove_file(&pending);
-            }
             progress::record(key, Shader::Cached);
             return Some(bytes);
         }
@@ -182,6 +217,7 @@ fn request(
         // A successful worker may have completed between the first read
         // and the existence check. Avoid compiling that request twice.
         if let Some(bytes) = read_portable_file(&result, stage) {
+            REPLIES.of(dir).insert(name);
             progress::record(key, Shader::Translated);
             return Some(bytes);
         }
@@ -197,10 +233,15 @@ fn request(
     let start = Instant::now();
     loop {
         if let Some(bytes) = read_portable_file(&result, stage) {
+            REPLIES.of(dir).insert(name);
             progress::record(key, Shader::Translated);
             return Some(bytes);
         }
         if failed.exists() {
+            // The host records a refusal in its cache before it reports the failure.
+            if let Some(cache) = compiler_cache(dir) {
+                CACHED.of(cache).insert(format!("{key}.unsupported"));
+            }
             progress::record(key, Shader::Unsupported);
             return None;
         }
@@ -217,5 +258,24 @@ fn request(
             return None;
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_is_listed_once_and_extended() {
+        let dir = std::env::temp_dir().join(format!("tuxbox-names-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sha256"), b"").unwrap();
+        let names = Names::new();
+        assert!(names.of(&dir).contains("a.sha256"));
+        fs::write(dir.join("b.sha256"), b"").unwrap();
+        assert!(!names.of(&dir).contains("b.sha256"));
+        names.of(&dir).insert("b.sha256".into());
+        assert!(names.of(&dir).contains("b.sha256"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
